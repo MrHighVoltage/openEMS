@@ -65,12 +65,21 @@ public:
 
 	void SetCurrentGroup(std::string group, bool createGrp=true);
 
+	bool OpenFile();
+	void CloseFile();
+	void FlushFile();
+	bool IsFileOpen() const { return m_h5file >= 0; }
+
 	bool WriteData(std::string dataSetName, hid_t mem_type, void const* field_buf, size_t dim, size_t* datasize, std::string d_order="");
 	bool WriteAttribute(std::string locName, std::string attr_name, void const* value, hsize_t size, hid_t mem_type);
 
 protected:
 	std::string m_filename;
 	std::string m_Group;
+	hid_t m_h5file;
+
+	hid_t AcquireFile();
+	void ReleaseFile(hid_t file);
 
 	hid_t OpenGroup(hid_t hdf5_file, std::string group);
 	bool WriteData(hid_t group, std::string dataSetName, hid_t mem_type, void const* field_buf, size_t dim, size_t* datasize, std::string d_order="");
