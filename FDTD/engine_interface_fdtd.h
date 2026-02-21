@@ -23,6 +23,7 @@
 #include "Common/engine_interface_base.h"
 #include "operator.h"
 #include "engine.h"
+#include "tools/arraylib/array_nijk.h"
 
 class Engine_Interface_FDTD : public Engine_Interface_Base
 {
@@ -39,6 +40,12 @@ public:
 	const Engine* GetFDTDEngine() const {return m_Eng;}
 	//! Get the FDTD operator in case direct access is needed. Direct access is not recommended!
 	const Operator* GetFDTDOperator() const {return m_Op;}
+
+	//! Get material array pointers for optimised field extraction.
+	//! These are normally protected on Operator; Engine_Interface_FDTD has friend access.
+	ArrayLib::ArrayNIJK<float>* GetKappaPtr()  const {return m_Op->m_kappa_ptr;}
+	ArrayLib::ArrayNIJK<float>* GetEpsRPtr()   const {return m_Op->m_epsR_ptr;}
+	ArrayLib::ArrayNIJK<float>* GetMueRPtr()   const {return m_Op->m_mueR_ptr;}
 
 	virtual double* GetEField(const unsigned int* pos, double* out) const;
 	virtual double* GetHField(const unsigned int* pos, double* out) const;
