@@ -140,6 +140,9 @@ message(STATUS "Boost_INCLUDE_DIRS: ${Boost_INCLUDE_DIRS}")
 message(STATUS "Boost_LIBRARIES: ${Boost_LIBRARIES}")
 INCLUDE_DIRECTORIES (${Boost_INCLUDE_DIRS})
 
+# std::thread / std::mutex support
+find_package(Threads REQUIRED)
+
 # vtk
 find_package(VTK COMPONENTS vtkCommonCore NO_MODULE QUIET)
 if ("${VTK_VERSION}" VERSION_GREATER "9")
@@ -192,6 +195,7 @@ TARGET_LINK_LIBRARIES( openEMS
   ${Boost_LIBRARIES}
   ${vtk_LIBS}
   ${MPI_LIBRARIES}
+  Threads::Threads
 )
 
 if (WIN32)

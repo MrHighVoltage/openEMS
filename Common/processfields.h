@@ -78,6 +78,9 @@ public:
 	virtual bool NeedPermittivity() const;
 	virtual bool NeedPermeability() const;
 
+	void SetNumCalcThreads(unsigned int n) {m_numCalcThreads = n;}
+	unsigned int GetNumCalcThreads() const {return m_numCalcThreads;}
+
 protected:
 	DumpType m_DumpType;
 	FileType m_fileType;
@@ -98,8 +101,9 @@ protected:
 	unsigned int numLines[3];	//number of lines to dump
 	unsigned int* posLines[3];	//grid positions to dump
 	double* discLines[3];		//mesh disc lines to dump
+	unsigned int m_numCalcThreads;
 
-	//! Calculate and return the defined field. Caller has to cleanup the array.
+	//! Calculate the defined field.
 	bool CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field);
 };
 

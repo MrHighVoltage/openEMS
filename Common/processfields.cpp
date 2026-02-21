@@ -20,6 +20,7 @@
 #include "tools/vtk_file_writer.h"
 #include "tools/hdf5_file_writer.h"
 #include "processfields.h"
+#include "processfields_calc.h"
 #include "FDTD/engine_interface_fdtd.h"
 
 using std::cerr;
@@ -35,6 +36,7 @@ ProcessFields::ProcessFields(Engine_Interface_Base* eng_if) : Processing(eng_if)
 	m_HDF5_Dump_File = NULL;
 	SetPrecision(6);
 	m_dualTime = false;
+	m_numCalcThreads = 0;
 
 	// dump box should be always inside the snapped lines
 	m_SnapMethod = 1;
@@ -286,10 +288,48 @@ void ProcessFields::CalcMeshPos()
 
 bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 {
+	field.Init("Field", numLines);
+
+	Engine_Interface_FDTD* fdtd_if = dynamic_cast<Engine_Interface_FDTD*>(m_Eng_Interface);
+	if (fdtd_if)
+	{
+		const Engine* eng = fdtd_if->GetFDTDEngine();
+		const Operator* op = fdtd_if->GetFDTDOperator();
+		FieldCalc::MaterialContext mat;
+		mat.kappa = fdtd_if->GetKappaPtr();
+		mat.epsR = fdtd_if->GetEpsRPtr();
+		mat.mueR = fdtd_if->GetMueRPtr();
+
+		unsigned int nThreads = m_numCalcThreads;
+		if (nThreads == 0)
+		{
+			nThreads = std::thread::hardware_concurrency();
+			if (nThreads == 0)
+				nThreads = 1;
+		}
+
+		bool ok = false;
+		switch (eng->GetType())
+		{
+		case Engine::SSE:
+			ok = FieldCalc::CalcFieldForEngine<Engine_sse>(
+				static_cast<const Engine_sse*>(eng), op, mat, m_DumpType,
+				m_Eng_Interface->GetInterpolationType(), numLines, posLines, field, nThreads);
+			break;
+		case Engine::BASIC:
+			ok = FieldCalc::CalcFieldForEngine<Engine>(
+				eng, op, mat, m_DumpType, m_Eng_Interface->GetInterpolationType(),
+				numLines, posLines, field, nThreads);
+			break;
+		default:
+			break;
+		}
+		if (ok)
+			return true;
+	}
+
 	unsigned int pos[3];
 	double out[3];
-	//init the array
-	field.Init("Field", numLines);
 	switch (m_DumpType)
 	{
 	case E_FIELD_DUMP:
@@ -411,4 +451,3 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 		return false;
 	}
 }
-
