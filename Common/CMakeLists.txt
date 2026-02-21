@@ -3,6 +3,7 @@
 
 set(SOURCES
   ${SOURCES}
+  ${CMAKE_CURRENT_SOURCE_DIR}/async_field_writer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_base.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_base.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/processcurrent.cpp

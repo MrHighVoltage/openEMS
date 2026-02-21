@@ -20,6 +20,8 @@
 
 #include "processfields.h"
 
+class AsyncFieldWriter;
+
 class ProcessFieldsTD : public ProcessFields
 {
 public:
@@ -32,11 +34,18 @@ public:
 
 	virtual int Process();
 
+	virtual void FlushData();
+
 	//! Set the length of the filename timestep pad filled with zeros (default is 8)
 	void SetPadLength(int val) {pad_length=val;};
 
+	//! Set the number of ring-buffer slots for async I/O (0 = synchronous).
+	void SetAsyncWriteBuffers(unsigned int n) {m_asyncBuffers = n;}
+
 protected:
 	int pad_length;
+	unsigned int m_asyncBuffers;
+	AsyncFieldWriter* m_AsyncWriter;
 };
 
 #endif // PROCESSFIELDS_TD_H

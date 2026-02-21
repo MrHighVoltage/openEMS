@@ -16,6 +16,7 @@
 */
 
 #include "processfields_td.h"
+#include "async_field_writer.h"
 #include "Common/operator_base.h"
 #include "tools/vtk_file_writer.h"
 #include "tools/hdf5_file_writer.h"
@@ -28,10 +29,14 @@ using namespace std;
 ProcessFieldsTD::ProcessFieldsTD(Engine_Interface_Base* eng_if) : ProcessFields(eng_if)
 {
 	pad_length = 8;
+	m_asyncBuffers = 4;
+	m_AsyncWriter = NULL;
 }
 
 ProcessFieldsTD::~ProcessFieldsTD()
 {
+	delete m_AsyncWriter;
+	m_AsyncWriter = NULL;
 }
 
 void ProcessFieldsTD::InitProcess()
@@ -44,7 +49,24 @@ void ProcessFieldsTD::InitProcess()
 		m_Vtk_Dump_File->SetHeader(string("openEMS TD Field Dump -- Interpolation: ")+m_Eng_Interface->GetInterpolationTypeString());
 
 	if (m_HDF5_Dump_File)
+	{
 		m_HDF5_Dump_File->SetCurrentGroup("/FieldData/TD");
+		m_HDF5_Dump_File->OpenFile();
+	}
+
+	if (m_asyncBuffers > 0)
+	{
+		delete m_AsyncWriter;
+		m_AsyncWriter = new AsyncFieldWriter(m_asyncBuffers);
+	}
+}
+
+void ProcessFieldsTD::FlushData()
+{
+	if (m_AsyncWriter)
+		m_AsyncWriter->Flush();
+	if (m_HDF5_Dump_File)
+		m_HDF5_Dump_File->FlushFile();
 }
 
 int ProcessFieldsTD::Process()
@@ -54,23 +76,62 @@ int ProcessFieldsTD::Process()
 
 	string filename = m_filename;
 
-	ArrayLib::ArrayNIJK<float> field("TD_field", numLines);
-	bool success = CalcField(field);
+	std::shared_ptr<AsyncFieldWriter::FieldArray> field =
+		std::make_shared<AsyncFieldWriter::FieldArray>("TD_field", numLines);
+	bool success = CalcField(*field);
 
-	if (m_fileType==VTK_FILETYPE)
+	if (m_AsyncWriter)
+	{
+		if (m_fileType==VTK_FILETYPE)
+		{
+			unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
+			std::string fieldName = GetFieldNameByType(m_DumpType);
+			VTK_File_Writer* vtkWriter = m_Vtk_Dump_File;
+			m_AsyncWriter->Submit(field,
+				[vtkWriter, ts, fieldName](AsyncFieldWriter::FieldArray &data) -> bool
+				{
+					vtkWriter->SetTimestep(ts);
+					vtkWriter->ClearAllFields();
+					vtkWriter->AddVectorField(fieldName, data);
+					return vtkWriter->Write();
+				});
+		}
+		else if (m_fileType==HDF5_FILETYPE)
+		{
+			int padLength = pad_length;
+			unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
+			float time = (float)m_Eng_Interface->GetTime(m_dualTime);
+			HDF5_File_Writer* hdf5Writer = m_HDF5_Dump_File;
+			m_AsyncWriter->Submit(field,
+				[hdf5Writer, padLength, ts, time](AsyncFieldWriter::FieldArray &data) -> bool
+				{
+					stringstream ss;
+					ss << std::setw(padLength) << std::setfill('0') << ts;
+					bool ok = hdf5Writer->WriteVectorField<float>(ss.str(), data, g_settings.GetLegacyHDF5Dumps());
+					ok &= hdf5Writer->WriteAttribute("/FieldData/TD/"+ss.str(), "time", time);
+					return ok;
+				});
+		}
+		else
+		{
+			success = false;
+			cerr << "ProcessFieldsTD::Process: unknown File-Type" << endl;
+		}
+	}
+	else if (m_fileType==VTK_FILETYPE)
 	{
 		m_Vtk_Dump_File->SetTimestep(m_Eng_Interface->GetNumberOfTimesteps());
 		m_Vtk_Dump_File->ClearAllFields();
-		m_Vtk_Dump_File->AddVectorField(GetFieldNameByType(m_DumpType),field);
+		m_Vtk_Dump_File->AddVectorField(GetFieldNameByType(m_DumpType), *field);
 		success &= m_Vtk_Dump_File->Write();
 	}
 	else if (m_fileType==HDF5_FILETYPE)
 	{
 		stringstream ss;
 		ss << std::setw( pad_length ) << std::setfill( '0' ) << m_Eng_Interface->GetNumberOfTimesteps();
-		success &= m_HDF5_Dump_File->WriteVectorField<float>(ss.str(), field, g_settings.GetLegacyHDF5Dumps());
-		float time[1] = {(float)m_Eng_Interface->GetTime(m_dualTime)};
-		success &= m_HDF5_Dump_File->WriteAttribute("/FieldData/TD/"+ss.str(),"time",time,1);
+		success &= m_HDF5_Dump_File->WriteVectorField<float>(ss.str(), *field, g_settings.GetLegacyHDF5Dumps());
+		float time = (float)m_Eng_Interface->GetTime(m_dualTime);
+		success &= m_HDF5_Dump_File->WriteAttribute("/FieldData/TD/"+ss.str(), "time", time);
 	}
 	else
 	{
