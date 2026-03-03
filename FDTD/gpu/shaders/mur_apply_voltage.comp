@@ -1,0 +1,55 @@
+/*
+ * Mur 1st-order ABC: Apply to voltages stage.
+ *
+ * Overwrites the boundary face voltages with the Mur-corrected values:
+ *   V(nyP,  pos) = mur_nyP(i,j)
+ *   V(nyPP, pos) = mur_nyPP(i,j)
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf    { float volt[];     };
+layout(set=0, binding=1) buffer MurNyPBuf  { float mur_nyP[];  };
+layout(set=0, binding=2) buffer MurNyPPBuf { float mur_nyPP[]; };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz;
+    uint ny;
+    uint lineNr;
+    uint lineNrShift;   // unused but keeps PC consistent
+    uint numLinesP;
+    uint numLinesPP;
+};
+
+uint gridIdx(uint ny_dir, uint lineVal, uint i, uint j)
+{
+    if (ny_dir == 0u)
+        return lineVal * Ny*Nz + i * Nz + j;
+    else if (ny_dir == 1u)
+        return j * Ny*Nz + lineVal * Nz + i;
+    else
+        return i * Ny*Nz + j * Nz + lineVal;
+}
+
+uint compP(uint ny_dir)  { return (ny_dir + 1u) % 3u; }
+uint compPP(uint ny_dir) { return (ny_dir + 2u) % 3u; }
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint totalCells = numLinesP * numLinesPP;
+    if (gid >= totalCells) return;
+
+    uint i = gid / numLinesPP;
+    uint j = gid % numLinesPP;
+    uint N = Nx * Ny * Nz;
+
+    uint nP  = compP(ny);
+    uint nPP = compPP(ny);
+
+    uint gPos = gridIdx(ny, lineNr, i, j);
+
+    volt[nP  * N + gPos] = mur_nyP[gid];
+    volt[nPP * N + gPos] = mur_nyPP[gid];
+}

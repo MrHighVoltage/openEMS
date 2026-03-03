@@ -1,0 +1,70 @@
+/*
+ * UPML Post-Voltage Update compute shader.
+ *
+ * Implements (for each PML cell, 3 components):
+ *   f_help                = volt_flux[local_idx]     // partial result from pre-update
+ *   volt_flux[local_idx]  = volt[global_idx]         // save Yee-updated value as new flux
+ *   volt[global_idx]      = f_help + pml_vvfn[n] * volt_flux[local_idx]
+ *
+ * This runs AFTER the main Yee voltage update.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf     { float volt[];      };
+layout(set=0, binding=1) buffer VoltFluxBuf { float volt_flux[];  };
+layout(set=0, binding=2) buffer VVFNBuf     { float pml_vvfn[];  };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz;
+    uint pNx, pNy, pNz;
+    uint pStartX, pStartY, pStartZ;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint pN = pNx * pNy * pNz;
+    if (gid >= pN) return;
+
+    uint lz = gid % pNz;
+    uint ly = (gid / pNz) % pNy;
+    uint lx = gid / (pNy * pNz);
+
+    uint gx = lx + pStartX;
+    uint gy = ly + pStartY;
+    uint gz = lz + pStartZ;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+    uint g_base = gx * sYZ + gy * Nz + gz;
+    uint l_base = gid;
+
+    // --- Component 0 (x) ---
+    {
+        uint gi = g_base;
+        uint li = l_base;
+        float f_help = volt_flux[li];        // partial from pre-update
+        volt_flux[li] = volt[gi];            // save Yee result as new flux
+        volt[gi] = f_help + pml_vvfn[li] * volt_flux[li];
+    }
+
+    // --- Component 1 (y) ---
+    {
+        uint gi = N + g_base;
+        uint li = pN + l_base;
+        float f_help = volt_flux[li];
+        volt_flux[li] = volt[gi];
+        volt[gi] = f_help + pml_vvfn[li] * volt_flux[li];
+    }
+
+    // --- Component 2 (z) ---
+    {
+        uint gi = 2*N + g_base;
+        uint li = 2*pN + l_base;
+        float f_help = volt_flux[li];
+        volt_flux[li] = volt[gi];
+        volt[gi] = f_help + pml_vvfn[li] * volt_flux[li];
+    }
+}

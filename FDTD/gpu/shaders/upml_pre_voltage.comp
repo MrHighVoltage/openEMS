@@ -1,0 +1,87 @@
+/*
+ * UPML Pre-Voltage Update compute shader.
+ *
+ * Implements (for each PML cell, 3 components):
+ *   f_help    = pml_vv[n] * volt[global_idx] - pml_vvfo[n] * volt_flux[local_idx]
+ *   volt[global_idx]      = volt_flux[local_idx]   // save old flux as voltage
+ *   volt_flux[local_idx]  = f_help                  // save partial result
+ *
+ * This runs BEFORE the main Yee voltage update.
+ *
+ * Memory layout: N-I-J-K  index(n, x, y, z) = n * Nx*Ny*Nz + x * Ny*Nz + y * Nz + z
+ * PML local:     N-I-J-K  index(n, lx, ly, lz) = n * pNx*pNy*pNz + lx * pNy*pNz + ly * pNz + lz
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf     { float volt[];      };
+layout(set=0, binding=1) buffer VoltFluxBuf { float volt_flux[];  };
+layout(set=0, binding=2) buffer VVBuf       { float pml_vv[];    };
+layout(set=0, binding=3) buffer VVFOBuf     { float pml_vvfo[];  };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz;         // global grid size
+    uint pNx, pNy, pNz;      // PML region size (number of PML lines)
+    uint pStartX, pStartY, pStartZ; // PML region start position in global grid
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint pN = pNx * pNy * pNz;
+    if (gid >= pN) return;
+
+    // Decompose PML-local linear index → (lx, ly, lz)
+    uint lz = gid % pNz;
+    uint ly = (gid / pNz) % pNy;
+    uint lx = gid / (pNy * pNz);
+
+    // Global position
+    uint gx = lx + pStartX;
+    uint gy = ly + pStartY;
+    uint gz = lz + pStartZ;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+
+    // Global linear index for this cell
+    uint g_base = gx * sYZ + gy * Nz + gz;
+
+    // PML arrays are sized 3 * pN, same N-I-J-K layout
+    // local linear index
+    uint l_base = gid;  // lx * pNy*pNz + ly * pNz + lz
+
+    // --- Component 0 (x) ---
+    {
+        uint gi = g_base;          // component 0: offset 0
+        uint li = l_base;          // component 0: offset 0
+        float V   = volt[gi];
+        float F   = volt_flux[li];
+        float fh  = pml_vv[li] * V - pml_vvfo[li] * F;
+        volt[gi]      = F;        // save old flux as voltage
+        volt_flux[li] = fh;       // store partial result
+    }
+
+    // --- Component 1 (y) ---
+    {
+        uint gi = N + g_base;      // component 1
+        uint li = pN + l_base;     // component 1
+        float V   = volt[gi];
+        float F   = volt_flux[li];
+        float fh  = pml_vv[li] * V - pml_vvfo[li] * F;
+        volt[gi]      = F;
+        volt_flux[li] = fh;
+    }
+
+    // --- Component 2 (z) ---
+    {
+        uint gi = 2*N + g_base;    // component 2
+        uint li = 2*pN + l_base;   // component 2
+        float V   = volt[gi];
+        float F   = volt_flux[li];
+        float fh  = pml_vv[li] * V - pml_vvfo[li] * F;
+        volt[gi]      = F;
+        volt_flux[li] = fh;
+    }
+}

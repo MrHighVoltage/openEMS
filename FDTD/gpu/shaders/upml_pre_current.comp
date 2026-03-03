@@ -1,0 +1,77 @@
+/*
+ * UPML Pre-Current Update compute shader.
+ *
+ * Implements (for each PML cell, 3 components):
+ *   f_help    = pml_ii[n] * curr[global_idx] - pml_iifo[n] * curr_flux[local_idx]
+ *   curr[global_idx]      = curr_flux[local_idx]
+ *   curr_flux[local_idx]  = f_help
+ *
+ * This runs BEFORE the main Yee current update.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer CurrBuf     { float curr[];      };
+layout(set=0, binding=1) buffer CurrFluxBuf { float curr_flux[];  };
+layout(set=0, binding=2) buffer IIBuf       { float pml_ii[];    };
+layout(set=0, binding=3) buffer IIFOBuf     { float pml_iifo[];  };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz;
+    uint pNx, pNy, pNz;
+    uint pStartX, pStartY, pStartZ;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint pN = pNx * pNy * pNz;
+    if (gid >= pN) return;
+
+    uint lz = gid % pNz;
+    uint ly = (gid / pNz) % pNy;
+    uint lx = gid / (pNy * pNz);
+
+    uint gx = lx + pStartX;
+    uint gy = ly + pStartY;
+    uint gz = lz + pStartZ;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+    uint g_base = gx * sYZ + gy * Nz + gz;
+    uint l_base = gid;
+
+    // --- Component 0 (x) ---
+    {
+        uint gi = g_base;
+        uint li = l_base;
+        float I   = curr[gi];
+        float F   = curr_flux[li];
+        float fh  = pml_ii[li] * I - pml_iifo[li] * F;
+        curr[gi]      = F;
+        curr_flux[li] = fh;
+    }
+
+    // --- Component 1 (y) ---
+    {
+        uint gi = N + g_base;
+        uint li = pN + l_base;
+        float I   = curr[gi];
+        float F   = curr_flux[li];
+        float fh  = pml_ii[li] * I - pml_iifo[li] * F;
+        curr[gi]      = F;
+        curr_flux[li] = fh;
+    }
+
+    // --- Component 2 (z) ---
+    {
+        uint gi = 2*N + g_base;
+        uint li = 2*pN + l_base;
+        float I   = curr[gi];
+        float F   = curr_flux[li];
+        float fh  = pml_ii[li] * I - pml_iifo[li] * F;
+        curr[gi]      = F;
+        curr_flux[li] = fh;
+    }
+}

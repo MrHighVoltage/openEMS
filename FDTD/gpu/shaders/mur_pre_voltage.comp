@@ -1,0 +1,74 @@
+/*
+ * Mur 1st-order ABC: Pre-voltage update stage.
+ *
+ * 2D dispatch over the boundary face: one thread per (i,j) on the face.
+ *
+ * For each face cell (i,j):
+ *   mur_nyP(i,j)  = V(nyP,  pos_shift) - coeff_nyP(i,j)  * V(nyP,  pos)
+ *   mur_nyPP(i,j) = V(nyPP, pos_shift) - coeff_nyPP(i,j) * V(nyPP, pos)
+ *
+ * where pos[ny]=lineNr, pos[nyP]=i, pos[nyPP]=j
+ *   and pos_shift[ny]=lineNrShift, same for nyP/nyPP.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf     { float volt[];      };
+layout(set=0, binding=1) buffer MurNyPBuf   { float mur_nyP[];   };   // [numLinesP * numLinesPP]
+layout(set=0, binding=2) buffer MurNyPPBuf  { float mur_nyPP[];  };   // [numLinesP * numLinesPP]
+layout(set=0, binding=3) buffer CoeffNyPBuf { float coeff_nyP[]; };   // [numLinesP * numLinesPP]
+layout(set=0, binding=4) buffer CoeffNyPPBuf{ float coeff_nyPP[];};   // [numLinesP * numLinesPP]
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz;         // global grid
+    uint ny;                 // normal direction (0/1/2)
+    uint lineNr;             // boundary line position
+    uint lineNrShift;        // neighbor position (lineNr ± 1)
+    uint numLinesP;          // face dimension along nyP
+    uint numLinesPP;         // face dimension along nyPP
+};
+
+// Compute the flat grid index for a position given normal direction
+uint gridIdx(uint ny_dir, uint lineVal, uint i, uint j)
+{
+    // pos[ny]=lineVal, pos[nyP]=i, pos[nyPP]=j
+    // nyP=(ny+1)%3, nyPP=(ny+2)%3
+    if (ny_dir == 0u)
+        return lineVal * Ny*Nz + i * Nz + j;  // (lineVal, i, j)
+    else if (ny_dir == 1u)
+        return j * Ny*Nz + lineVal * Nz + i;  // (j, lineVal, i)
+    else
+        return i * Ny*Nz + j * Nz + lineVal;  // (i, j, lineVal)
+}
+
+// Get component index for nyP, nyPP
+uint compP(uint ny_dir)  { return (ny_dir + 1u) % 3u; }
+uint compPP(uint ny_dir) { return (ny_dir + 2u) % 3u; }
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint totalCells = numLinesP * numLinesPP;
+    if (gid >= totalCells) return;
+
+    uint i = gid / numLinesPP;
+    uint j = gid % numLinesPP;
+    uint N = Nx * Ny * Nz;
+
+    uint nP  = compP(ny);
+    uint nPP = compPP(ny);
+
+    // pos: boundary face
+    uint gPos     = gridIdx(ny, lineNr,      i, j);
+    // pos_shift: neighbor face
+    uint gShift   = gridIdx(ny, lineNrShift, i, j);
+
+    float c_nyP  = coeff_nyP[gid];
+    float c_nyPP = coeff_nyPP[gid];
+
+    // V(nyP, pos_shift) - coeff * V(nyP, pos)
+    mur_nyP[gid]  = volt[nP  * N + gShift] - c_nyP  * volt[nP  * N + gPos];
+    // V(nyPP, pos_shift) - coeff * V(nyPP, pos)
+    mur_nyPP[gid] = volt[nPP * N + gShift] - c_nyPP * volt[nPP * N + gPos];
+}

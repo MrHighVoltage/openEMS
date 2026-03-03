@@ -1,0 +1,70 @@
+/*
+ * UPML Post-Current Update compute shader.
+ *
+ * Implements (for each PML cell, 3 components):
+ *   f_help                = curr_flux[local_idx]
+ *   curr_flux[local_idx]  = curr[global_idx]
+ *   curr[global_idx]      = f_help + pml_iifn[n] * curr_flux[local_idx]
+ *
+ * This runs AFTER the main Yee current update.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer CurrBuf     { float curr[];      };
+layout(set=0, binding=1) buffer CurrFluxBuf { float curr_flux[];  };
+layout(set=0, binding=2) buffer IIFNBuf     { float pml_iifn[];  };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz;
+    uint pNx, pNy, pNz;
+    uint pStartX, pStartY, pStartZ;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint pN = pNx * pNy * pNz;
+    if (gid >= pN) return;
+
+    uint lz = gid % pNz;
+    uint ly = (gid / pNz) % pNy;
+    uint lx = gid / (pNy * pNz);
+
+    uint gx = lx + pStartX;
+    uint gy = ly + pStartY;
+    uint gz = lz + pStartZ;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+    uint g_base = gx * sYZ + gy * Nz + gz;
+    uint l_base = gid;
+
+    // --- Component 0 (x) ---
+    {
+        uint gi = g_base;
+        uint li = l_base;
+        float f_help = curr_flux[li];
+        curr_flux[li] = curr[gi];
+        curr[gi] = f_help + pml_iifn[li] * curr_flux[li];
+    }
+
+    // --- Component 1 (y) ---
+    {
+        uint gi = N + g_base;
+        uint li = pN + l_base;
+        float f_help = curr_flux[li];
+        curr_flux[li] = curr[gi];
+        curr[gi] = f_help + pml_iifn[li] * curr_flux[li];
+    }
+
+    // --- Component 2 (z) ---
+    {
+        uint gi = 2*N + g_base;
+        uint li = 2*pN + l_base;
+        float f_help = curr_flux[li];
+        curr_flux[li] = curr[gi];
+        curr[gi] = f_help + pml_iifn[li] * curr_flux[li];
+    }
+}
