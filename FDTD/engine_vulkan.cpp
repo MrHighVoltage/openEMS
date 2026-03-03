@@ -25,6 +25,7 @@
 #include "extensions/operator_ext_mur_abc.h"
 #include "extensions/engine_ext_lumpedRLC.h"
 #include "extensions/operator_ext_lumpedRLC.h"
+#include "Common/processing.h"
 #include "gpu_shader_spirv.h"
 #include "tools/constants.h"
 
@@ -157,6 +158,7 @@ void Engine_Vulkan::Init()
 	UploadCoefficients();
 	SetupGPUExcitation();
 	SetupGPUExtensions();
+	SetupFusedUPML();
 	SetupGPU_EnergyReduction();
 
 	// Upload initial (zero) field data to GPU
@@ -196,6 +198,8 @@ void Engine_Vulkan::Init()
 		cout << "  Pure GPU mode — double-buffered fire-and-forget submission" << endl;
 	if (m_hasGPU_UPML)
 		cout << "  GPU UPML active (" << m_gpuUPML.size() << " region(s))" << endl;
+	if (m_hasFusedUPML)
+		cout << "  Fused Yee+UPML kernels active" << endl;
 	if (m_hasGPU_Dispersive)
 		cout << "  GPU dispersive materials active (" << m_gpuDisp.size() << " order(s))" << endl;
 	if (m_hasGPU_TFSF)
@@ -1788,7 +1792,193 @@ void Engine_Vulkan::SetupGPU_RLC()
 
 void Engine_Vulkan::SetupGPU_Probes()
 {
-	// Placeholder for future probe gather setup
+	// Placeholder — actual probe setup happens in SetupProbeCache()
+	// after the initial PA->Process() recording run.
+}
+
+void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
+{
+	// Finalize probe recording: stop recording mode and build GPU resources
+	// from the cell accesses captured during the initial PA->Process().
+	m_recordingProbeAccess = false;
+
+	if (m_recordedCells.empty())
+	{
+		cerr << "[Vulkan] No probe cell accesses recorded — pipelining disabled." << endl;
+		m_hasGPU_Probes = false;
+		return;
+	}
+
+	// Deduplicate recorded cells
+	std::sort(m_recordedCells.begin(), m_recordedCells.end());
+	m_recordedCells.erase(std::unique(m_recordedCells.begin(), m_recordedCells.end()),
+	                      m_recordedCells.end());
+
+	m_probeCacheCount = (uint32_t)m_recordedCells.size();
+	cerr << "[Vulkan] Probe cache: " << m_probeCacheCount << " unique cells recorded." << endl;
+
+	// Build CPU-side cache map: key → index
+	m_probeCacheMap.clear();
+	m_probeCacheMap.reserve(m_probeCacheCount);
+	std::vector<uint32_t> probeIndices(m_probeCacheCount);
+	std::vector<uint32_t> probeFieldSel(m_probeCacheCount);
+
+	for (uint32_t i = 0; i < m_probeCacheCount; ++i)
+	{
+		uint64_t cell = m_recordedCells[i];
+		uint32_t fieldSel = (uint32_t)(cell >> 48);
+		uint32_t linearIdx = (uint32_t)(cell & 0x0000FFFFFFFFFFFF);
+		m_probeCacheMap[cell] = i;
+		probeIndices[i]  = linearIdx;
+		probeFieldSel[i] = fieldSel;
+	}
+
+	m_probeCacheCPU.resize(m_probeCacheCount, 0.0f);
+
+	// Free the recording vector
+	m_recordedCells.clear();
+	m_recordedCells.shrink_to_fit();
+
+	// Create GPU buffers for the gather shader
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	VkMemoryPropertyFlags dLoc  = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+	                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	VkDeviceSize idxSize = m_probeCacheCount * sizeof(uint32_t);
+	VkDeviceSize outSize = m_probeCacheCount * sizeof(float);
+
+	// Upload probe index buffer (read-only on GPU)
+	CreateGpuBuf(m_probeIdxBuf, idxSize, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, dLoc);
+	UploadGpuBuf(m_probeIdxBuf, probeIndices.data(), idxSize);
+
+	// Upload field selector buffer (read-only on GPU)
+	CreateGpuBuf(m_probeSelBuf, idxSize, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, dLoc);
+	UploadGpuBuf(m_probeSelBuf, probeFieldSel.data(), idxSize);
+
+	// Probe output buffer: try ReBAR for zero-copy CPU readback
+	CreateGpuBuf(m_probeOutBuf, outSize, usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	             m_voltMapped ? rebar : dLoc);
+
+	if (m_voltMapped) // ReBAR available
+	{
+		VkResult r = vkMapMemory(m_device, m_probeOutBuf.memory, 0, outSize, 0,
+		                         (void**)&m_probeOutMapped);
+		if (r != VK_SUCCESS)
+			m_probeOutMapped = nullptr;
+	}
+
+	// If no ReBAR, create a staging buffer for download
+	if (!m_probeOutMapped)
+	{
+		VkMemoryPropertyFlags hostVis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		CreateGpuBuf(m_probeStagingBuf, outSize,
+		             VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
+	}
+
+	// Create probe gather pipeline (re-use existing m_probeDescLayout with 5 bindings)
+	// Descriptor pool for 1 set, 5 storage buffer descriptors
+	VkDescriptorPoolSize poolSz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
+	VkDescriptorPoolCreateInfo dpi{};
+	dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	dpi.maxSets       = 1;
+	dpi.poolSizeCount = 1;
+	dpi.pPoolSizes    = &poolSz;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_probeDescPool));
+
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool     = m_probeDescPool;
+	ai.descriptorSetCount = 1;
+	ai.pSetLayouts        = &m_probeDescLayout;
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_probeGatherDescSet));
+
+	// Write descriptors: volt, curr, probeIdx, fieldSel, probeOut
+	VkBuffer bufs[5] = {m_voltBuf, m_currBuf, m_probeIdxBuf.buffer,
+	                     m_probeSelBuf.buffer, m_probeOutBuf.buffer};
+	VkDeviceSize sizes[5] = {m_fieldBufSize, m_fieldBufSize, idxSize, idxSize, outSize};
+	WriteDescriptorBuffers(m_device, m_probeGatherDescSet, bufs, sizes, 5);
+
+	// Create the probe gather compute pipeline using m_probePipeLayout
+	// The push constant is a single uint (count)
+	if (m_probePipeLayout == VK_NULL_HANDLE)
+	{
+		VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t)};
+		VkPipelineLayoutCreateInfo pli{};
+		pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+		pli.setLayoutCount         = 1;
+		pli.pSetLayouts            = &m_probeDescLayout;
+		pli.pushConstantRangeCount = 1;
+		pli.pPushConstantRanges    = &pcRange;
+		VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_probePipeLayout));
+	}
+
+	VkShaderModule mod = CreateShaderModule(gpu_spirv::gather_probes_data,
+	                                        gpu_spirv::gather_probes_size);
+	VkPipelineShaderStageCreateInfo stage{};
+	stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+	stage.module = mod;
+	stage.pName  = "main";
+
+	VkComputePipelineCreateInfo ci{};
+	ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	ci.stage  = stage;
+	ci.layout = m_probePipeLayout;
+	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_probePipeline));
+	vkDestroyShaderModule(m_device, mod, nullptr);
+
+	m_hasGPU_Probes = true;
+	cerr << "[Vulkan] Probe gather pipeline created (" << m_probeCacheCount
+	     << " cells, " << (m_probeOutMapped ? "ReBAR direct" : "staging") << " readback)." << endl;
+}
+
+void Engine_Vulkan::SnapshotProbeCache()
+{
+	if (!m_hasGPU_Probes || m_probeCacheCount == 0) return;
+
+	if (m_probeOutMapped)
+	{
+		// ReBAR: direct copy from mapped VRAM
+		memcpy(m_probeCacheCPU.data(), m_probeOutMapped,
+		       m_probeCacheCount * sizeof(float));
+	}
+	else
+	{
+		// No ReBAR: copy via staging buffer with a transfer command
+		VkDeviceSize sz = m_probeCacheCount * sizeof(float);
+		RunSingleCommand([&](VkCommandBuffer cmd)
+		{
+			VkBufferCopy region = {0, 0, sz};
+			vkCmdCopyBuffer(cmd, m_probeOutBuf.buffer,
+			                m_probeStagingBuf.buffer, 1, &region);
+		});
+
+		void* mapped;
+		VK_CHECK(vkMapMemory(m_device, m_probeStagingBuf.memory, 0, sz, 0, &mapped));
+		memcpy(m_probeCacheCPU.data(), mapped, sz);
+		vkUnmapMemory(m_device, m_probeStagingBuf.memory);
+	}
+}
+
+void Engine_Vulkan::SubmitSpeculative(unsigned int nTS)
+{
+	// Submit a batch of nTS timesteps without advancing the public numTS.
+	// We save/restore numTS around the call to IterateTS so the engine
+	// external state doesn't change until CommitSpeculative().
+	m_speculativeTS = nTS;
+	unsigned int savedTS = numTS;
+	IterateTS(nTS);      // internally advances numTS
+	numTS = savedTS;     // revert public numTS
+}
+
+void Engine_Vulkan::CommitSpeculative()
+{
+	if (m_speculativeTS == 0) return;
+	numTS += m_speculativeTS;
+	m_speculativeTS = 0;
 }
 
 // ===========================================================================
@@ -1953,6 +2143,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	uint32_t cN = (numLines[0]-1) * (numLines[1]-1) * (numLines[2]-1);
 	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
 	GridPC gridPC = {numLines[0], numLines[1], numLines[2], opVk->GetNumCompressed()};
+	FusedPC fusedPC = {numLines[0], numLines[1], numLines[2], opVk->GetNumCompressed(),
+	                   m_hasFusedUPML ? (uint32_t)m_gpuUPML.size() : 0u};
 	uint32_t voltGroups = (N  + 255) / 256;
 	uint32_t currGroups = (cN + 255) / 256;
 	uint32_t excVoltGroups = (m_excVoltCount + 255) / 256;
@@ -2010,6 +2202,225 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		{
 			uint32_t ts = numTS + iter;
 
+			if (m_hasFusedUPML)
+			{
+				// ============= FUSED Yee+UPML path =============
+				// Single dispatch replaces: UPML pre-volt + Yee volt + UPML post-volt
+				// Mur/RLC/Dispersive pre-voltage still dispatch separately before fused
+				if (m_hasGPU_Mur || m_hasGPU_RLC || m_hasGPU_Dispersive)
+				{
+					// Record non-UPML pre-voltage extensions
+					// Mur pre-voltage
+					if (!m_gpuMur.empty())
+						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPreVoltPipeline);
+					for (const auto& m : m_gpuMur)
+					{
+						if (ts < m.startTS) continue;
+						uint32_t groups = (m.totalCells + 255) / 256;
+						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+						                        m_murPipeLayout, 0, 1, &m.preDesc, 0, nullptr);
+						vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+						vkCmdDispatch(cmd, groups, 1, 1);
+					}
+					// RLC pre-voltage
+					if (m_hasGPU_RLC)
+					{
+						RlcPC pc = {m_gpuRLC.count};
+						uint32_t groups = (m_gpuRLC.count + 255) / 256;
+						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcPreVoltPipeline);
+						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+						                        m_rlcPrePipeLayout, 0, 1, &m_gpuRLC.preDesc, 0, nullptr);
+						vkCmdPushConstants(cmd, m_rlcPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
+						vkCmdDispatch(cmd, groups, 1, 1);
+					}
+					// Dispersive pre-voltage
+					if (!m_gpuDisp.empty())
+						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreVoltPipeline);
+					for (const auto& d : m_gpuDisp)
+					{
+						if (!d.voltADEOn) continue;
+						uint32_t groups = (d.count + 255) / 256;
+						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+						                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
+						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+						vkCmdDispatch(cmd, groups, 1, 1);
+					}
+					vkCmdPipelineBarrier(cmd,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						0, 1, &barrier, 0, nullptr, 0, nullptr);
+				}
+
+				// --- Fused voltage update (Yee + UPML pre + UPML post in one dispatch) ---
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fusedPipeLayout, 0, 1, &m_fusedVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(FusedPC), &fusedPC);
+				vkCmdDispatch(cmd, voltGroups, 1, 1);
+
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+				// --- Voltage excitation ---
+				if (hasExcVolt)
+				{
+					ExcPC epc = {m_excVoltCount, (int32_t)(ts+1), m_excSignalLen, m_excSignalPeriod};
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_excPipeLayout, 0, 1, &m_excVoltDescSet, 0, nullptr);
+					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+					                   0, sizeof(ExcPC), &epc);
+					vkCmdDispatch(cmd, excVoltGroups, 1, 1);
+
+					vkCmdPipelineBarrier(cmd,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						0, 1, &barrier, 0, nullptr, 0, nullptr);
+				}
+
+				// --- Post-voltage: non-UPML only (Mur, TF/SF) ---
+				// (UPML post-voltage is fused into the main dispatch above)
+				if (m_hasGPU_Mur || m_hasGPU_TFSF)
+				{
+					// Mur post-voltage
+					if (!m_gpuMur.empty())
+						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPostVoltPipeline);
+					for (const auto& m : m_gpuMur)
+					{
+						if (ts < m.startTS) continue;
+						uint32_t groups = (m.totalCells + 255) / 256;
+						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+						                        m_murPipeLayout, 0, 1, &m.postDesc, 0, nullptr);
+						vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+						vkCmdDispatch(cmd, groups, 1, 1);
+					}
+					// TF/SF voltage injection
+					if (m_hasGPU_TFSF && m_gpuTFSF.voltCount > 0 && tfsfExc)
+					{
+						TfsfPC tpc = {m_gpuTFSF.voltCount, (int32_t)(ts+1), tfsfSigLen, tfsfSigPeriod};
+						uint32_t groups = (m_gpuTFSF.voltCount + 255) / 256;
+						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfVoltPipeline);
+						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+						                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.voltDesc, 0, nullptr);
+						vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+						vkCmdDispatch(cmd, groups, 1, 1);
+					}
+					vkCmdPipelineBarrier(cmd,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						0, 1, &barrier, 0, nullptr, 0, nullptr);
+				}
+
+				// --- Apply2Voltages (dispersive, Mur, RLC — same as non-fused path) ---
+				if (!m_gpuDisp.empty())
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
+				for (const auto& d : m_gpuDisp)
+				{
+					if (!d.voltADEOn) continue;
+					DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
+					uint32_t groups = (d.count + 255) / 256;
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_dispApplyPipeLayout, 0, 1, &d.applyVoltDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+				if (!m_gpuMur.empty())
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
+				for (const auto& m : m_gpuMur)
+				{
+					if (ts < m.startTS) continue;
+					uint32_t groups = (m.totalCells + 255) / 256;
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_murPipeLayout, 0, 1, &m.applyDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+				if (m_hasGPU_RLC)
+				{
+					RlcPC pc = {m_gpuRLC.count};
+					uint32_t groups = (m_gpuRLC.count + 255) / 256;
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyVoltPipeline);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_rlcApplyPipeLayout, 0, 1, &m_gpuRLC.applyDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+
+				// --- Fused current update (Yee + UPML pre + UPML post) ---
+				// Pre-current non-UPML extensions (dispersive)
+				if (m_hasGPU_Dispersive)
+				{
+					if (!m_gpuDisp.empty())
+						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreCurrPipeline);
+					for (const auto& d : m_gpuDisp)
+					{
+						if (!d.currADEOn) continue;
+						uint32_t groups = (d.count + 255) / 256;
+						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+						                        m_dispPrePipeLayout, 0, 1, &d.preCurrDesc, 0, nullptr);
+						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+						vkCmdDispatch(cmd, groups, 1, 1);
+					}
+					vkCmdPipelineBarrier(cmd,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						0, 1, &barrier, 0, nullptr, 0, nullptr);
+				}
+
+				// Fused current dispatch (Yee + UPML pre/post)
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedCurrPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fusedPipeLayout, 0, 1, &m_fusedCurrDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(FusedPC), &fusedPC);
+				vkCmdDispatch(cmd, voltGroups, 1, 1);  // dispatch N threads (same as voltage)
+
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+				// --- Current excitation ---
+				if (hasExcCurr)
+				{
+					ExcPC epc = {m_excCurrCount, (int32_t)(ts+1), m_excSignalLen, m_excSignalPeriod};
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_excPipeLayout, 0, 1, &m_excCurrDescSet, 0, nullptr);
+					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+					                   0, sizeof(ExcPC), &epc);
+					vkCmdDispatch(cmd, excCurrGroups, 1, 1);
+
+					vkCmdPipelineBarrier(cmd,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						0, 1, &barrier, 0, nullptr, 0, nullptr);
+				}
+
+				// --- Post-current: TF/SF only (UPML is fused) ---
+				if (m_hasGPU_TFSF && m_gpuTFSF.currCount > 0 && tfsfExc)
+				{
+					TfsfPC tpc = {m_gpuTFSF.currCount, (int32_t)(ts), tfsfSigLen, tfsfSigPeriod};
+					uint32_t groups = (m_gpuTFSF.currCount + 255) / 256;
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfCurrPipeline);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.currDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+				// Dispersive apply current
+				if (!m_gpuDisp.empty())
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyCurrPipeline);
+				for (const auto& d : m_gpuDisp)
+				{
+					if (!d.currADEOn) continue;
+					DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
+					uint32_t groups = (d.count + 255) / 256;
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_dispApplyPipeLayout, 0, 1, &d.applyCurrDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+			}
+			else
+			{
+			// ============= Original separate-dispatch path =============
 			// === Pre-voltage extensions (GPU) ===
 			RecordVoltageExtensions(cmd, ts);
 
@@ -2127,10 +2538,6 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
 
-			// (No barrier needed: apply-to-voltage writes V, pre-current reads C
-			//  — different field buffers. The pre-current barrier inside
-			//  RecordCurrentExtensions covers the Yee dependency.)
-
 			// === Pre-current extensions (GPU) ===
 			RecordCurrentExtensions(cmd, ts);
 
@@ -2200,10 +2607,24 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
+			} // end else (original separate-dispatch path)
+		}
 
-			// (No final barrier: the pre-voltage barrier in the NEXT iteration —
-			//  or the implicit queue completion for the last iteration — ensures
-			//  all post-current writes are visible before anyone reads V or C.)
+		// --- Probe gather: append at end of batch ----------------------
+		if (m_hasGPU_Probes && m_probeCacheCount > 0)
+		{
+			// Final barrier: ensure all Yee/extension writes are visible
+			vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+			uint32_t probeGroups = (m_probeCacheCount + 255) / 256;
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_probePipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_probePipeLayout, 0, 1, &m_probeGatherDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_probePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(uint32_t), &m_probeCacheCount);
+			vkCmdDispatch(cmd, probeGroups, 1, 1);
 		}
 
 		// --- End + submit (fire-and-forget) ---
@@ -2373,6 +2794,9 @@ void Engine_Vulkan::CleanupVulkan()
 	// Energy reduction
 	CleanupGPU_EnergyReduction();
 
+	// Fused UPML
+	CleanupFusedUPML();
+
 	// Pipeline cache
 	if (m_pipelineCache) vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
 
@@ -2502,6 +2926,22 @@ void Engine_Vulkan::CleanupExtensions()
 	DestroyGpuBuf(m_gpuProbes.output);
 	m_gpuProbes = GpuProbeData{};
 
+	// --- Destroy probe cache GPU data (pipelined processing) ---
+	if (m_probeOutMapped)
+	{
+		vkUnmapMemory(m_device, m_probeOutBuf.memory);
+		m_probeOutMapped = nullptr;
+	}
+	DestroyGpuBuf(m_probeIdxBuf);
+	DestroyGpuBuf(m_probeSelBuf);
+	DestroyGpuBuf(m_probeOutBuf);
+	DestroyGpuBuf(m_probeStagingBuf);
+	if (m_probeDescPool) { vkDestroyDescriptorPool(m_device, m_probeDescPool, nullptr); m_probeDescPool = VK_NULL_HANDLE; }
+	m_probeGatherDescSet = VK_NULL_HANDLE; // freed with pool
+	m_probeCacheMap.clear();
+	m_probeCacheCPU.clear();
+	m_probeCacheCount = 0;
+
 	// Reset flags
 	m_hasGPU_UPML = false;
 	m_hasGPU_Dispersive = false;
@@ -2509,6 +2949,222 @@ void Engine_Vulkan::CleanupExtensions()
 	m_hasGPU_Mur = false;
 	m_hasGPU_RLC = false;
 	m_hasGPU_Probes = false;
+}
+
+// ===========================================================================
+// Fused Yee+UPML Pipeline
+// ===========================================================================
+
+void Engine_Vulkan::SetupFusedUPML()
+{
+	if (!m_hasGPU_UPML || m_gpuUPML.empty())
+		return;
+
+	// --- Compute total PML cells and build region metadata ---
+	struct PMLRegionGPU { uint32_t startX, startY, startZ, sizeX, sizeY, sizeZ, fluxOffset; };
+	std::vector<PMLRegionGPU> regions;
+	uint32_t totalPmlCells = 0;
+
+	for (const auto& u : m_gpuUPML)
+	{
+		PMLRegionGPU r;
+		r.startX = u.pc.pStartX;
+		r.startY = u.pc.pStartY;
+		r.startZ = u.pc.pStartZ;
+		r.sizeX  = u.pc.pNx;
+		r.sizeY  = u.pc.pNy;
+		r.sizeZ  = u.pc.pNz;
+		r.fluxOffset = totalPmlCells;  // per-component offset
+		regions.push_back(r);
+		totalPmlCells += u.totalCells;
+	}
+	m_fusedTotalPmlCells = totalPmlCells;
+
+	if (regions.size() > 6)
+	{
+		cerr << "Engine_Vulkan::SetupFusedUPML: too many PML regions (" << regions.size()
+		     << "), max 6 — falling back to separate dispatches" << endl;
+		return;
+	}
+
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	VkDeviceSize fluxBufSize = 3 * (VkDeviceSize)totalPmlCells * sizeof(float);
+	if (fluxBufSize == 0) return;
+
+	// --- Create concatenated buffers ---
+	CreateGpuBuf(m_fusedVoltFlux, fluxBufSize, rwUsage, dLoc);
+	CreateGpuBuf(m_fusedCurrFlux, fluxBufSize, rwUsage, dLoc);
+	CreateGpuBuf(m_fusedPmlVv,    fluxBufSize, usage, dLoc);
+	CreateGpuBuf(m_fusedPmlVvfo,  fluxBufSize, usage, dLoc);
+	CreateGpuBuf(m_fusedPmlVvfn,  fluxBufSize, usage, dLoc);
+	CreateGpuBuf(m_fusedPmlIi,    fluxBufSize, usage, dLoc);
+	CreateGpuBuf(m_fusedPmlIifo,  fluxBufSize, usage, dLoc);
+	CreateGpuBuf(m_fusedPmlIifn,  fluxBufSize, usage, dLoc);
+
+	// --- Upload concatenated data (copy from per-region buffers via staging) ---
+	// Initialize flux to zero
+	{
+		std::vector<float> zeros(3 * totalPmlCells, 0.0f);
+		UploadGpuBuf(m_fusedVoltFlux, zeros.data(), fluxBufSize);
+		UploadGpuBuf(m_fusedCurrFlux, zeros.data(), fluxBufSize);
+	}
+
+	// Copy per-region coefficient data into concatenated buffers
+	for (size_t ri = 0; ri < m_gpuUPML.size(); ++ri)
+	{
+		const auto& u = m_gpuUPML[ri];
+		VkDeviceSize regionFluxSize = 3 * (VkDeviceSize)u.totalCells * sizeof(float);
+		VkDeviceSize dstOffset = 3 * (VkDeviceSize)regions[ri].fluxOffset * sizeof(float);
+
+		// GPU-to-GPU copy: region buffer → concatenated buffer at correct offset
+		RunSingleCommand([&](VkCommandBuffer cmd)
+		{
+			VkBufferCopy copyRegion = {0, dstOffset, regionFluxSize};
+			vkCmdCopyBuffer(cmd, u.pmlVv.buffer,   m_fusedPmlVv.buffer,   1, &copyRegion);
+			vkCmdCopyBuffer(cmd, u.pmlVvfo.buffer, m_fusedPmlVvfo.buffer, 1, &copyRegion);
+			vkCmdCopyBuffer(cmd, u.pmlVvfn.buffer, m_fusedPmlVvfn.buffer, 1, &copyRegion);
+			vkCmdCopyBuffer(cmd, u.pmlIi.buffer,   m_fusedPmlIi.buffer,   1, &copyRegion);
+			vkCmdCopyBuffer(cmd, u.pmlIifo.buffer, m_fusedPmlIifo.buffer, 1, &copyRegion);
+			vkCmdCopyBuffer(cmd, u.pmlIifn.buffer, m_fusedPmlIifn.buffer, 1, &copyRegion);
+		});
+	}
+
+	// --- PML region metadata SSBO ---
+	VkDeviceSize regionInfoSize = regions.size() * sizeof(PMLRegionGPU);
+	CreateGpuBuf(m_fusedPmlRegionInfo, regionInfoSize, usage, dLoc);
+	UploadGpuBuf(m_fusedPmlRegionInfo, regions.data(), regionInfoSize);
+
+	// --- Descriptor set layout (10 bindings) ---
+	{
+		std::vector<VkDescriptorSetLayoutBinding> bindings(10);
+		for (uint32_t i = 0; i < 10; i++)
+			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+		VkDescriptorSetLayoutCreateInfo ci{};
+		ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		ci.bindingCount = 10;
+		ci.pBindings    = bindings.data();
+		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &m_fusedDescLayout));
+	}
+
+	// --- Pipeline layout (push constant = FusedPC, 20 bytes) ---
+	VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FusedPC)};
+	VkPipelineLayoutCreateInfo pli{};
+	pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pli.setLayoutCount         = 1;
+	pli.pSetLayouts            = &m_fusedDescLayout;
+	pli.pushConstantRangeCount = 1;
+	pli.pPushConstantRanges    = &pcRange;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_fusedPipeLayout));
+
+	// --- Descriptor pool (2 sets × 10 bindings) ---
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 * 2};
+	VkDescriptorPoolCreateInfo pi{};
+	pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	pi.maxSets       = 2;
+	pi.poolSizeCount = 1;
+	pi.pPoolSizes    = &poolSize;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &pi, nullptr, &m_fusedDescPool));
+
+	// --- Allocate descriptor sets ---
+	VkDescriptorSetLayout layouts[2] = {m_fusedDescLayout, m_fusedDescLayout};
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool     = m_fusedDescPool;
+	ai.descriptorSetCount = 2;
+	ai.pSetLayouts        = layouts;
+	VkDescriptorSet sets[2];
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, sets));
+	m_fusedVoltDescSet = sets[0];
+	m_fusedCurrDescSet = sets[1];
+
+	// --- Write fused voltage descriptors ---
+	{
+		VkBuffer bufs[10] = {
+			m_voltBuf, m_currBuf, m_opIndexBuf, m_vvCompBuf, m_viCompBuf,
+			m_fusedPmlRegionInfo.buffer, m_fusedVoltFlux.buffer,
+			m_fusedPmlVv.buffer, m_fusedPmlVvfo.buffer, m_fusedPmlVvfn.buffer
+		};
+		VkDeviceSize sizes[10] = {
+			m_fieldBufSize, m_fieldBufSize, m_opIndexBufSize,
+			m_coeffCompBufSize, m_coeffCompBufSize,
+			regionInfoSize, fluxBufSize,
+			fluxBufSize, fluxBufSize, fluxBufSize
+		};
+		WriteDescriptorBuffers(m_device, m_fusedVoltDescSet, bufs, sizes, 10);
+	}
+
+	// --- Write fused current descriptors ---
+	{
+		VkBuffer bufs[10] = {
+			m_currBuf, m_voltBuf, m_opIndexBuf, m_iiCompBuf, m_ivCompBuf,
+			m_fusedPmlRegionInfo.buffer, m_fusedCurrFlux.buffer,
+			m_fusedPmlIi.buffer, m_fusedPmlIifo.buffer, m_fusedPmlIifn.buffer
+		};
+		VkDeviceSize sizes[10] = {
+			m_fieldBufSize, m_fieldBufSize, m_opIndexBufSize,
+			m_coeffCompBufSize, m_coeffCompBufSize,
+			regionInfoSize, fluxBufSize,
+			fluxBufSize, fluxBufSize, fluxBufSize
+		};
+		WriteDescriptorBuffers(m_device, m_fusedCurrDescSet, bufs, sizes, 10);
+	}
+
+	// --- Create compute pipelines ---
+	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
+	{
+		VkPipelineShaderStageCreateInfo stage{};
+		stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+		stage.module = mod;
+		stage.pName  = "main";
+		VkComputePipelineCreateInfo ci{};
+		ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		ci.stage  = stage;
+		ci.layout = layout;
+		VkPipeline pipe;
+		VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &pipe));
+		return pipe;
+	};
+
+	VkShaderModule mod;
+	mod = CreateShaderModule(gpu_spirv::fused_update_voltages_data,
+	                         gpu_spirv::fused_update_voltages_size);
+	m_fusedVoltPipeline = makePipeline(mod, m_fusedPipeLayout);
+	vkDestroyShaderModule(m_device, mod, nullptr);
+
+	mod = CreateShaderModule(gpu_spirv::fused_update_currents_data,
+	                         gpu_spirv::fused_update_currents_size);
+	m_fusedCurrPipeline = makePipeline(mod, m_fusedPipeLayout);
+	vkDestroyShaderModule(m_device, mod, nullptr);
+
+	m_hasFusedUPML = true;
+	cout << "Engine_Vulkan: fused Yee+UPML kernels created ("
+	     << regions.size() << " regions, " << totalPmlCells << " PML cells)" << endl;
+}
+
+void Engine_Vulkan::CleanupFusedUPML()
+{
+	if (m_device == VK_NULL_HANDLE) return;
+	DestroyGpuBuf(m_fusedVoltFlux);
+	DestroyGpuBuf(m_fusedCurrFlux);
+	DestroyGpuBuf(m_fusedPmlVv);
+	DestroyGpuBuf(m_fusedPmlVvfo);
+	DestroyGpuBuf(m_fusedPmlVvfn);
+	DestroyGpuBuf(m_fusedPmlIi);
+	DestroyGpuBuf(m_fusedPmlIifo);
+	DestroyGpuBuf(m_fusedPmlIifn);
+	DestroyGpuBuf(m_fusedPmlRegionInfo);
+	if (m_fusedVoltPipeline) { vkDestroyPipeline(m_device, m_fusedVoltPipeline, nullptr); m_fusedVoltPipeline = VK_NULL_HANDLE; }
+	if (m_fusedCurrPipeline) { vkDestroyPipeline(m_device, m_fusedCurrPipeline, nullptr); m_fusedCurrPipeline = VK_NULL_HANDLE; }
+	if (m_fusedPipeLayout)   { vkDestroyPipelineLayout(m_device, m_fusedPipeLayout, nullptr); m_fusedPipeLayout = VK_NULL_HANDLE; }
+	if (m_fusedDescLayout)   { vkDestroyDescriptorSetLayout(m_device, m_fusedDescLayout, nullptr); m_fusedDescLayout = VK_NULL_HANDLE; }
+	if (m_fusedDescPool)     { vkDestroyDescriptorPool(m_device, m_fusedDescPool, nullptr); m_fusedDescPool = VK_NULL_HANDLE; }
+	m_fusedVoltDescSet = m_fusedCurrDescSet = VK_NULL_HANDLE;
+	m_hasFusedUPML = false;
 }
 
 // ===========================================================================
@@ -2680,6 +3336,29 @@ double Engine_Vulkan::CalcVoltageIntegralGPU(const unsigned int* start, const un
 	if (((start[0]!=stop[0]) + (start[1]!=stop[1]) + (start[2]!=stop[2]))!=1)
 		return 0.0;
 
+	// When recording probe accesses or reading from probe cache, go through
+	// GetVolt() which handles recording and cache lookup.
+	if (m_recordingProbeAccess || m_pipelinedReading)
+	{
+		double result = 0.0;
+		for (int n = 0; n < 3; ++n)
+		{
+			if (start[n] < stop[n])
+			{
+				unsigned int pos[3] = {start[0], start[1], start[2]};
+				for (; pos[n] < stop[n]; ++pos[n])
+					result += (double)GetVolt(n, pos[0], pos[1], pos[2]);
+			}
+			else if (start[n] > stop[n])
+			{
+				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
+				for (; pos[n] < start[n]; ++pos[n])
+					result -= (double)GetVolt(n, pos[0], pos[1], pos[2]);
+			}
+		}
+		return result;
+	}
+
 	DrainGPU();
 
 	double result = 0.0;
@@ -2732,6 +3411,28 @@ double Engine_Vulkan::CalcCurrentIntegralGPU(const unsigned int* start, const un
 {
 	if (((start[0]!=stop[0]) + (start[1]!=stop[1]) + (start[2]!=stop[2]))!=1)
 		return 0.0;
+
+	// When recording or in pipelined mode, go through GetCurr() for cache/recording
+	if (m_recordingProbeAccess || m_pipelinedReading)
+	{
+		double result = 0.0;
+		for (int n = 0; n < 3; ++n)
+		{
+			if (start[n] < stop[n])
+			{
+				unsigned int pos[3] = {start[0], start[1], start[2]};
+				for (; pos[n] < stop[n]; ++pos[n])
+					result += (double)GetCurr(n, pos[0], pos[1], pos[2]);
+			}
+			else if (start[n] > stop[n])
+			{
+				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
+				for (; pos[n] < start[n]; ++pos[n])
+					result -= (double)GetCurr(n, pos[0], pos[1], pos[2]);
+			}
+		}
+		return result;
+	}
 
 	DrainGPU();
 

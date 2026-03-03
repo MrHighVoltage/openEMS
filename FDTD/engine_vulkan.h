@@ -20,6 +20,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <unordered_map>
 
 class Operator_Ext_Excitation;
 class Operator_Ext_UPML;
@@ -74,6 +75,26 @@ public:
 	//! Check if async processing is supported (pure GPU mode, no CPU extensions).
 	bool HasAsyncProcessing() const { return m_asyncThread.joinable(); }
 
+	// --- Pipelined processing support -------------------------------------
+	//! Begin recording cell accesses. Call before PA->Process().
+	void StartProbeRecording() { m_recordedCells.clear(); m_recordingProbeAccess = true; }
+	//! Stop recording and build probe cache from recorded cells.
+	//! Must be called after PA->Process(). Creates GPU gather resources.
+	void SetupProbeCache(class ProcessingArray* PA);
+	//! After DrainGPU, snapshot gathered probe values into CPU cache.
+	void SnapshotProbeCache();
+	//! Enable/disable pipelined read mode. When enabled, GetVolt/GetCurr
+	//! return from the CPU-side probe cache instead of VRAM.
+	void EnablePipelinedReading(bool enable) { m_pipelinedReading = enable; }
+	//! Check if pipelined processing is active and usable.
+	bool HasPipelinedProcessing() const { return m_hasGPU_Probes && !m_hasCPUExtensions; }
+	//! Submit a speculative batch that does NOT advance the public numTS.
+	void SubmitSpeculative(unsigned int nTS);
+	//! Drain the speculative batch and advance numTS.
+	void CommitSpeculative();
+	//! Wait for all in-flight GPU work to complete.
+	void DrainGPU() const;
+
 	// --- Field access (lazy sync from GPU) --------------------------------
 	// Pure-GPU mode with ReBAR: DrainGPU() (typically a no-op since the
 	// ~50 µs compute is already done) then read directly from the
@@ -81,9 +102,26 @@ public:
 	// Hybrid mode / no-ReBAR fallback: download via staging buffer.
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
+		uint64_t linIdx = (uint64_t)n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
+		if (m_recordingProbeAccess)
+		{
+			m_recordedCells.push_back((uint64_t)0 << 48 | linIdx);
+			// still need to return a value — use zero during recording
+			if (!m_gpuDrained) DrainGPU();
+			if (m_voltMapped) return m_voltMapped[linIdx];
+			if (m_hostDirty) SyncFieldsToHost();
+			return Engine::GetVolt(n,x,y,z);
+		}
+		if (m_pipelinedReading)
+		{
+			auto it = m_probeCacheMap.find((uint64_t)0 << 48 | linIdx);
+			if (it != m_probeCacheMap.end())
+				return m_probeCacheCPU[it->second];
+			// Fallback: not in cache — must drain GPU
+		}
 		if (!m_gpuDrained) DrainGPU();
 		if (m_voltMapped)
-			return m_voltMapped[n * m_fieldN + x * m_strideYZ + y * numLines[2] + z];
+			return m_voltMapped[linIdx];
 		if (m_hostDirty) SyncFieldsToHost();
 		return Engine::GetVolt(n,x,y,z);
 	}
@@ -91,9 +129,24 @@ public:
 	{ return GetVolt(n, pos[0], pos[1], pos[2]); }
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
+		uint64_t linIdx = (uint64_t)n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
+		if (m_recordingProbeAccess)
+		{
+			m_recordedCells.push_back((uint64_t)1 << 48 | linIdx);
+			if (!m_gpuDrained) DrainGPU();
+			if (m_currMapped) return m_currMapped[linIdx];
+			if (m_hostDirty) SyncFieldsToHost();
+			return Engine::GetCurr(n,x,y,z);
+		}
+		if (m_pipelinedReading)
+		{
+			auto it = m_probeCacheMap.find((uint64_t)1 << 48 | linIdx);
+			if (it != m_probeCacheMap.end())
+				return m_probeCacheCPU[it->second];
+		}
 		if (!m_gpuDrained) DrainGPU();
 		if (m_currMapped)
-			return m_currMapped[n * m_fieldN + x * m_strideYZ + y * numLines[2] + z];
+			return m_currMapped[linIdx];
 		if (m_hostDirty) SyncFieldsToHost();
 		return Engine::GetCurr(n,x,y,z);
 	}
@@ -207,10 +260,6 @@ private:
 	//! Used only by hybrid path and non-ReBAR fallback.
 	void FlushGPU() const;
 
-	//! Ensure both in-flight command buffers are complete.  Called before
-	//! any CPU-side field read or operation that needs exclusive access.
-	void DrainGPU() const;
-
 	//! Upload CPU data to a device-local buffer via the staging buffer.
 	void UploadToDeviceBuffer(VkBuffer dst, const void* data, VkDeviceSize size);
 	//! Download device-local buffer to CPU via the staging buffer.
@@ -231,6 +280,7 @@ private:
 
 	//! Push constant structs matching the shader layouts.
 	struct GridPC   { uint32_t Nx, Ny, Nz, numComp; };
+	struct FusedPC  { uint32_t Nx, Ny, Nz, numComp, numPmlRegions; };
 	struct ExcPC    { uint32_t count; int32_t numTS; uint32_t sigLen; int32_t period; };
 
 	//! Push constant struct for UPML shaders (36 bytes = 9 × uint32).
@@ -327,6 +377,24 @@ private:
 		uint32_t count = 0;
 	};
 
+	// ---- Fused Yee+UPML pipeline (concatenated PML buffers) ----------
+	bool m_hasFusedUPML = false;
+	GpuBuf m_fusedVoltFlux;     //!< Concatenated volt flux (all PML regions)
+	GpuBuf m_fusedCurrFlux;     //!< Concatenated curr flux (all PML regions)
+	GpuBuf m_fusedPmlVv, m_fusedPmlVvfo, m_fusedPmlVvfn;   //!< Concatenated volt PML coeffs
+	GpuBuf m_fusedPmlIi, m_fusedPmlIifo, m_fusedPmlIifn;   //!< Concatenated curr PML coeffs
+	GpuBuf m_fusedPmlRegionInfo; //!< PML region metadata SSBO
+	uint32_t m_fusedTotalPmlCells = 0;  //!< Sum of all PML regions' cell counts
+	VkDescriptorSetLayout m_fusedDescLayout = VK_NULL_HANDLE;
+	VkPipelineLayout      m_fusedPipeLayout = VK_NULL_HANDLE;
+	VkPipeline            m_fusedVoltPipeline = VK_NULL_HANDLE;
+	VkPipeline            m_fusedCurrPipeline = VK_NULL_HANDLE;
+	VkDescriptorPool      m_fusedDescPool = VK_NULL_HANDLE;
+	VkDescriptorSet       m_fusedVoltDescSet = VK_NULL_HANDLE;
+	VkDescriptorSet       m_fusedCurrDescSet = VK_NULL_HANDLE;
+	void SetupFusedUPML();       //!< Create concatenated PML buffers + fused pipeline
+	void CleanupFusedUPML();     //!< Destroy fused UPML resources
+
 	// ---- Extension GPU instances --------------------------------------
 	VkDescriptorPool      m_extDescPool = VK_NULL_HANDLE;
 	std::vector<GpuUPMLData>  m_gpuUPML;
@@ -386,6 +454,22 @@ private:
 	bool m_hasGPU_Mur        = false;
 	bool m_hasGPU_RLC        = false;
 	bool m_hasGPU_Probes     = false;
+
+	// ---- Pipelined processing state -----------------------------------
+	bool m_pipelinedReading = false;   //!< When true, GetVolt/GetCurr use probe cache
+	mutable bool m_recordingProbeAccess = false; //!< When true, GetVolt/GetCurr record cell indices
+	mutable std::vector<uint64_t> m_recordedCells; //!< Recorded (fieldSel<<48 | linearIdx) during dry run
+	std::vector<float> m_probeCacheCPU;  //!< CPU-side snapshot of gathered probes
+	std::unordered_map<uint64_t, uint32_t> m_probeCacheMap; //!< field_linear_idx → cache index
+	uint32_t m_probeCacheCount = 0;     //!< Number of probe points
+	GpuBuf m_probeIdxBuf;              //!< GPU probe index buffer
+	GpuBuf m_probeSelBuf;              //!< GPU field selector (0=volt, 1=curr)
+	GpuBuf m_probeOutBuf;              //!< GPU probe output buffer (HOST_VISIBLE)
+	GpuBuf m_probeStagingBuf;          //!< Staging buffer for non-ReBAR probe download
+	float* m_probeOutMapped = nullptr;  //!< ReBAR-mapped probe output (or nullptr)
+	VkDescriptorSet  m_probeGatherDescSet = VK_NULL_HANDLE;
+	VkDescriptorPool m_probeDescPool     = VK_NULL_HANDLE;
+	unsigned int m_speculativeTS = 0;   //!< Timesteps in speculative batch
 
 	// ---- GPU energy reduction -----------------------------------------
 	static constexpr uint32_t ENERGY_NUM_WG = 256; //!< workgroups for energy reduction

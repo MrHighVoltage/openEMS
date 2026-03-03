@@ -1474,8 +1474,123 @@ void openEMS::RunFDTD()
 	//*************** simulate ************//
 
 	PA->PreProcess();
+
+#ifdef WITH_GPU
+	// --- GPU pipelined processing path ---
+	Engine_Vulkan* gpuEng = dynamic_cast<Engine_Vulkan*>(FDTD_Eng);
+	if (gpuEng)
+	{
+		// Enable probe access recording during initial PA->Process()
+		gpuEng->StartProbeRecording();
+	}
+#endif
+
 	int step=PA->Process();
 	if ((step<0) || (step>(int)NrTS)) step=NrTS;
+
+#ifdef WITH_GPU
+	if (gpuEng)
+	{
+		// Build the probe gather pipeline from recorded cell accesses
+		gpuEng->SetupProbeCache(PA);
+	}
+
+	// Use pipelined loop if probe gather is set up and no CPU extensions
+	if (gpuEng && gpuEng->HasPipelinedProcessing())
+	{
+		// ====== Pipelined GPU main loop ======
+		// Pipeline: GPU computes TS(N+1) while CPU processes TS(N).
+		//
+		// Prime: run first batch, drain, snapshot.
+		FDTD_Eng->IterateTS(step);                   // submit first batch
+		gpuEng->DrainGPU();                           // wait for first batch
+		gpuEng->SnapshotProbeCache();                 // capture probe results
+
+		while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
+		{
+			// Submit 1 speculative timestep (GPU starts, numTS NOT advanced)
+			gpuEng->SubmitSpeculative(1);
+
+			// Process the PREVIOUS batch's probe data (GPU concurrent)
+			gpuEng->EnablePipelinedReading(true);
+			step = PA->Process();
+			gpuEng->EnablePipelinedReading(false);
+
+			// Drain+commit speculative step → advance numTS by 1
+			gpuEng->DrainGPU();
+			gpuEng->CommitSpeculative();
+			gpuEng->SnapshotProbeCache();
+
+			// If step > 1, we need (step-1) more timesteps before next Process
+			if (step > 1)
+			{
+				int remaining = step - 1;
+				currTS = FDTD_Eng->GetNumberOfTimesteps();
+				if (remaining > (int)(NrTS - currTS)) remaining = NrTS - currTS;
+				if (remaining > 0)
+				{
+					FDTD_Eng->IterateTS(remaining);
+					gpuEng->DrainGPU();
+					gpuEng->SnapshotProbeCache();
+				}
+			}
+
+			// --- Energy estimation ---
+			if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
+			{
+				// Energy computation needs full field access — disable pipelined reading
+				currE = ProcField->CalcTotalEnergyEstimate();
+				if (currE>maxE)
+					maxE=currE;
+			}
+
+			currTS = FDTD_Eng->GetNumberOfTimesteps();
+			if ((step<0) || (step>(int)(NrTS - currTS))) step=NrTS - currTS;
+
+			// --- Timing and status output ---
+			gettimeofday(&currTime,NULL);
+			t_diff = CalcDiffTime(currTime,prevTime);
+
+			if (t_diff>4)
+			{
+				t_run = CalcDiffTime(currTime,startTime);
+				speed = numCells*(currTS-prevTS)/t_diff;
+				cout << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
+				cout << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
+				if (Eng_Ext_SSD==NULL)
+				{
+					currE = ProcField->CalcTotalEnergyEstimate();
+					if (currE>maxE)
+						maxE=currE;
+					if (maxE)
+						change = currE/maxE;
+					cout << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
+				}
+				else
+				{
+					change = Eng_Ext_SSD->GetLastDiff();
+					cout << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
+				}
+				prevTime=currTime;
+				prevTS=currTS;
+
+				PA->FlushNext();
+
+				if (m_DumpStats)
+					DumpRunStatistics(__OPENEMS_RUN_STAT_FILE__, t_run, currTS, speed, currE);
+				FDTD_Eng->NextInterval(speed);
+			}
+		}
+
+		// Final process for the last snapshot
+		gpuEng->EnablePipelinedReading(true);
+		PA->Process();
+		gpuEng->EnablePipelinedReading(false);
+	}
+	else
+#endif
+	{
+	// ====== Standard (non-pipelined) main loop ======
 	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
 	{
 		FDTD_Eng->IterateTS(step);
@@ -1525,6 +1640,7 @@ void openEMS::RunFDTD()
 			FDTD_Eng->NextInterval(speed);
 		}
 	}
+	} // end standard main loop
 	if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
 		cerr << "RunFDTD: Warning: Max. number of timesteps was reached before the end-criteria of -" << fabs(10.0*log10(endCrit)) << "dB was reached... " << endl << \
 				"\tYou may want to choose a higher number of max. timesteps... " << endl;
