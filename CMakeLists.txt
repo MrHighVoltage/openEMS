@@ -73,6 +73,57 @@ if (WITH_MPI)
 	message(STATUS "Found MPI. INCLUDE " ${MPI_INCLUDE_PATH})
 endif()
 
+option(WITH_GPU "Build Vulkan GPU FDTD engine (requires Vulkan SDK with glslc)" OFF)
+if (WITH_GPU)
+	find_package(Vulkan REQUIRED)
+	find_program(GLSLC glslc HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
+	ADD_DEFINITIONS(-DWITH_GPU)
+	INCLUDE_DIRECTORIES(${Vulkan_INCLUDE_DIRS})
+
+	message(STATUS "Found Vulkan: ${Vulkan_LIBRARIES}")
+	message(STATUS "glslc: ${GLSLC}")
+
+	# Compile GLSL shaders to SPIR-V
+	set(GPU_SHADER_SRC ${openEMS_SOURCE_DIR}/FDTD/gpu/shaders)
+	set(GPU_SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/gpu_shaders)
+	file(MAKE_DIRECTORY ${GPU_SHADER_OUT})
+
+	set(GPU_SHADER_NAMES
+		update_voltages update_currents apply_excitation
+		upml_pre_voltage upml_post_voltage upml_pre_current upml_post_current
+		dispersive_pre_voltage dispersive_pre_current
+		dispersive_apply_voltage dispersive_apply_current
+		tfsf_voltage tfsf_current
+		mur_pre_voltage mur_post_voltage mur_apply_voltage
+		rlc_pre_voltage rlc_apply_voltage
+		gather_probes reduce_energy
+	)
+	set(GPU_SPV_FILES)
+	foreach(S ${GPU_SHADER_NAMES})
+		add_custom_command(
+			OUTPUT ${GPU_SHADER_OUT}/${S}.spv
+			COMMAND ${GLSLC} -O ${GPU_SHADER_SRC}/${S}.comp -o ${GPU_SHADER_OUT}/${S}.spv
+			DEPENDS ${GPU_SHADER_SRC}/${S}.comp
+			COMMENT "Compiling shader ${S}.comp -> SPIR-V"
+		)
+		list(APPEND GPU_SPV_FILES ${GPU_SHADER_OUT}/${S}.spv)
+	endforeach()
+
+	# Generate C++ header with embedded SPIR-V byte arrays
+	add_custom_command(
+		OUTPUT ${GPU_SHADER_OUT}/gpu_shader_spirv.h
+		COMMAND ${CMAKE_COMMAND}
+			-DSPV_DIR=${GPU_SHADER_OUT}
+			-DSHADERS="${GPU_SHADER_NAMES}"
+			-DOUTPUT=${GPU_SHADER_OUT}/gpu_shader_spirv.h
+			-P ${GPU_SHADER_SRC}/embed_spirv.cmake
+		DEPENDS ${GPU_SPV_FILES} ${GPU_SHADER_SRC}/embed_spirv.cmake
+		COMMENT "Generating embedded SPIR-V header"
+	)
+	add_custom_target(gpu_shaders DEPENDS ${GPU_SHADER_OUT}/gpu_shader_spirv.h)
+	INCLUDE_DIRECTORIES(${GPU_SHADER_OUT})
+endif()
+
 # Set locations of extra CMake modules
 SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${openEMS_SOURCE_DIR}/cmake/Modules/")
 
@@ -183,6 +234,24 @@ if (${MPI_CXX_FOUND})
 	SET(CMAKE_CXX_COMPILER ${MPI_CXX_COMPILER})
 endif()
 
+# AVX2 + FMA compile flags for the AVX2 engine sources (must be set here, not in
+# subdirectory, because set_source_files_properties is directory-scoped in CMake)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx2 -mfma" COMPILER_SUPPORTS_AVX2_FMA)
+if(COMPILER_SUPPORTS_AVX2_FMA)
+  set_source_files_properties(
+    FDTD/operator_avx2.cpp
+    FDTD/engine_avx2.cpp
+    FDTD/operator_avx2_multithread.cpp
+    FDTD/engine_avx2_multithread.cpp
+    FDTD/engine_interface_avx2_fdtd.cpp
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma"
+  )
+  message(STATUS "AVX2+FMA engine: enabled")
+else()
+  message(WARNING "AVX2+FMA engine: compiler does not support -mavx2 -mfma, engine will not work at runtime on non-AVX2 CPUs")
+endif()
+
 add_library( openEMS SHARED ${SOURCES})
 #ADD_EXECUTABLE( openEMS main.cpp ${SOURCES})
 set_target_properties(openEMS PROPERTIES VERSION ${LIB_VERSION_STRING} SOVERSION ${LIB_VERSION_MAJOR} )
@@ -197,6 +266,11 @@ TARGET_LINK_LIBRARIES( openEMS
   ${MPI_LIBRARIES}
   Threads::Threads
 )
+
+if (WITH_GPU)
+  TARGET_LINK_LIBRARIES(openEMS Vulkan::Vulkan)
+  add_dependencies(openEMS gpu_shaders)
+endif()
 
 if (WIN32)
     # make sure "BUILD_OPENEMS_LIB" is only set for openEMS (dll) not openEMS_bin (exe)

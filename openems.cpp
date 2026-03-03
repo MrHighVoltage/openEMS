@@ -37,6 +37,15 @@
 #include "FDTD/extensions/engine_ext_steadystate.h"
 #include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/engine_interface_cylindrical_fdtd.h"
+#include "FDTD/operator_avx2.h"
+#include "FDTD/operator_avx2_multithread.h"
+#include "FDTD/engine_avx2.h"
+#include "FDTD/engine_avx2_multithread.h"
+#include "FDTD/engine_interface_avx2_fdtd.h"
+#ifdef WITH_GPU
+#include "FDTD/operator_vulkan.h"
+#include "FDTD/engine_vulkan.h"
+#endif
 #include "Common/processvoltage.h"
 #include "Common/processcurrent.h"
 #include "Common/processfieldprobe.h"
@@ -80,7 +89,7 @@ openEMS::openEMS()
 	m_debugBox = m_debugPEC = m_no_simulation = false;
 	m_DumpStats = false;
 
-	m_engine = EngineType_Multithreaded; //default engine type
+	m_engine = EngineType_AVX2_Multithreaded; //default engine type
 	m_engine_numThreads = 0;
 
 	m_Abort = false;
@@ -226,7 +235,11 @@ void openEMS::collectCommandLineArguments()
 					if (val == "fastest")
 					{
 						// default, don't show console output
-						m_engine = EngineType_Multithreaded;
+#ifdef WITH_GPU
+						m_engine = EngineType_GPU;
+#else
+						m_engine = EngineType_AVX2_Multithreaded;
+#endif
 					}
 					else if (val == "basic")
 					{
@@ -248,6 +261,23 @@ void openEMS::collectCommandLineArguments()
 						cout << "openEMS - enabled multithreading" << endl;
 						m_engine = EngineType_Multithreaded;
 					}
+#ifdef WITH_GPU
+					else if (val == "gpu")
+					{
+						cout << "openEMS - enabled Vulkan GPU engine" << endl;
+						m_engine = EngineType_GPU;
+					}
+#endif
+					else if (val == "avx2")
+					{
+						cout << "openEMS - enabled AVX2+FMA engine" << endl;
+						m_engine = EngineType_AVX2;
+					}
+					else if (val == "avx2-multithreaded")
+					{
+						cout << "openEMS - enabled AVX2+FMA multithreaded engine" << endl;
+						m_engine = EngineType_AVX2_Multithreaded;
+					}
 				}
 			),
 		    "Choose engine type \n\n"
@@ -256,6 +286,11 @@ void openEMS::collectCommandLineArguments()
 			"  sse: \tengine using SSE vector extensions\n"
 			"  sse-compressed: \tengine using compressed "
 			"operator + sse vector extensions\n"
+#ifdef WITH_GPU
+			"  gpu: \tVulkan GPU-accelerated engine\n"
+#endif
+			"  avx2: \tengine using AVX2+FMA vector extensions\n"
+			"  avx2-multithreaded: \tengine using AVX2+FMA + multithreading\n"
 			"  multithreaded: \tengine using compressed "
 #ifdef MPI_SUPPORT
 			"operator + sse vector extensions + MPI + multithreading\n"
@@ -469,6 +504,9 @@ Engine_Interface_FDTD* openEMS::NewEngineInterface(int multigridlevel)
 	Operator_Cylinder* op_cyl = dynamic_cast<Operator_Cylinder*>(FDTD_Op);
 	if (op_cyl)
 		return new Engine_Interface_Cylindrical_FDTD(op_cyl);
+	Operator_AVX2* op_avx2 = dynamic_cast<Operator_AVX2*>(FDTD_Op);
+	if (op_avx2)
+		return new Engine_Interface_AVX2_FDTD(op_avx2);
 	Operator_sse* op_sse = dynamic_cast<Operator_sse*>(FDTD_Op);
 	if (op_sse)
 		return new Engine_Interface_SSE_FDTD(op_sse);
@@ -754,6 +792,20 @@ bool openEMS::SetupOperator()
 	{
 		FDTD_Op = Operator_Multithread::New(m_engine_numThreads);
 	}
+	else if (m_engine == EngineType_AVX2)
+	{
+		FDTD_Op = Operator_AVX2::New();
+	}
+	else if (m_engine == EngineType_AVX2_Multithreaded)
+	{
+		FDTD_Op = Operator_AVX2_Multithread::New(m_engine_numThreads);
+	}
+#ifdef WITH_GPU
+	else if (m_engine == EngineType_GPU)
+	{
+		FDTD_Op = Operator_Vulkan::New();
+	}
+#endif
 	else
 	{
 		FDTD_Op = Operator::New();

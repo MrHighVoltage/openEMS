@@ -54,9 +54,17 @@ public:
 
 	unsigned int GetVoltCount() const {return Volt_Count;}
 	unsigned int GetVoltCount(int ny) const {return Volt_Count_Dir[ny];}
+	const unsigned int* GetVoltIndex(int n) const {return Volt_index[n];}
+	const unsigned short* GetVoltDir() const {return Volt_dir;}
+	const FDTD_FLOAT* GetVoltAmp() const {return Volt_amp;}
+	const unsigned int* GetVoltDelay() const {return Volt_delay;}
 
 	unsigned int GetCurrCount() const {return Curr_Count;}
 	unsigned int GetCurrCount(int ny) const {return Curr_Count_Dir[ny];}
+	const unsigned int* GetCurrIndex(int n) const {return Curr_index[n];}
+	const unsigned short* GetCurrDir() const {return Curr_dir;}
+	const FDTD_FLOAT* GetCurrAmp() const {return Curr_amp;}
+	const unsigned int* GetCurrDelay() const {return Curr_delay;}
 
 protected:
 	Operator_Ext_Excitation(Operator* op, Operator_Ext_Excitation* op_ext);

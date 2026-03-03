@@ -35,7 +35,11 @@ class Engine
 public:
 	enum EngineType
 	{
-		BASIC, SSE, UNKNOWN
+		BASIC, SSE, AVX2,
+#ifdef WITH_GPU
+		GPU,
+#endif
+		UNKNOWN
 	};
 
 	static Engine* New(const Operator* op);

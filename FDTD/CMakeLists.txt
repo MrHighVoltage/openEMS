@@ -7,9 +7,17 @@ if (WITH_MPI)
      )
 endif()
 
+if (WITH_GPU)
+  set(GPU_SOURCES
+     ${CMAKE_CURRENT_SOURCE_DIR}/engine_vulkan.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/operator_vulkan.cpp
+     )
+endif()
+
 set(SOURCES
   ${SOURCES}
   ${MPI_SOURCES}
+  ${GPU_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/engine.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_multithread.cpp
@@ -26,5 +34,10 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_sse_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_cylindrical_fdtd.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/operator_avx2.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_avx2.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/operator_avx2_multithread.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_avx2_multithread.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_avx2_fdtd.cpp
   PARENT_SCOPE
 )

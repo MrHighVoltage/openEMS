@@ -316,6 +316,11 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 				static_cast<const Engine_sse*>(eng), op, mat, m_DumpType,
 				m_Eng_Interface->GetInterpolationType(), numLines, posLines, field, nThreads);
 			break;
+#ifdef WITH_GPU
+		case Engine::GPU:
+			// GPU engine: lazy-syncs fields to CPU on first GetVolt/GetCurr,
+			// then uses the same base Engine template path.
+#endif
 		case Engine::BASIC:
 			ok = FieldCalc::CalcFieldForEngine<Engine>(
 				eng, op, mat, m_DumpType, m_Eng_Interface->GetInterpolationType(),
