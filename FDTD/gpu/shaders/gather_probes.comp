@@ -1,0 +1,40 @@
+/*
+ * Probe field gather shader.
+ *
+ * Sparse dispatch: one thread per probe sample point.
+ * Reads field values at sparse locations and writes them into a compact
+ * output buffer for efficient CPU readback.
+ *
+ * The CPU uploads pre-linearized field indices (dir*N + flat_idx) for each
+ * probe point. The shader gathers those field values into a contiguous
+ * output array that can be read back via ReBAR or a staging buffer.
+ *
+ * This avoids downloading the entire field arrays just to read a few probes.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf   { float volt[];     };
+layout(set=0, binding=1) buffer CurrBuf   { float curr[];     };
+layout(set=0, binding=2) buffer IdxBuf    { uint  probeIdx[]; };  // pre-linearized indices
+layout(set=0, binding=3) buffer FieldBuf  { uint  fieldSel[]; };  // 0 = volt, 1 = curr
+layout(set=0, binding=4) buffer OutputBuf { float probeOut[]; };  // compact output
+
+layout(push_constant) uniform PC {
+    uint count;  // total probe sample points
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    uint idx = probeIdx[gid];
+    uint sel = fieldSel[gid];
+
+    if (sel == 0u)
+        probeOut[gid] = volt[idx];
+    else
+        probeOut[gid] = curr[idx];
+}
