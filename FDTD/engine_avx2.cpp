@@ -1,0 +1,456 @@
+/*
+*	Copyright (C) 2026 openEMS contributors
+*
+*	This program is free software: you can redistribute it and/or modify
+*	it under the terms of the GNU General Public License as published by
+*	the Free Software Foundation, either version 3 of the License, or
+*	(at your option) any later version.
+*
+*	This program is distributed in the hope that it will be useful,
+*	but WITHOUT ANY WARRANTY; without even the implied warranty of
+*	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*	GNU General Public License for more details.
+*
+*	You should have received a copy of the GNU General Public License
+*	along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "engine_avx2.h"
+#include "tools/denormal.h"
+
+#include <immintrin.h>
+#include <cstring>
+#include <cmath>
+
+using std::cout;
+using std::endl;
+
+// --- 32-byte aligned allocation helper ---
+
+static f8vector* Alloc_f8_flat(size_t count)
+{
+	void* ptr = nullptr;
+	if (posix_memalign(&ptr, 32, sizeof(f8vector) * count) != 0)
+		return nullptr;
+	memset(ptr, 0, sizeof(f8vector) * count);
+	return static_cast<f8vector*>(ptr);
+}
+
+// --- AVX2 cross-lane shift helpers for z-boundary handling ---
+
+// Shift left by one float: [a b c d e f g h] -> [0 a b c d e f g]
+static inline __m256 avx2_shift_left_1f(__m256 val)
+{
+	__m256i vi = _mm256_castps_si256(val);
+	__m256i shifted_in_lane = _mm256_bslli_epi128(vi, 4);
+	__m256 perm = _mm256_permute2f128_ps(val, val, 0x00);
+	__m256 v3_broadcast = _mm256_permute_ps(perm, 0xFF);
+	__m256 shifted = _mm256_castsi256_ps(shifted_in_lane);
+	return _mm256_blend_ps(shifted, v3_broadcast, 0x10);
+}
+
+// Shift right by one float: [a b c d e f g h] -> [b c d e f g h 0]
+static inline __m256 avx2_shift_right_1f(__m256 val)
+{
+	__m256i vi = _mm256_castps_si256(val);
+	__m256i shifted_in_lane = _mm256_bsrli_epi128(vi, 4);
+	__m256 perm = _mm256_permute2f128_ps(val, val, 0x11);
+	__m256 v4_broadcast = _mm256_permute_ps(perm, 0x00);
+	__m256 shifted = _mm256_castsi256_ps(shifted_in_lane);
+	return _mm256_blend_ps(shifted, v4_broadcast, 0x08);
+}
+
+// ============================================================================
+// Engine_AVX2
+// ============================================================================
+
+Engine_AVX2* Engine_AVX2::New(const Operator_AVX2* op)
+{
+	cout << "Create FDTD engine (AVX2 + FMA, compressed flat arrays)" << endl;
+	Engine_AVX2* e = new Engine_AVX2(op);
+	e->Init();
+	return e;
+}
+
+Engine_AVX2::Engine_AVX2(const Operator_AVX2* op) : Engine(op)
+{
+	m_type = AVX2;
+	Op = op;
+	m_volt = nullptr;
+	m_curr = nullptr;
+	numVectors = (unsigned int)ceil((double)numLines[2] / 8.0);
+
+	// Strides for interleaved polarisation layout: N-fastest (I-J-K-N ordering)
+	m_vs_n = 1;
+	m_vs_z = 3;
+	m_vs_y = 3 * numVectors;
+	m_vs_x = 3 * numVectors * numLines[1];
+
+	// Flush denormals to zero for performance
+	Denormal::Disable();
+}
+
+Engine_AVX2::~Engine_AVX2()
+{
+	Reset();
+}
+
+void Engine_AVX2::Init()
+{
+	Engine::Init();
+
+	// Free the base class arrays — we use our own flat AVX2 arrays
+	delete volt_ptr;
+	volt_ptr = nullptr;
+	delete curr_ptr;
+	curr_ptr = nullptr;
+
+	size_t totalElems = (size_t)3 * numLines[0] * numLines[1] * numVectors;
+	m_volt = Alloc_f8_flat(totalElems);
+	m_curr = Alloc_f8_flat(totalElems);
+}
+
+void Engine_AVX2::Reset()
+{
+	free(m_volt);
+	m_volt = nullptr;
+	free(m_curr);
+	m_curr = nullptr;
+	Engine::Reset();
+}
+
+// ============================================================================
+// Voltage update with AVX2 + FMA + compressed operator + flat arrays
+//
+// FDTD voltage update equation (per polarisation):
+//   V_n = vv_n * V_n + vi_n * (curl_H)_n
+//
+// Uses FMA: result = fmadd(vv, V, vi * curl_H)
+//
+// Memory layout (I-J-K-N ordering):
+//   All 3 polarisations for same (x,y,z) are contiguous in memory.
+//   field[n + z*3 + y*vs_y + x*vs_x]
+//
+// Operator compression:
+//   Single index lookup Op->m_Op_index(x,y,z) into compact compressed tables.
+//   The compressed tables are tiny and stay cache-hot (typically <64 KB).
+//
+// Boundary handling:
+//   Branchless: i_shift_x = (x>0)*vs_x, i_shift_y = (y>0)*vs_y
+//   At x=0 or y=0, the shift is 0, making "(here) - (here-shift)" = 0.
+// ============================================================================
+
+void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
+{
+	f8vector* __restrict volt = m_volt;
+	f8vector* __restrict curr = m_curr;
+
+	const int vs_z = (int)m_vs_z;
+	const int vs_y = (int)m_vs_y;
+	const int vs_x = (int)m_vs_x;
+
+	unsigned int pos[3];
+	pos[0] = startX;
+
+	for (unsigned int posX = 0; posX < numX; ++posX)
+	{
+		// Branchless: 0 when at boundary, full stride otherwise
+		const int i_shift_x = (pos[0] > 0) * vs_x;
+
+		for (pos[1] = 0; pos[1] < numLines[1]; ++pos[1])
+		{
+			const int i_shift_y = (pos[1] > 0) * vs_y;
+
+			// --- Main loop: z_vec >= 1 (z-1 stays within allocation) ---
+			for (pos[2] = 1; pos[2] < numVectors; ++pos[2])
+			{
+				const unsigned int index = Op->m_Op_index(pos[0], pos[1], pos[2]);
+				const int base = (int)(pos[0] * m_vs_x + pos[1] * m_vs_y + pos[2] * m_vs_z);
+
+				// X-polarisation: V_x = vv_x * V_x + vi_x * (dHz/dy - dHy/dz)
+				{
+					__m256 v  = _mm256_load_ps(volt[base].f);
+					__m256 vv = _mm256_load_ps(Op->f8_vv_Comp[0][index].f);
+					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[0][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(curr[base + 2].f),
+						_mm256_load_ps(curr[base + 2 - i_shift_y].f)
+					);
+					curl = _mm256_sub_ps(curl,
+						_mm256_load_ps(curr[base + 1].f));
+					curl = _mm256_add_ps(curl,
+						_mm256_load_ps(curr[base + 1 - vs_z].f));
+
+					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
+					_mm256_store_ps(volt[base].f, v);
+				}
+
+				// Y-polarisation: V_y = vv_y * V_y + vi_y * (dHx/dz - dHz/dx)
+				{
+					__m256 v  = _mm256_load_ps(volt[base + 1].f);
+					__m256 vv = _mm256_load_ps(Op->f8_vv_Comp[1][index].f);
+					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[1][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(curr[base].f),
+						_mm256_load_ps(curr[base - vs_z].f)
+					);
+					curl = _mm256_sub_ps(curl,
+						_mm256_load_ps(curr[base + 2].f));
+					curl = _mm256_add_ps(curl,
+						_mm256_load_ps(curr[base + 2 - i_shift_x].f));
+
+					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
+					_mm256_store_ps(volt[base + 1].f, v);
+				}
+
+				// Z-polarisation: V_z = vv_z * V_z + vi_z * (dHy/dx - dHx/dy)
+				{
+					__m256 v  = _mm256_load_ps(volt[base + 2].f);
+					__m256 vv = _mm256_load_ps(Op->f8_vv_Comp[2][index].f);
+					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[2][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(curr[base + 1].f),
+						_mm256_load_ps(curr[base + 1 - i_shift_x].f)
+					);
+					curl = _mm256_sub_ps(curl,
+						_mm256_load_ps(curr[base].f));
+					curl = _mm256_add_ps(curl,
+						_mm256_load_ps(curr[base - i_shift_y].f));
+
+					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
+					_mm256_store_ps(volt[base + 2].f, v);
+				}
+			}
+
+			// --- Boundary: z_vec = 0 (z-1 wraps to last vector) ---
+			{
+				const unsigned int index = Op->m_Op_index(pos[0], pos[1], 0);
+				const int base = (int)(pos[0] * m_vs_x + pos[1] * m_vs_y);
+				const int end  = base + (int)((numVectors - 1) * m_vs_z);
+
+				// z-1 of Hy and Hx: shift from last vector
+				__m256 curr_Hy_zm1 = avx2_shift_left_1f(
+					_mm256_load_ps(curr[end + 1].f)
+				);
+				__m256 curr_Hx_zm1 = avx2_shift_left_1f(
+					_mm256_load_ps(curr[end].f)
+				);
+
+				// X-polarisation
+				{
+					__m256 v  = _mm256_load_ps(volt[base].f);
+					__m256 vv = _mm256_load_ps(Op->f8_vv_Comp[0][index].f);
+					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[0][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(curr[base + 2].f),
+						_mm256_load_ps(curr[base + 2 - i_shift_y].f)
+					);
+					curl = _mm256_sub_ps(curl, _mm256_load_ps(curr[base + 1].f));
+					curl = _mm256_add_ps(curl, curr_Hy_zm1);
+
+					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
+					_mm256_store_ps(volt[base].f, v);
+				}
+
+				// Y-polarisation
+				{
+					__m256 v  = _mm256_load_ps(volt[base + 1].f);
+					__m256 vv = _mm256_load_ps(Op->f8_vv_Comp[1][index].f);
+					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[1][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(curr[base].f),
+						curr_Hx_zm1
+					);
+					curl = _mm256_sub_ps(curl, _mm256_load_ps(curr[base + 2].f));
+					curl = _mm256_add_ps(curl, _mm256_load_ps(curr[base + 2 - i_shift_x].f));
+
+					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
+					_mm256_store_ps(volt[base + 1].f, v);
+				}
+
+				// Z-polarisation (no z-shift needed for z-pol voltage update)
+				{
+					__m256 v  = _mm256_load_ps(volt[base + 2].f);
+					__m256 vv = _mm256_load_ps(Op->f8_vv_Comp[2][index].f);
+					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[2][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(curr[base + 1].f),
+						_mm256_load_ps(curr[base + 1 - i_shift_x].f)
+					);
+					curl = _mm256_sub_ps(curl, _mm256_load_ps(curr[base].f));
+					curl = _mm256_add_ps(curl, _mm256_load_ps(curr[base - i_shift_y].f));
+
+					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
+					_mm256_store_ps(volt[base + 2].f, v);
+				}
+			}
+		}
+		++pos[0];
+	}
+}
+
+// ============================================================================
+// Current update with AVX2 + FMA + compressed operator + flat arrays
+//
+// FDTD current update equation (per polarisation):
+//   I_n = ii_n * I_n + iv_n * (curl_E)_n
+//
+// Uses forward differences (E at +1 positions) for the curl of E.
+// ============================================================================
+
+void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
+{
+	f8vector* __restrict volt = m_volt;
+	f8vector* __restrict curr = m_curr;
+
+	const int vs_z = (int)m_vs_z;
+	const int vs_y = (int)m_vs_y;
+	const int vs_x = (int)m_vs_x;
+
+	unsigned int pos[3];
+	pos[0] = startX;
+
+	for (unsigned int posX = 0; posX < numX; ++posX)
+	{
+		for (pos[1] = 0; pos[1] < numLines[1] - 1; ++pos[1])
+		{
+			// --- Main loop: z_vec < numVectors - 1 (z+1 within range) ---
+			for (pos[2] = 0; pos[2] < numVectors - 1; ++pos[2])
+			{
+				const unsigned int index = Op->m_Op_index(pos[0], pos[1], pos[2]);
+				const int base = (int)(pos[0] * m_vs_x + pos[1] * m_vs_y + pos[2] * m_vs_z);
+
+				// X-polarisation: I_x = ii_x * I_x + iv_x * (dEz/dy - dEy/dz)
+				{
+					__m256 c  = _mm256_load_ps(curr[base].f);
+					__m256 ii = _mm256_load_ps(Op->f8_ii_Comp[0][index].f);
+					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[0][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(volt[base + 2].f),
+						_mm256_load_ps(volt[base + 2 + vs_y].f)
+					);
+					curl = _mm256_sub_ps(curl,
+						_mm256_load_ps(volt[base + 1].f));
+					curl = _mm256_add_ps(curl,
+						_mm256_load_ps(volt[base + 1 + vs_z].f));
+
+					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
+					_mm256_store_ps(curr[base].f, c);
+				}
+
+				// Y-polarisation: I_y = ii_y * I_y + iv_y * (dEx/dz - dEz/dx)
+				{
+					__m256 c  = _mm256_load_ps(curr[base + 1].f);
+					__m256 ii = _mm256_load_ps(Op->f8_ii_Comp[1][index].f);
+					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[1][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(volt[base].f),
+						_mm256_load_ps(volt[base + vs_z].f)
+					);
+					curl = _mm256_sub_ps(curl,
+						_mm256_load_ps(volt[base + 2].f));
+					curl = _mm256_add_ps(curl,
+						_mm256_load_ps(volt[base + 2 + vs_x].f));
+
+					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
+					_mm256_store_ps(curr[base + 1].f, c);
+				}
+
+				// Z-polarisation: I_z = ii_z * I_z + iv_z * (dEy/dx - dEx/dy)
+				{
+					__m256 c  = _mm256_load_ps(curr[base + 2].f);
+					__m256 ii = _mm256_load_ps(Op->f8_ii_Comp[2][index].f);
+					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[2][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(volt[base + 1].f),
+						_mm256_load_ps(volt[base + 1 + vs_x].f)
+					);
+					curl = _mm256_sub_ps(curl,
+						_mm256_load_ps(volt[base].f));
+					curl = _mm256_add_ps(curl,
+						_mm256_load_ps(volt[base + vs_y].f));
+
+					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
+					_mm256_store_ps(curr[base + 2].f, c);
+				}
+			}
+
+			// --- Boundary: z_vec = numVectors - 1 (z+1 wraps to first vector) ---
+			{
+				const unsigned int posZ = numVectors - 1;
+				const unsigned int index = Op->m_Op_index(pos[0], pos[1], posZ);
+				const int base = (int)(pos[0] * m_vs_x + pos[1] * m_vs_y + posZ * m_vs_z);
+				const int base_z0 = (int)(pos[0] * m_vs_x + pos[1] * m_vs_y);
+
+				// z+1 of Ey and Ex: shift from first vector
+				__m256 volt_Ey_zp1 = avx2_shift_right_1f(
+					_mm256_load_ps(volt[base_z0 + 1].f)
+				);
+				__m256 volt_Ex_zp1 = avx2_shift_right_1f(
+					_mm256_load_ps(volt[base_z0].f)
+				);
+
+				// X-polarisation
+				{
+					__m256 c  = _mm256_load_ps(curr[base].f);
+					__m256 ii = _mm256_load_ps(Op->f8_ii_Comp[0][index].f);
+					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[0][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(volt[base + 2].f),
+						_mm256_load_ps(volt[base + 2 + vs_y].f)
+					);
+					curl = _mm256_sub_ps(curl, _mm256_load_ps(volt[base + 1].f));
+					curl = _mm256_add_ps(curl, volt_Ey_zp1);
+
+					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
+					_mm256_store_ps(curr[base].f, c);
+				}
+
+				// Y-polarisation
+				{
+					__m256 c  = _mm256_load_ps(curr[base + 1].f);
+					__m256 ii = _mm256_load_ps(Op->f8_ii_Comp[1][index].f);
+					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[1][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(volt[base].f),
+						volt_Ex_zp1
+					);
+					curl = _mm256_sub_ps(curl, _mm256_load_ps(volt[base + 2].f));
+					curl = _mm256_add_ps(curl, _mm256_load_ps(volt[base + 2 + vs_x].f));
+
+					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
+					_mm256_store_ps(curr[base + 1].f, c);
+				}
+
+				// Z-polarisation (no z-shift for z-pol current update)
+				{
+					__m256 c  = _mm256_load_ps(curr[base + 2].f);
+					__m256 ii = _mm256_load_ps(Op->f8_ii_Comp[2][index].f);
+					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[2][index].f);
+
+					__m256 curl = _mm256_sub_ps(
+						_mm256_load_ps(volt[base + 1].f),
+						_mm256_load_ps(volt[base + 1 + vs_x].f)
+					);
+					curl = _mm256_sub_ps(curl, _mm256_load_ps(volt[base].f));
+					curl = _mm256_add_ps(curl, _mm256_load_ps(volt[base + vs_y].f));
+
+					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
+					_mm256_store_ps(curr[base + 2].f, c);
+				}
+			}
+		}
+		++pos[0];
+	}
+}

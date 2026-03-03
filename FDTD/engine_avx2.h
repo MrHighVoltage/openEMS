@@ -1,0 +1,93 @@
+/*
+*	Copyright (C) 2026 openEMS contributors
+*
+*	This program is free software: you can redistribute it and/or modify
+*	it under the terms of the GNU General Public License as published by
+*	the Free Software Foundation, either version 3 of the License, or
+*	(at your option) any later version.
+*
+*	This program is distributed in the hope that it will be useful,
+*	but WITHOUT ANY WARRANTY; without even the implied warranty of
+*	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*	GNU General Public License for more details.
+*
+*	You should have received a copy of the GNU General Public License
+*	along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#ifndef ENGINE_AVX2_H
+#define ENGINE_AVX2_H
+
+#include "engine.h"
+#include "operator_avx2.h"
+
+class Engine_AVX2 : public Engine
+{
+public:
+	static Engine_AVX2* New(const Operator_AVX2* op);
+	virtual ~Engine_AVX2();
+
+	virtual void Init();
+	virtual void Reset();
+
+	virtual unsigned int GetNumberOfTimesteps() { return numTS; }
+
+	// Scalar element access (for post-processing / probes)
+	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{
+		return m_volt[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
+	}
+	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
+	{
+		return m_volt[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
+	}
+	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{
+		return m_curr[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
+	}
+	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
+	{
+		return m_curr[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
+	}
+
+	inline virtual void SetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
+	{
+		m_volt[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors] = value;
+	}
+	inline virtual void SetVolt(unsigned int n, const unsigned int pos[3], FDTD_FLOAT value)
+	{
+		m_volt[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors] = value;
+	}
+	inline virtual void SetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
+	{
+		m_curr[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors] = value;
+	}
+	inline virtual void SetCurr(unsigned int n, const unsigned int pos[3], FDTD_FLOAT value)
+	{
+		m_curr[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors] = value;
+	}
+
+protected:
+	Engine_AVX2(const Operator_AVX2* op);
+	const Operator_AVX2* Op;
+
+	virtual void UpdateVoltages(unsigned int startX, unsigned int numX);
+	virtual void UpdateCurrents(unsigned int startX, unsigned int numX);
+
+	unsigned int numVectors; //!< number of 8-wide AVX vectors along z
+
+public: // public access for efficient extension/interface access
+	//! Flat field arrays with interleaved polarisations.
+	//! Layout: m_volt[n + z_vec * m_vs_z + y * m_vs_y + x * m_vs_x]
+	//! where n=0,1,2 (polarisation) is the fastest dimension.
+	f8vector* m_volt;
+	f8vector* m_curr;
+
+	// Strides (in f8vector units)
+	unsigned int m_vs_n; //!< polarisation stride = 1
+	unsigned int m_vs_z; //!< z-vector stride = 3
+	unsigned int m_vs_y; //!< y stride = 3 * numVectors
+	unsigned int m_vs_x; //!< x stride = 3 * numVectors * numLines[1]
+};
+
+#endif // ENGINE_AVX2_H
