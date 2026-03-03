@@ -1,0 +1,2840 @@
+/*
+*	Copyright (C) 2026 openEMS contributors
+*
+*	This program is free software: you can redistribute it and/or modify
+*	it under the terms of the GNU General Public License as published by
+*	the Free Software Foundation, either version 3 of the License, or
+*	(at your option) any later version.
+*/
+
+#ifdef WITH_GPU
+
+#include "engine_vulkan.h"
+#include "operator_vulkan.h"
+#include "operator.h"
+#include "extensions/engine_extension.h"
+#include "extensions/engine_ext_excitation.h"
+#include "extensions/operator_ext_excitation.h"
+#include "extensions/engine_ext_upml.h"
+#include "extensions/operator_ext_upml.h"
+#include "extensions/engine_ext_lorentzmaterial.h"
+#include "extensions/operator_ext_lorentzmaterial.h"
+#include "extensions/engine_ext_tfsf.h"
+#include "extensions/operator_ext_tfsf.h"
+#include "extensions/engine_ext_mur_abc.h"
+#include "extensions/operator_ext_mur_abc.h"
+#include "extensions/engine_ext_lumpedRLC.h"
+#include "extensions/operator_ext_lumpedRLC.h"
+#include "gpu_shader_spirv.h"
+#include "tools/constants.h"
+
+#include <iostream>
+#include <cstring>
+#include <stdexcept>
+#include <functional>
+#include <algorithm>
+
+using std::cerr;
+using std::cout;
+using std::endl;
+
+// ---------------------------------------------------------------------------
+// Vulkan error checking
+// ---------------------------------------------------------------------------
+#define VK_CHECK(call) \
+	do { \
+		VkResult _r = (call); \
+		if (_r != VK_SUCCESS) { \
+			cerr << "Vulkan error " << _r << " at " << __FILE__ << ":" << __LINE__ << endl; \
+			throw std::runtime_error("Vulkan call failed"); \
+		} \
+	} while(0)
+
+// ===========================================================================
+// Construction / Destruction
+// ===========================================================================
+
+Engine_Vulkan* Engine_Vulkan::New(const Operator* op)
+{
+	cout << "Create Vulkan GPU engine" << endl;
+	Engine_Vulkan* e = new Engine_Vulkan(op);
+	e->Init();
+	return e;
+}
+
+Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
+{
+	m_type = GPU;
+
+	m_instance       = VK_NULL_HANDLE;
+	m_physDevice     = VK_NULL_HANDLE;
+	m_device         = VK_NULL_HANDLE;
+	m_computeQueue   = VK_NULL_HANDLE;
+	m_computeQueueFamily = 0;
+
+	m_voltBuf = m_currBuf = VK_NULL_HANDLE;
+	m_voltMem = m_currMem = VK_NULL_HANDLE;
+	m_opIndexBuf = VK_NULL_HANDLE;
+	m_opIndexMem = VK_NULL_HANDLE;
+	m_vvCompBuf = m_viCompBuf = m_iiCompBuf = m_ivCompBuf = VK_NULL_HANDLE;
+	m_vvCompMem = m_viCompMem = m_iiCompMem = m_ivCompMem = VK_NULL_HANDLE;
+	m_opIndexBufSize = 0;
+	m_coeffCompBufSize = 0;
+	m_stagingBuf = VK_NULL_HANDLE;
+	m_stagingMem = VK_NULL_HANDLE;
+	m_fieldBufSize = 0;
+	m_voltMapped = nullptr;
+	m_currMapped = nullptr;
+	m_fieldN     = 0;
+	m_strideYZ   = 0;
+
+	m_excVoltIdxBuf = m_excVoltAmpBuf = m_excVoltDelayBuf = VK_NULL_HANDLE;
+	m_excVoltIdxMem = m_excVoltAmpMem = m_excVoltDelayMem = VK_NULL_HANDLE;
+	m_excCurrIdxBuf = m_excCurrAmpBuf = m_excCurrDelayBuf = VK_NULL_HANDLE;
+	m_excCurrIdxMem = m_excCurrAmpMem = m_excCurrDelayMem = VK_NULL_HANDLE;
+	m_excSignalVoltBuf = m_excSignalCurrBuf = VK_NULL_HANDLE;
+	m_excSignalVoltMem = m_excSignalCurrMem = VK_NULL_HANDLE;
+	m_excVoltCount = m_excCurrCount = 0;
+	m_excSignalLen = 0;
+	m_excSignalPeriod = 0;
+
+	m_fdtdDescLayout = VK_NULL_HANDLE;
+	m_excDescLayout  = VK_NULL_HANDLE;
+	m_descPool       = VK_NULL_HANDLE;
+	m_updateVoltDescSet = m_updateCurrDescSet = VK_NULL_HANDLE;
+	m_excVoltDescSet = m_excCurrDescSet = VK_NULL_HANDLE;
+
+	m_fdtdPipeLayout = VK_NULL_HANDLE;
+	m_excPipeLayout  = VK_NULL_HANDLE;
+	m_updateVoltPipeline = m_updateCurrPipeline = m_excPipeline = VK_NULL_HANDLE;
+
+	m_cmdPool = VK_NULL_HANDLE;
+	m_cmdBufs[0] = m_cmdBufs[1] = VK_NULL_HANDLE;
+	m_utilCmdBuf = VK_NULL_HANDLE;
+	m_fences[0] = m_fences[1] = VK_NULL_HANDLE;
+	m_utilFence = VK_NULL_HANDLE;
+	m_cmdIdx = 0;
+	m_gpuInFlight[0] = m_gpuInFlight[1] = false;
+
+	m_hostDirty   = false;
+	m_deviceDirty = false;
+	m_hasCPUExtensions  = false;
+	m_hasGPUExcitation  = false;
+	m_gpuDrained  = true;
+	m_pipelineCache = VK_NULL_HANDLE;
+}
+
+Engine_Vulkan::~Engine_Vulkan()
+{
+	// Shut down async processing thread first
+	if (m_asyncThread.joinable())
+	{
+		{
+			std::lock_guard<std::mutex> lk(m_asyncMutex);
+			m_asyncShutdown = true;
+			m_asyncCond.notify_one();
+		}
+		m_asyncThread.join();
+	}
+	DrainGPU();
+	Reset();
+}
+
+// ===========================================================================
+// Init / Reset
+// ===========================================================================
+
+void Engine_Vulkan::Init()
+{
+	// Base class allocates CPU arrays (volt_ptr, curr_ptr) and extensions
+	Engine::Init();
+
+	// Vulkan resources
+	InitVulkan();
+	CreateBuffers();
+	CreateDescriptors();
+	CreatePipelines();
+	UploadCoefficients();
+	SetupGPUExcitation();
+	SetupGPUExtensions();
+	SetupGPU_EnergyReduction();
+
+	// Upload initial (zero) field data to GPU
+	if (m_voltMapped)
+	{
+		// ReBAR: direct memcpy through the persistently mapped pointer
+		memcpy(m_voltMapped, volt_ptr->data(), m_fieldBufSize);
+		memcpy(m_currMapped, curr_ptr->data(), m_fieldBufSize);
+	}
+	else
+	{
+		UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+		UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
+	}
+
+	m_hostDirty  = false;
+	m_deviceDirty = false;
+
+	// Print GPU info
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(m_physDevice, &props);
+	cout << "Engine_Vulkan: using " << props.deviceName << endl;
+	cout << "  Field buffer size: " << (m_fieldBufSize / (1024*1024)) << " MB per field" << endl;
+	{
+		const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
+		cout << "  Compressed operator: " << opVk->GetNumCompressed() << " unique coeff sets"
+		     << " (index: " << (m_opIndexBufSize / 1024) << " KB, tables: "
+		     << (4 * m_coeffCompBufSize / 1024) << " KB)" << endl;
+	}
+	if (m_voltMapped)
+		cout << "  ReBAR active — zero-copy CPU field reads from VRAM" << endl;
+	else
+		cout << "  ReBAR not available — using staging buffer for field sync" << endl;
+	if (m_hasCPUExtensions)
+		cout << "  WARNING: CPU extensions present — hybrid mode (slower)" << endl;
+	else
+		cout << "  Pure GPU mode — double-buffered fire-and-forget submission" << endl;
+	if (m_hasGPU_UPML)
+		cout << "  GPU UPML active (" << m_gpuUPML.size() << " region(s))" << endl;
+	if (m_hasGPU_Dispersive)
+		cout << "  GPU dispersive materials active (" << m_gpuDisp.size() << " order(s))" << endl;
+	if (m_hasGPU_TFSF)
+		cout << "  GPU TF/SF active (V:" << m_gpuTFSF.voltCount << " I:" << m_gpuTFSF.currCount << " points)" << endl;
+	if (m_hasGPU_Mur)
+		cout << "  GPU Mur ABC active (" << m_gpuMur.size() << " face(s))" << endl;
+	if (m_hasGPU_RLC)
+		cout << "  GPU lumped RLC active (" << m_gpuRLC.count << " elements)" << endl;
+	cout << "  GPU energy reduction active (" << ENERGY_NUM_WG << " workgroups)" << endl;
+}
+
+void Engine_Vulkan::Reset()
+{
+	CleanupVulkan();
+	Engine::Reset();
+}
+
+// ===========================================================================
+// Vulkan Initialisation
+// ===========================================================================
+
+void Engine_Vulkan::InitVulkan()
+{
+	// --- Instance ---
+	VkApplicationInfo appInfo{};
+	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	appInfo.pApplicationName = "openEMS";
+	appInfo.apiVersion = VK_API_VERSION_1_0;
+
+	VkInstanceCreateInfo instInfo{};
+	instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	instInfo.pApplicationInfo = &appInfo;
+	VK_CHECK(vkCreateInstance(&instInfo, nullptr, &m_instance));
+
+	// --- Physical device ---
+	uint32_t devCount = 0;
+	vkEnumeratePhysicalDevices(m_instance, &devCount, nullptr);
+	if (devCount == 0)
+		throw std::runtime_error("Engine_Vulkan: no Vulkan-capable GPU found");
+
+	std::vector<VkPhysicalDevice> devs(devCount);
+	vkEnumeratePhysicalDevices(m_instance, &devCount, devs.data());
+
+	// Prefer discrete GPU, fall back to anything with compute
+	m_physDevice = VK_NULL_HANDLE;
+	for (auto& dev : devs)
+	{
+		uint32_t qfCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, nullptr);
+		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, qfProps.data());
+
+		for (uint32_t i = 0; i < qfCount; i++)
+		{
+			if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+			{
+				VkPhysicalDeviceProperties props;
+				vkGetPhysicalDeviceProperties(dev, &props);
+				if (!m_physDevice || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+				{
+					m_physDevice = dev;
+					m_computeQueueFamily = i;
+				}
+				break;
+			}
+		}
+	}
+	if (m_physDevice == VK_NULL_HANDLE)
+		throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
+
+	// --- Logical device ---
+	float priority = 1.0f;
+	VkDeviceQueueCreateInfo queueInfo{};
+	queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+	queueInfo.queueFamilyIndex = m_computeQueueFamily;
+	queueInfo.queueCount = 1;
+	queueInfo.pQueuePriorities = &priority;
+
+	VkDeviceCreateInfo devInfo{};
+	devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	devInfo.queueCreateInfoCount = 1;
+	devInfo.pQueueCreateInfos = &queueInfo;
+	VK_CHECK(vkCreateDevice(m_physDevice, &devInfo, nullptr, &m_device));
+
+	vkGetDeviceQueue(m_device, m_computeQueueFamily, 0, &m_computeQueue);
+
+	// --- Command pool + buffer ---
+	VkCommandPoolCreateInfo poolInfo{};
+	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	poolInfo.queueFamilyIndex = m_computeQueueFamily;
+	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	VK_CHECK(vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_cmdPool));
+
+	VkCommandBufferAllocateInfo allocInfo{};
+	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocInfo.commandPool = m_cmdPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+	VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &m_cmdBufs[0]));
+	VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &m_cmdBufs[1]));
+	VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &m_utilCmdBuf));
+
+	// --- Fences ---
+	VkFenceCreateInfo fenceInfo{};
+	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;   // start signaled so first wait is a no-op
+	VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_fences[0]));
+	VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_fences[1]));
+	fenceInfo.flags = 0;   // utility fence starts unsignaled
+	VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_utilFence));
+
+	// --- Pipeline cache (speeds up subsequent runs) ---
+	VkPipelineCacheCreateInfo cacheInfo{};
+	cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+	VK_CHECK(vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &m_pipelineCache));
+}
+
+// ===========================================================================
+// Buffer helpers
+// ===========================================================================
+
+uint32_t Engine_Vulkan::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const
+{
+	VkPhysicalDeviceMemoryProperties memProps;
+	vkGetPhysicalDeviceMemoryProperties(m_physDevice, &memProps);
+	for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
+	{
+		if ((typeFilter & (1 << i)) &&
+		    (memProps.memoryTypes[i].propertyFlags & properties) == properties)
+			return i;
+	}
+	throw std::runtime_error("Engine_Vulkan: failed to find suitable memory type");
+}
+
+uint32_t Engine_Vulkan::FindMemoryTypeSoft(uint32_t typeFilter, VkMemoryPropertyFlags properties) const
+{
+	VkPhysicalDeviceMemoryProperties memProps;
+	vkGetPhysicalDeviceMemoryProperties(m_physDevice, &memProps);
+	for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
+	{
+		if ((typeFilter & (1 << i)) &&
+		    (memProps.memoryTypes[i].propertyFlags & properties) == properties)
+			return i;
+	}
+	return UINT32_MAX;
+}
+
+void Engine_Vulkan::CreateBufferWithMemory(VkDeviceSize size, VkBufferUsageFlags usage,
+                                           VkMemoryPropertyFlags memProps,
+                                           VkBuffer& buf, VkDeviceMemory& mem)
+{
+	if (size == 0) { buf = VK_NULL_HANDLE; mem = VK_NULL_HANDLE; return; }
+
+	VkBufferCreateInfo ci{};
+	ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	ci.size  = size;
+	ci.usage = usage;
+	ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VK_CHECK(vkCreateBuffer(m_device, &ci, nullptr, &buf));
+
+	VkMemoryRequirements memReq;
+	vkGetBufferMemoryRequirements(m_device, buf, &memReq);
+
+	VkMemoryAllocateInfo ai{};
+	ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	ai.allocationSize  = memReq.size;
+	ai.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits, memProps);
+	VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &mem));
+	VK_CHECK(vkBindBufferMemory(m_device, buf, mem, 0));
+}
+
+void Engine_Vulkan::CreateBuffers()
+{
+	size_t N = (size_t)numLines[0] * numLines[1] * numLines[2];
+	m_fieldBufSize = 3 * N * sizeof(FDTD_FLOAT);
+	m_fieldN   = (uint32_t)N;
+	m_strideYZ = numLines[1] * numLines[2];
+
+	VkBufferUsageFlags devRW  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT   |
+	                            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkBufferUsageFlags devRO  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	// --- Try ReBAR (resizable BAR): DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT ---
+	// This allows the CPU to read field data directly from VRAM without any
+	// staging-buffer copy, eliminating the 352 MB download bottleneck.
+	VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+	                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	// Probe whether a suitable memory type exists for the volt buffer
+	{
+		VkBufferCreateInfo ci{};
+		ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		ci.size  = m_fieldBufSize;
+		ci.usage = devRW;
+		ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VkBuffer probeBuf;
+		vkCreateBuffer(m_device, &ci, nullptr, &probeBuf);
+		VkMemoryRequirements memReq;
+		vkGetBufferMemoryRequirements(m_device, probeBuf, &memReq);
+		uint32_t rebarIdx = FindMemoryTypeSoft(memReq.memoryTypeBits, rebar);
+		vkDestroyBuffer(m_device, probeBuf, nullptr);
+
+		if (rebarIdx != UINT32_MAX)
+		{
+			// Try to allocate both field buffers with ReBAR.
+			// Allocate volt first; if it succeeds, try curr.
+			CreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_voltBuf, m_voltMem);
+			VkResult r = vkMapMemory(m_device, m_voltMem, 0, m_fieldBufSize, 0, (void**)&m_voltMapped);
+			if (r == VK_SUCCESS)
+			{
+				CreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_currBuf, m_currMem);
+				r = vkMapMemory(m_device, m_currMem, 0, m_fieldBufSize, 0, (void**)&m_currMapped);
+				if (r != VK_SUCCESS)
+				{
+					// Curr map failed; tear down and fall back
+					m_currMapped = nullptr;
+					vkUnmapMemory(m_device, m_voltMem);
+					m_voltMapped = nullptr;
+					vkDestroyBuffer(m_device, m_voltBuf, nullptr);
+					vkFreeMemory(m_device, m_voltMem, nullptr);
+					vkDestroyBuffer(m_device, m_currBuf, nullptr);
+					vkFreeMemory(m_device, m_currMem, nullptr);
+					m_voltBuf = m_currBuf = VK_NULL_HANDLE;
+					m_voltMem = m_currMem = VK_NULL_HANDLE;
+				}
+			}
+			else
+			{
+				// Volt map failed; tear down and fall back
+				m_voltMapped = nullptr;
+				vkDestroyBuffer(m_device, m_voltBuf, nullptr);
+				vkFreeMemory(m_device, m_voltMem, nullptr);
+				m_voltBuf = VK_NULL_HANDLE;
+				m_voltMem = VK_NULL_HANDLE;
+			}
+		}
+	}
+
+	// Fallback: plain device-local (requires staging for CPU access)
+	if (m_voltBuf == VK_NULL_HANDLE)
+		CreateBufferWithMemory(m_fieldBufSize, devRW, dLoc, m_voltBuf, m_voltMem);
+	if (m_currBuf == VK_NULL_HANDLE)
+		CreateBufferWithMemory(m_fieldBufSize, devRW, dLoc, m_currBuf, m_currMem);
+
+	// Compressed coefficient buffers (read-only, always device-local)
+	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
+	unsigned int numComp = opVk->GetNumCompressed();
+	m_opIndexBufSize  = N * sizeof(uint32_t);
+	m_coeffCompBufSize = 3 * numComp * sizeof(float);
+	CreateBufferWithMemory(m_opIndexBufSize,  devRO, dLoc, m_opIndexBuf,  m_opIndexMem);
+	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_vvCompBuf, m_vvCompMem);
+	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_viCompBuf, m_viCompMem);
+	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_iiCompBuf, m_iiCompMem);
+	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_ivCompBuf, m_ivCompMem);
+
+	// Staging buffer (still needed for coefficient uploads, excitation data,
+	// and fallback field sync when ReBAR is not available)
+	VkBufferUsageFlags stgUse = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+	                            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	CreateBufferWithMemory(m_fieldBufSize, stgUse, host, m_stagingBuf, m_stagingMem);
+}
+
+// ===========================================================================
+// Descriptor setup
+// ===========================================================================
+
+void Engine_Vulkan::WriteDescriptorBuffers(VkDevice dev, VkDescriptorSet set,
+                                           const VkBuffer* bufs, const VkDeviceSize* sizes,
+                                           uint32_t count)
+{
+	std::vector<VkDescriptorBufferInfo> infos(count);
+	std::vector<VkWriteDescriptorSet>   writes(count);
+	for (uint32_t i = 0; i < count; i++)
+	{
+		infos[i]  = {bufs[i], 0, sizes[i]};
+		writes[i] = {};
+		writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet          = set;
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo     = &infos[i];
+	}
+	vkUpdateDescriptorSets(dev, count, writes.data(), 0, nullptr);
+}
+
+void Engine_Vulkan::CreateDescriptors()
+{
+	// --- Layouts ---
+	auto makeLayout = [&](uint32_t nBindings) -> VkDescriptorSetLayout
+	{
+		std::vector<VkDescriptorSetLayoutBinding> bindings(nBindings);
+		for (uint32_t i = 0; i < nBindings; i++)
+			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+		VkDescriptorSetLayoutCreateInfo ci{};
+		ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		ci.bindingCount = nBindings;
+		ci.pBindings    = bindings.data();
+		VkDescriptorSetLayout layout;
+		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &layout));
+		return layout;
+	};
+	m_fdtdDescLayout = makeLayout(5);
+	m_excDescLayout  = makeLayout(5);
+
+	// --- Pool ---
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5*2 + 5*2};
+	VkDescriptorPoolCreateInfo pi{};
+	pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	pi.maxSets       = 4;
+	pi.poolSizeCount = 1;
+	pi.pPoolSizes    = &poolSize;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &pi, nullptr, &m_descPool));
+
+	// --- Allocate sets ---
+	VkDescriptorSetLayout layouts[4] = {m_fdtdDescLayout, m_fdtdDescLayout,
+	                                     m_excDescLayout,  m_excDescLayout};
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool     = m_descPool;
+	ai.descriptorSetCount = 4;
+	ai.pSetLayouts        = layouts;
+	VkDescriptorSet sets[4];
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, sets));
+	m_updateVoltDescSet = sets[0];
+	m_updateCurrDescSet = sets[1];
+	m_excVoltDescSet    = sets[2];
+	m_excCurrDescSet    = sets[3];
+
+	// --- Write FDTD update descriptors ---
+	{
+		VkBuffer      bufs[5] = {m_voltBuf, m_currBuf, m_opIndexBuf, m_vvCompBuf, m_viCompBuf};
+		VkDeviceSize sizes[5] = {m_fieldBufSize, m_fieldBufSize, m_opIndexBufSize,
+		                          m_coeffCompBufSize, m_coeffCompBufSize};
+		WriteDescriptorBuffers(m_device, m_updateVoltDescSet, bufs, sizes, 5);
+	}
+	{
+		VkBuffer      bufs[5] = {m_currBuf, m_voltBuf, m_opIndexBuf, m_iiCompBuf, m_ivCompBuf};
+		VkDeviceSize sizes[5] = {m_fieldBufSize, m_fieldBufSize, m_opIndexBufSize,
+		                          m_coeffCompBufSize, m_coeffCompBufSize};
+		WriteDescriptorBuffers(m_device, m_updateCurrDescSet, bufs, sizes, 5);
+	}
+	// Excitation descriptors are written in SetupGPUExcitation()
+}
+
+// ===========================================================================
+// Pipeline setup
+// ===========================================================================
+
+VkShaderModule Engine_Vulkan::CreateShaderModule(const unsigned char* code, size_t codeSize)
+{
+	// Copy to aligned uint32_t buffer
+	std::vector<uint32_t> aligned((codeSize + 3) / 4);
+	memcpy(aligned.data(), code, codeSize);
+
+	VkShaderModuleCreateInfo ci{};
+	ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	ci.codeSize = codeSize;
+	ci.pCode    = aligned.data();
+	VkShaderModule mod;
+	VK_CHECK(vkCreateShaderModule(m_device, &ci, nullptr, &mod));
+	return mod;
+}
+
+void Engine_Vulkan::CreatePipelines()
+{
+	// --- Pipeline layouts ---
+	// FDTD: push constant = GridPC (12 bytes)
+	VkPushConstantRange fdtdPC = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC)};
+	VkPipelineLayoutCreateInfo pli{};
+	pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pli.setLayoutCount         = 1;
+	pli.pSetLayouts            = &m_fdtdDescLayout;
+	pli.pushConstantRangeCount = 1;
+	pli.pPushConstantRanges    = &fdtdPC;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_fdtdPipeLayout));
+
+	// Excitation: push constant = ExcPC (16 bytes)
+	VkPushConstantRange excPC = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExcPC)};
+	pli.pSetLayouts         = &m_excDescLayout;
+	pli.pPushConstantRanges = &excPC;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_excPipeLayout));
+
+	// --- Shader modules ---
+	VkShaderModule voltMod = CreateShaderModule(gpu_spirv::update_voltages_data,
+	                                            gpu_spirv::update_voltages_size);
+	VkShaderModule currMod = CreateShaderModule(gpu_spirv::update_currents_data,
+	                                            gpu_spirv::update_currents_size);
+	VkShaderModule excMod  = CreateShaderModule(gpu_spirv::apply_excitation_data,
+	                                            gpu_spirv::apply_excitation_size);
+
+	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
+	{
+		VkPipelineShaderStageCreateInfo stage{};
+		stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+		stage.module = mod;
+		stage.pName  = "main";
+
+		VkComputePipelineCreateInfo ci{};
+		ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		ci.stage  = stage;
+		ci.layout = layout;
+		VkPipeline pipe;
+		VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &pipe));
+		return pipe;
+	};
+
+	m_updateVoltPipeline = makePipeline(voltMod, m_fdtdPipeLayout);
+	m_updateCurrPipeline = makePipeline(currMod, m_fdtdPipeLayout);
+	m_excPipeline        = makePipeline(excMod,  m_excPipeLayout);
+
+	vkDestroyShaderModule(m_device, voltMod, nullptr);
+	vkDestroyShaderModule(m_device, currMod, nullptr);
+	vkDestroyShaderModule(m_device, excMod,  nullptr);
+}
+
+// ===========================================================================
+// Data upload helpers
+// ===========================================================================
+
+void Engine_Vulkan::RunSingleCommand(std::function<void(VkCommandBuffer)> func) const
+{
+	VkCommandBufferBeginInfo bi{};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkResetCommandBuffer(m_utilCmdBuf, 0);
+	VK_CHECK(vkBeginCommandBuffer(m_utilCmdBuf, &bi));
+
+	func(m_utilCmdBuf);
+
+	VK_CHECK(vkEndCommandBuffer(m_utilCmdBuf));
+
+	VkSubmitInfo si{};
+	si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers    = &m_utilCmdBuf;
+	vkResetFences(m_device, 1, &m_utilFence);
+	VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_utilFence));
+	VK_CHECK(vkWaitForFences(m_device, 1, &m_utilFence, VK_TRUE, UINT64_MAX));
+}
+
+void Engine_Vulkan::UploadToDeviceBuffer(VkBuffer dst, const void* data, VkDeviceSize size)
+{
+	void* mapped;
+	VK_CHECK(vkMapMemory(m_device, m_stagingMem, 0, size, 0, &mapped));
+	memcpy(mapped, data, size);
+	vkUnmapMemory(m_device, m_stagingMem);
+
+	RunSingleCommand([&](VkCommandBuffer cmd)
+	{
+		VkBufferCopy region = {0, 0, size};
+		vkCmdCopyBuffer(cmd, m_stagingBuf, dst, 1, &region);
+	});
+}
+
+void Engine_Vulkan::DownloadFromDeviceBuffer(VkBuffer src, void* data, VkDeviceSize size) const
+{
+	RunSingleCommand([&](VkCommandBuffer cmd)
+	{
+		VkBufferCopy region = {0, 0, size};
+		vkCmdCopyBuffer(cmd, src, m_stagingBuf, 1, &region);
+	});
+
+	void* mapped;
+	VK_CHECK(vkMapMemory(m_device, m_stagingMem, 0, size, 0, &mapped));
+	memcpy(data, mapped, size);
+	vkUnmapMemory(m_device, m_stagingMem);
+}
+
+void Engine_Vulkan::UploadCoefficients()
+{
+	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
+	UploadToDeviceBuffer(m_opIndexBuf, opVk->GetOpIndex(), m_opIndexBufSize);
+	UploadToDeviceBuffer(m_vvCompBuf,  opVk->GetVVComp(),  m_coeffCompBufSize);
+	UploadToDeviceBuffer(m_viCompBuf,  opVk->GetVIComp(),  m_coeffCompBufSize);
+	UploadToDeviceBuffer(m_iiCompBuf,  opVk->GetIIComp(),  m_coeffCompBufSize);
+	UploadToDeviceBuffer(m_ivCompBuf,  opVk->GetIVComp(),  m_coeffCompBufSize);
+}
+
+// ===========================================================================
+// GpuBuf helpers
+// ===========================================================================
+
+void Engine_Vulkan::CreateGpuBuf(GpuBuf& gb, VkDeviceSize size,
+                                 VkBufferUsageFlags usage, VkMemoryPropertyFlags memProps)
+{
+	CreateBufferWithMemory(size, usage, memProps, gb.buffer, gb.memory);
+}
+
+void Engine_Vulkan::DestroyGpuBuf(GpuBuf& gb)
+{
+	if (gb.buffer) { vkDestroyBuffer(m_device, gb.buffer, nullptr); gb.buffer = VK_NULL_HANDLE; }
+	if (gb.memory) { vkFreeMemory(m_device, gb.memory, nullptr);    gb.memory = VK_NULL_HANDLE; }
+}
+
+void Engine_Vulkan::UploadGpuBuf(GpuBuf& gb, const void* data, VkDeviceSize size)
+{
+	UploadToDeviceBuffer(gb.buffer, data, size);
+}
+
+// ===========================================================================
+// GPU Excitation Setup
+// ===========================================================================
+
+void Engine_Vulkan::SetupGPUExcitation()
+{
+	// Find and remove the CPU excitation extension; upload its data to GPU.
+	Operator_Ext_Excitation* opExc = const_cast<Operator*>(Op)->GetExcitationExtension();
+	Excitation* exc = const_cast<Operator*>(Op)->GetExcitationSignal();
+
+	// Check for non-excitation CPU extensions
+	// Extensions that have GPU implementations are also removed from the CPU
+	// extension list and handled entirely on the GPU.
+	m_hasCPUExtensions = false;
+	for (auto it = m_Eng_exts.begin(); it != m_Eng_exts.end(); )
+	{
+		Engine_Ext_Excitation* eext = dynamic_cast<Engine_Ext_Excitation*>(*it);
+		if (eext)
+		{
+			// Remove CPU excitation; we handle it on GPU
+			delete eext;
+			it = m_Eng_exts.erase(it);
+			continue;
+		}
+
+		// Check if this extension has a GPU implementation
+		bool gpuNative = false;
+		if (dynamic_cast<Engine_Ext_UPML*>(*it))             gpuNative = true;
+		else if (dynamic_cast<Engine_Ext_LorentzMaterial*>(*it)) gpuNative = true;
+		else if (dynamic_cast<Engine_Ext_TFSF*>(*it))        gpuNative = true;
+		else if (dynamic_cast<Engine_Ext_Mur_ABC*>(*it))     gpuNative = true;
+		else if (dynamic_cast<Engine_Ext_LumpedRLC*>(*it))   gpuNative = true;
+
+		if (gpuNative)
+		{
+			// Remove from CPU extension list; GPU will handle it
+			delete *it;
+			it = m_Eng_exts.erase(it);
+		}
+		else
+		{
+			m_hasCPUExtensions = true;
+			++it;
+		}
+	}
+
+	if (!opExc || !exc)
+	{
+		m_hasGPUExcitation = false;
+		return;
+	}
+
+	m_hasGPUExcitation = true;
+	m_excSignalLen    = exc->GetLength();
+	m_excSignalPeriod = (exc->GetSignalPeriod() > 0)
+	                    ? (int)(exc->GetSignalPeriod() / exc->GetTimestep())
+	                    : 0;
+
+	size_t N = (size_t)numLines[0] * numLines[1] * numLines[2];
+	uint32_t sYZ = numLines[1] * numLines[2];
+
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	// --- Voltage excitation ---
+	m_excVoltCount = opExc->GetVoltCount();
+	if (m_excVoltCount > 0)
+	{
+		// Precompute linear indices
+		std::vector<uint32_t> linIdx(m_excVoltCount);
+		for (unsigned int n = 0; n < m_excVoltCount; n++)
+		{
+			uint32_t dir = opExc->GetVoltDir()[n];
+			uint32_t x   = opExc->GetVoltIndex(0)[n];
+			uint32_t y   = opExc->GetVoltIndex(1)[n];
+			uint32_t z   = opExc->GetVoltIndex(2)[n];
+			linIdx[n]    = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
+		}
+
+		VkDeviceSize idxSize = m_excVoltCount * sizeof(uint32_t);
+		VkDeviceSize ampSize = m_excVoltCount * sizeof(FDTD_FLOAT);
+		CreateBufferWithMemory(idxSize, usage, dLoc, m_excVoltIdxBuf,   m_excVoltIdxMem);
+		CreateBufferWithMemory(ampSize, usage, dLoc, m_excVoltAmpBuf,   m_excVoltAmpMem);
+		CreateBufferWithMemory(idxSize, usage, dLoc, m_excVoltDelayBuf, m_excVoltDelayMem);
+		UploadToDeviceBuffer(m_excVoltIdxBuf,   linIdx.data(), idxSize);
+		UploadToDeviceBuffer(m_excVoltAmpBuf,   opExc->GetVoltAmp(), ampSize);
+		UploadToDeviceBuffer(m_excVoltDelayBuf, opExc->GetVoltDelay(), idxSize);
+	}
+
+	// --- Current excitation ---
+	m_excCurrCount = opExc->GetCurrCount();
+	if (m_excCurrCount > 0)
+	{
+		std::vector<uint32_t> linIdx(m_excCurrCount);
+		for (unsigned int n = 0; n < m_excCurrCount; n++)
+		{
+			uint32_t dir = opExc->GetCurrDir()[n];
+			uint32_t x   = opExc->GetCurrIndex(0)[n];
+			uint32_t y   = opExc->GetCurrIndex(1)[n];
+			uint32_t z   = opExc->GetCurrIndex(2)[n];
+			linIdx[n]    = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
+		}
+
+		VkDeviceSize idxSize = m_excCurrCount * sizeof(uint32_t);
+		VkDeviceSize ampSize = m_excCurrCount * sizeof(FDTD_FLOAT);
+		CreateBufferWithMemory(idxSize, usage, dLoc, m_excCurrIdxBuf,   m_excCurrIdxMem);
+		CreateBufferWithMemory(ampSize, usage, dLoc, m_excCurrAmpBuf,   m_excCurrAmpMem);
+		CreateBufferWithMemory(idxSize, usage, dLoc, m_excCurrDelayBuf, m_excCurrDelayMem);
+		UploadToDeviceBuffer(m_excCurrIdxBuf,   linIdx.data(), idxSize);
+		UploadToDeviceBuffer(m_excCurrAmpBuf,   opExc->GetCurrAmp(), ampSize);
+		UploadToDeviceBuffer(m_excCurrDelayBuf, opExc->GetCurrDelay(), idxSize);
+	}
+
+	// --- Excitation signal ---
+	VkDeviceSize sigSize = m_excSignalLen * sizeof(FDTD_FLOAT);
+	CreateBufferWithMemory(sigSize, usage, dLoc, m_excSignalVoltBuf, m_excSignalVoltMem);
+	CreateBufferWithMemory(sigSize, usage, dLoc, m_excSignalCurrBuf, m_excSignalCurrMem);
+	UploadToDeviceBuffer(m_excSignalVoltBuf, exc->GetVoltageSignal(), sigSize);
+	UploadToDeviceBuffer(m_excSignalCurrBuf, exc->GetCurrentSignal(), sigSize);
+
+	// --- Write excitation descriptor sets ---
+	if (m_excVoltCount > 0)
+	{
+		VkBuffer      bufs[5] = {m_voltBuf, m_excVoltAmpBuf, m_excVoltIdxBuf,
+		                          m_excVoltDelayBuf, m_excSignalVoltBuf};
+		VkDeviceSize sizes[5] = {m_fieldBufSize,
+		                          m_excVoltCount * sizeof(FDTD_FLOAT),
+		                          m_excVoltCount * sizeof(uint32_t),
+		                          m_excVoltCount * sizeof(uint32_t),
+		                          sigSize};
+		WriteDescriptorBuffers(m_device, m_excVoltDescSet, bufs, sizes, 5);
+	}
+	if (m_excCurrCount > 0)
+	{
+		VkBuffer      bufs[5] = {m_currBuf, m_excCurrAmpBuf, m_excCurrIdxBuf,
+		                          m_excCurrDelayBuf, m_excSignalCurrBuf};
+		VkDeviceSize sizes[5] = {m_fieldBufSize,
+		                          m_excCurrCount * sizeof(FDTD_FLOAT),
+		                          m_excCurrCount * sizeof(uint32_t),
+		                          m_excCurrCount * sizeof(uint32_t),
+		                          sigSize};
+		WriteDescriptorBuffers(m_device, m_excCurrDescSet, bufs, sizes, 5);
+	}
+}
+
+// ===========================================================================
+// GPU Extension Setup (UPML, Dispersive, TF/SF, Mur ABC, LumpedRLC, Probes)
+// ===========================================================================
+
+void Engine_Vulkan::SetupGPUExtensions()
+{
+	// Scan operator extensions and setup GPU resources for each
+	// Iterate operator extensions
+	size_t nExts = Op->GetNumberOfExtentions();
+
+	// Count what we need for descriptor pool sizing
+	unsigned int numUPML = 0, numDispOrders = 0, numTFSF = 0, numMur = 0;
+	unsigned int numRLC = 0;
+	unsigned int totalDescSets = 0;
+	unsigned int totalStorageBindings = 0;
+
+	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
+	{
+		Operator_Extension* ext = Op->GetExtension(eIdx);
+		if (auto* upml = dynamic_cast<Operator_Ext_UPML*>(ext))
+		{
+			numUPML++;
+			totalDescSets += 4;
+			totalStorageBindings += 14;  // 4+3+4+3
+		}
+		else if (auto* lor = dynamic_cast<Operator_Ext_LorentzMaterial*>(ext))
+		{
+			numDispOrders += lor->m_Order;
+			totalDescSets += lor->m_Order * 4;
+			totalStorageBindings += lor->m_Order * 20;
+		}
+		else if (auto* tfsf = dynamic_cast<Operator_Ext_TFSF*>(ext))
+		{
+			numTFSF++;
+			totalDescSets += 2;
+			totalStorageBindings += 12;
+		}
+		else if (auto* mur = dynamic_cast<Operator_Ext_Mur_ABC*>(ext))
+		{
+			numMur++;
+			totalDescSets += 3;
+			totalStorageBindings += 13;
+		}
+		else if (auto* rlc = dynamic_cast<Operator_Ext_LumpedRLC*>(ext))
+		{
+			if (rlc->RLC_count > 0) {
+				numRLC++;
+				totalDescSets += 2;
+				totalStorageBindings += 22;
+			}
+		}
+	}
+	// Probes (placeholder, will be set up later)
+	// totalDescSets += 1;
+	// totalStorageBindings += 5;
+
+	if (totalDescSets == 0) return;  // No GPU extensions to setup
+
+	// Create extension descriptor set layouts
+	CreateExtensionDescriptorLayouts();
+
+	// --- Create extension descriptor pool ---
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, totalStorageBindings + 32};
+	VkDescriptorPoolCreateInfo pi{};
+	pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	pi.maxSets       = totalDescSets + 8;
+	pi.poolSizeCount = 1;
+	pi.pPoolSizes    = &poolSize;
+	pi.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &pi, nullptr, &m_extDescPool));
+
+	// Setup each extension type
+	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
+	{
+		Operator_Extension* ext = Op->GetExtension(eIdx);
+		if (dynamic_cast<Operator_Ext_UPML*>(ext))
+			SetupGPU_UPML();
+		else if (dynamic_cast<Operator_Ext_LorentzMaterial*>(ext))
+			SetupGPU_Dispersive();
+		else if (dynamic_cast<Operator_Ext_TFSF*>(ext))
+			SetupGPU_TFSF();
+		else if (dynamic_cast<Operator_Ext_Mur_ABC*>(ext))
+			SetupGPU_Mur();
+		else if (auto* rlc = dynamic_cast<Operator_Ext_LumpedRLC*>(ext))
+		{
+			if (rlc->RLC_count > 0)
+				SetupGPU_RLC();
+		}
+	}
+
+	// Create extension compute pipelines
+	CreateExtensionPipelines();
+}
+
+void Engine_Vulkan::CreateExtensionDescriptorLayouts()
+{
+	auto makeLayout = [&](uint32_t nBindings) -> VkDescriptorSetLayout
+	{
+		std::vector<VkDescriptorSetLayoutBinding> bindings(nBindings);
+		for (uint32_t i = 0; i < nBindings; i++)
+			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+		VkDescriptorSetLayoutCreateInfo ci{};
+		ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		ci.bindingCount = nBindings;
+		ci.pBindings    = bindings.data();
+		VkDescriptorSetLayout layout;
+		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &layout));
+		return layout;
+	};
+
+	// UPML: preVolt=4, postVolt=3, preCurr=4, postCurr=3
+	m_upmlPreVoltDescLayout  = makeLayout(4);
+	m_upmlPostVoltDescLayout = makeLayout(3);
+	m_upmlPreCurrDescLayout  = makeLayout(4);
+	m_upmlPostCurrDescLayout = makeLayout(3);
+
+	// Dispersive: pre=7 (field, ADE, LorADE, posIdx, int, ext, Lor), apply=3
+	m_dispPreDescLayout   = makeLayout(7);
+	m_dispApplyDescLayout = makeLayout(3);
+
+	// TF/SF: 6 bindings (field, amp, delta, idx, delay, signal)
+	m_tfsfDescLayout = makeLayout(6);
+
+	// Mur: pre=5, post=5, apply=3
+	m_murPreDescLayout   = makeLayout(5);
+	m_murPostDescLayout  = makeLayout(5);
+	m_murApplyDescLayout = makeLayout(3);
+
+	// RLC: pre=6, apply=16
+	m_rlcPreDescLayout   = makeLayout(6);
+	m_rlcApplyDescLayout = makeLayout(16);
+
+	// Probes: 5 bindings
+	m_probeDescLayout = makeLayout(5);
+}
+
+void Engine_Vulkan::CreateExtensionPipelines()
+{
+	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
+	{
+		VkPipelineShaderStageCreateInfo stage{};
+		stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+		stage.module = mod;
+		stage.pName  = "main";
+		VkComputePipelineCreateInfo ci{};
+		ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		ci.stage  = stage;
+		ci.layout = layout;
+		VkPipeline pipe;
+		VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &pipe));
+		return pipe;
+	};
+
+	auto makePipeLayout = [&](VkDescriptorSetLayout descLayout, uint32_t pcSize) -> VkPipelineLayout
+	{
+		VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize};
+		VkPipelineLayoutCreateInfo pli{};
+		pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+		pli.setLayoutCount         = 1;
+		pli.pSetLayouts            = &descLayout;
+		pli.pushConstantRangeCount = 1;
+		pli.pPushConstantRanges    = &pcRange;
+		VkPipelineLayout layout;
+		VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &layout));
+		return layout;
+	};
+
+	// --- UPML pipelines ---
+	if (m_hasGPU_UPML)
+	{
+		m_upmlPipeLayout = makePipeLayout(m_upmlPreVoltDescLayout, sizeof(PmlPC));
+
+		VkShaderModule mod;
+		mod = CreateShaderModule(gpu_spirv::upml_pre_voltage_data, gpu_spirv::upml_pre_voltage_size);
+		m_upmlPreVoltPipeline = makePipeline(mod, m_upmlPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::upml_post_voltage_data, gpu_spirv::upml_post_voltage_size);
+		m_upmlPostVoltPipeline = makePipeline(mod, m_upmlPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::upml_pre_current_data, gpu_spirv::upml_pre_current_size);
+		m_upmlPreCurrPipeline = makePipeline(mod, m_upmlPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::upml_post_current_data, gpu_spirv::upml_post_current_size);
+		m_upmlPostCurrPipeline = makePipeline(mod, m_upmlPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+	}
+
+	// --- Dispersive pipelines ---
+	if (m_hasGPU_Dispersive)
+	{
+		m_dispPrePipeLayout   = makePipeLayout(m_dispPreDescLayout, sizeof(DispPC));
+		m_dispApplyPipeLayout = makePipeLayout(m_dispApplyDescLayout, sizeof(DispPC));
+
+		VkShaderModule mod;
+		mod = CreateShaderModule(gpu_spirv::dispersive_pre_voltage_data, gpu_spirv::dispersive_pre_voltage_size);
+		m_dispPreVoltPipeline = makePipeline(mod, m_dispPrePipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::dispersive_pre_current_data, gpu_spirv::dispersive_pre_current_size);
+		m_dispPreCurrPipeline = makePipeline(mod, m_dispPrePipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::dispersive_apply_voltage_data, gpu_spirv::dispersive_apply_voltage_size);
+		m_dispApplyVoltPipeline = makePipeline(mod, m_dispApplyPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::dispersive_apply_current_data, gpu_spirv::dispersive_apply_current_size);
+		m_dispApplyCurrPipeline = makePipeline(mod, m_dispApplyPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+	}
+
+	// --- TF/SF pipelines ---
+	if (m_hasGPU_TFSF)
+	{
+		m_tfsfPipeLayout = makePipeLayout(m_tfsfDescLayout, sizeof(TfsfPC));
+
+		VkShaderModule mod;
+		mod = CreateShaderModule(gpu_spirv::tfsf_voltage_data, gpu_spirv::tfsf_voltage_size);
+		m_tfsfVoltPipeline = makePipeline(mod, m_tfsfPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::tfsf_current_data, gpu_spirv::tfsf_current_size);
+		m_tfsfCurrPipeline = makePipeline(mod, m_tfsfPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+	}
+
+	// --- Mur ABC pipelines ---
+	if (m_hasGPU_Mur)
+	{
+		m_murPipeLayout = makePipeLayout(m_murPreDescLayout, sizeof(MurPC));
+
+		VkShaderModule mod;
+		mod = CreateShaderModule(gpu_spirv::mur_pre_voltage_data, gpu_spirv::mur_pre_voltage_size);
+		m_murPreVoltPipeline = makePipeline(mod, m_murPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::mur_post_voltage_data, gpu_spirv::mur_post_voltage_size);
+		m_murPostVoltPipeline = makePipeline(mod, m_murPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::mur_apply_voltage_data, gpu_spirv::mur_apply_voltage_size);
+		m_murApplyVoltPipeline = makePipeline(mod, m_murPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+	}
+
+	// --- Lumped RLC pipelines ---
+	if (m_hasGPU_RLC)
+	{
+		m_rlcPrePipeLayout   = makePipeLayout(m_rlcPreDescLayout, sizeof(RlcPC));
+		m_rlcApplyPipeLayout = makePipeLayout(m_rlcApplyDescLayout, sizeof(RlcPC));
+
+		VkShaderModule mod;
+		mod = CreateShaderModule(gpu_spirv::rlc_pre_voltage_data, gpu_spirv::rlc_pre_voltage_size);
+		m_rlcPreVoltPipeline = makePipeline(mod, m_rlcPrePipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		mod = CreateShaderModule(gpu_spirv::rlc_apply_voltage_data, gpu_spirv::rlc_apply_voltage_size);
+		m_rlcApplyVoltPipeline = makePipeline(mod, m_rlcApplyPipeLayout);
+		vkDestroyShaderModule(m_device, mod, nullptr);
+	}
+
+	// --- Probe gather pipeline ---
+	// (not created here; will be created on demand when probes are set up)
+}
+
+// ---------------------------------------------------------------------------
+// Per-extension GPU data upload and descriptor writing
+// ---------------------------------------------------------------------------
+
+void Engine_Vulkan::SetupGPU_UPML()
+{
+	// Iterate operator extensions
+	size_t nExts = Op->GetNumberOfExtentions();
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
+	{
+		Operator_Extension* ext = Op->GetExtension(eIdx);
+		auto* upml = dynamic_cast<Operator_Ext_UPML*>(ext);
+		if (!upml) continue;
+
+		GpuUPMLData data;
+		uint32_t pNx = upml->m_numLines[0];
+		uint32_t pNy = upml->m_numLines[1];
+		uint32_t pNz = upml->m_numLines[2];
+		uint32_t pN  = pNx * pNy * pNz;
+		VkDeviceSize pmlBufSize = 3 * pN * sizeof(FDTD_FLOAT);  // [3][pNx][pNy][pNz]
+
+		if (pN == 0) continue;
+
+		data.pc.Nx = numLines[0]; data.pc.Ny = numLines[1]; data.pc.Nz = numLines[2];
+		data.pc.pNx = pNx; data.pc.pNy = pNy; data.pc.pNz = pNz;
+		data.pc.pStartX = upml->m_StartPos[0];
+		data.pc.pStartY = upml->m_StartPos[1];
+		data.pc.pStartZ = upml->m_StartPos[2];
+		data.totalCells  = pN;
+
+		// Create and upload auxiliary flux buffers (initialized to zero)
+		VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		CreateGpuBuf(data.voltFlux, pmlBufSize, rwUsage, dLoc);
+		CreateGpuBuf(data.currFlux, pmlBufSize, rwUsage, dLoc);
+		{
+			std::vector<float> zeros(3 * pN, 0.0f);
+			UploadGpuBuf(data.voltFlux, zeros.data(), pmlBufSize);
+			UploadGpuBuf(data.currFlux, zeros.data(), pmlBufSize);
+		}
+
+		// Upload PML coefficient arrays (contiguous [3][pNx][pNy][pNz])
+		CreateGpuBuf(data.pmlVv,   pmlBufSize, usage, dLoc);
+		CreateGpuBuf(data.pmlVvfo, pmlBufSize, usage, dLoc);
+		CreateGpuBuf(data.pmlVvfn, pmlBufSize, usage, dLoc);
+		CreateGpuBuf(data.pmlIi,   pmlBufSize, usage, dLoc);
+		CreateGpuBuf(data.pmlIifo, pmlBufSize, usage, dLoc);
+		CreateGpuBuf(data.pmlIifn, pmlBufSize, usage, dLoc);
+		UploadGpuBuf(data.pmlVv,   upml->vv.data(),   pmlBufSize);
+		UploadGpuBuf(data.pmlVvfo, upml->vvfo.data(), pmlBufSize);
+		UploadGpuBuf(data.pmlVvfn, upml->vvfn.data(), pmlBufSize);
+		UploadGpuBuf(data.pmlIi,   upml->ii.data(),   pmlBufSize);
+		UploadGpuBuf(data.pmlIifo, upml->iifo.data(), pmlBufSize);
+		UploadGpuBuf(data.pmlIifn, upml->iifn.data(), pmlBufSize);
+
+		// Allocate descriptor sets
+		auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
+		{
+			VkDescriptorSetAllocateInfo ai{};
+			ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+			ai.descriptorPool     = m_extDescPool;
+			ai.descriptorSetCount = 1;
+			ai.pSetLayouts        = &layout;
+			VkDescriptorSet set;
+			VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &set));
+			return set;
+		};
+
+		data.preVoltDesc  = allocDescSet(m_upmlPreVoltDescLayout);
+		data.postVoltDesc = allocDescSet(m_upmlPostVoltDescLayout);
+		data.preCurrDesc  = allocDescSet(m_upmlPreCurrDescLayout);
+		data.postCurrDesc = allocDescSet(m_upmlPostCurrDescLayout);
+
+		// Write descriptors: preVolt = [volt, volt_flux, pml_vv, pml_vvfo]
+		{
+			VkBuffer bufs[4]      = {m_voltBuf, data.voltFlux.buffer, data.pmlVv.buffer, data.pmlVvfo.buffer};
+			VkDeviceSize sizes[4] = {m_fieldBufSize, pmlBufSize, pmlBufSize, pmlBufSize};
+			WriteDescriptorBuffers(m_device, data.preVoltDesc, bufs, sizes, 4);
+		}
+		// postVolt = [volt, volt_flux, pml_vvfn]
+		{
+			VkBuffer bufs[3]      = {m_voltBuf, data.voltFlux.buffer, data.pmlVvfn.buffer};
+			VkDeviceSize sizes[3] = {m_fieldBufSize, pmlBufSize, pmlBufSize};
+			WriteDescriptorBuffers(m_device, data.postVoltDesc, bufs, sizes, 3);
+		}
+		// preCurr = [curr, curr_flux, pml_ii, pml_iifo]
+		{
+			VkBuffer bufs[4]      = {m_currBuf, data.currFlux.buffer, data.pmlIi.buffer, data.pmlIifo.buffer};
+			VkDeviceSize sizes[4] = {m_fieldBufSize, pmlBufSize, pmlBufSize, pmlBufSize};
+			WriteDescriptorBuffers(m_device, data.preCurrDesc, bufs, sizes, 4);
+		}
+		// postCurr = [curr, curr_flux, pml_iifn]
+		{
+			VkBuffer bufs[3]      = {m_currBuf, data.currFlux.buffer, data.pmlIifn.buffer};
+			VkDeviceSize sizes[3] = {m_fieldBufSize, pmlBufSize, pmlBufSize};
+			WriteDescriptorBuffers(m_device, data.postCurrDesc, bufs, sizes, 3);
+		}
+
+		m_gpuUPML.push_back(std::move(data));
+	}
+
+	m_hasGPU_UPML = !m_gpuUPML.empty();
+}
+
+void Engine_Vulkan::SetupGPU_Dispersive()
+{
+	// Iterate operator extensions
+	size_t nExts = Op->GetNumberOfExtentions();
+	VkBufferUsageFlags usage   = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	uint32_t N  = m_fieldN;
+	uint32_t sYZ = m_strideYZ;
+
+	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
+	{
+		Operator_Extension* ext = Op->GetExtension(eIdx);
+		auto* lor = dynamic_cast<Operator_Ext_LorentzMaterial*>(ext);
+		if (!lor) continue;
+
+		for (int order = 0; order < lor->m_Order; order++)
+		{
+			uint32_t cnt = lor->m_LM_Count[order];
+			if (cnt == 0) continue;
+
+			GpuDispData data;
+			data.count     = cnt;
+			data.voltADEOn = lor->m_volt_ADE_On[order];
+			data.currADEOn = lor->m_curr_ADE_On[order];
+			data.hasLorADE = lor->m_volt_Lor_ADE_On ? lor->m_volt_Lor_ADE_On[order] : false;
+
+			data.pc.count     = cnt;
+			data.pc.Nx = numLines[0]; data.pc.Ny = numLines[1]; data.pc.Nz = numLines[2];
+			data.pc.hasLorADE = data.hasLorADE ? 1 : 0;
+
+			VkDeviceSize adeSize = 3 * cnt * sizeof(FDTD_FLOAT);
+			VkDeviceSize idxSize = 3 * cnt * sizeof(uint32_t);
+
+			// Flatten position indices: [3][count]
+			std::vector<uint32_t> posIdx(3 * cnt);
+			for (uint32_t i = 0; i < cnt; i++)
+			{
+				posIdx[i]           = lor->m_LM_pos[order][0][i];
+				posIdx[cnt + i]     = lor->m_LM_pos[order][1][i];
+				posIdx[2*cnt + i]   = lor->m_LM_pos[order][2][i];
+			}
+			CreateGpuBuf(data.posIdx, idxSize, usage, dLoc);
+			UploadGpuBuf(data.posIdx, posIdx.data(), idxSize);
+
+			// ADE state (zero-initialized)
+			std::vector<float> zeros(3 * cnt, 0.0f);
+			CreateGpuBuf(data.voltADE, adeSize, rwUsage, dLoc);
+			UploadGpuBuf(data.voltADE, zeros.data(), adeSize);
+			CreateGpuBuf(data.currADE, adeSize, rwUsage, dLoc);
+			UploadGpuBuf(data.currADE, zeros.data(), adeSize);
+
+			if (data.hasLorADE)
+			{
+				CreateGpuBuf(data.voltLorADE, adeSize, rwUsage, dLoc);
+				UploadGpuBuf(data.voltLorADE, zeros.data(), adeSize);
+				CreateGpuBuf(data.currLorADE, adeSize, rwUsage, dLoc);
+				UploadGpuBuf(data.currLorADE, zeros.data(), adeSize);
+			}
+
+			// Flatten coefficient arrays: [3][count]
+			auto flattenCoef = [&](FDTD_FLOAT*** arr) -> std::vector<float>
+			{
+				std::vector<float> flat(3 * cnt);
+				for (int n = 0; n < 3; n++)
+					for (uint32_t i = 0; i < cnt; i++)
+						flat[n * cnt + i] = arr[order][n][i];
+				return flat;
+			};
+
+			auto uploadCoef = [&](GpuBuf& gb, FDTD_FLOAT*** arr)
+			{
+				auto flat = flattenCoef(arr);
+				CreateGpuBuf(gb, adeSize, usage, dLoc);
+				UploadGpuBuf(gb, flat.data(), adeSize);
+			};
+
+			uploadCoef(data.vIntADE, lor->v_int_ADE);
+			uploadCoef(data.vExtADE, lor->v_ext_ADE);
+			uploadCoef(data.iIntADE, lor->i_int_ADE);
+			uploadCoef(data.iExtADE, lor->i_ext_ADE);
+			if (data.hasLorADE)
+			{
+				uploadCoef(data.vLorADE, lor->v_Lor_ADE);
+				uploadCoef(data.iLorADE, lor->i_Lor_ADE);
+			}
+
+			// Allocate descriptor sets
+			auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
+			{
+				VkDescriptorSetAllocateInfo ai{};
+				ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+				ai.descriptorPool     = m_extDescPool;
+				ai.descriptorSetCount = 1;
+				ai.pSetLayouts        = &layout;
+				VkDescriptorSet set;
+				VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &set));
+				return set;
+			};
+
+			// Use dummy buffer for unused Lorentz slots when hasLorADE=false
+			VkBuffer lorVoltBuf = data.hasLorADE ? data.voltLorADE.buffer : data.voltADE.buffer;
+			VkBuffer lorCurrBuf = data.hasLorADE ? data.currLorADE.buffer : data.currADE.buffer;
+			VkBuffer vLorBuf    = data.hasLorADE ? data.vLorADE.buffer    : data.vIntADE.buffer;
+			VkBuffer iLorBuf    = data.hasLorADE ? data.iLorADE.buffer    : data.iIntADE.buffer;
+
+			data.preVoltDesc = allocDescSet(m_dispPreDescLayout);
+			{
+				VkBuffer bufs[7]      = {m_voltBuf, data.voltADE.buffer, lorVoltBuf,
+				                          data.posIdx.buffer, data.vIntADE.buffer,
+				                          data.vExtADE.buffer, vLorBuf};
+				VkDeviceSize sizes[7] = {m_fieldBufSize, adeSize, adeSize, idxSize, adeSize, adeSize, adeSize};
+				WriteDescriptorBuffers(m_device, data.preVoltDesc, bufs, sizes, 7);
+			}
+
+			data.preCurrDesc = allocDescSet(m_dispPreDescLayout);
+			{
+				VkBuffer bufs[7]      = {m_currBuf, data.currADE.buffer, lorCurrBuf,
+				                          data.posIdx.buffer, data.iIntADE.buffer,
+				                          data.iExtADE.buffer, iLorBuf};
+				VkDeviceSize sizes[7] = {m_fieldBufSize, adeSize, adeSize, idxSize, adeSize, adeSize, adeSize};
+				WriteDescriptorBuffers(m_device, data.preCurrDesc, bufs, sizes, 7);
+			}
+
+			data.applyVoltDesc = allocDescSet(m_dispApplyDescLayout);
+			{
+				VkBuffer bufs[3]      = {m_voltBuf, data.voltADE.buffer, data.posIdx.buffer};
+				VkDeviceSize sizes[3] = {m_fieldBufSize, adeSize, idxSize};
+				WriteDescriptorBuffers(m_device, data.applyVoltDesc, bufs, sizes, 3);
+			}
+
+			data.applyCurrDesc = allocDescSet(m_dispApplyDescLayout);
+			{
+				VkBuffer bufs[3]      = {m_currBuf, data.currADE.buffer, data.posIdx.buffer};
+				VkDeviceSize sizes[3] = {m_fieldBufSize, adeSize, idxSize};
+				WriteDescriptorBuffers(m_device, data.applyCurrDesc, bufs, sizes, 3);
+			}
+
+			m_gpuDisp.push_back(std::move(data));
+		}
+	}
+
+	m_hasGPU_Dispersive = !m_gpuDisp.empty();
+}
+
+void Engine_Vulkan::SetupGPU_TFSF()
+{
+	// Iterate operator extensions
+	size_t nExts = Op->GetNumberOfExtentions();
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	uint32_t N = m_fieldN;
+	uint32_t sYZ = m_strideYZ;
+
+	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
+	{
+		Operator_Extension* ext = Op->GetExtension(eIdx);
+		auto* tfsf = dynamic_cast<Operator_Ext_TFSF*>(ext);
+		if (!tfsf) continue;
+
+		Excitation* exc = tfsf->m_Exc;
+		if (!exc) continue;
+
+		// Count total injection points for voltage and current
+		uint32_t voltTotal = 0, currTotal = 0;
+		for (int n = 0; n < 3; n++)
+		{
+			int nP = (n+1)%3, nPP = (n+2)%3;
+			uint32_t faceSize = tfsf->m_numLines[nP] * tfsf->m_numLines[nPP];
+			for (int side = 0; side < 2; side++)
+			{
+				if (tfsf->m_ActiveDir[n][side])
+				{
+					voltTotal += 2 * faceSize;  // 2 tangential components
+					currTotal += 2 * faceSize;
+				}
+			}
+		}
+
+		if (voltTotal == 0 && currTotal == 0) continue;
+
+		// Flatten voltage injection points
+		std::vector<float>    vAmp(voltTotal), vDelta(voltTotal);
+		std::vector<uint32_t> vIdx(voltTotal), vDelay(voltTotal);
+		uint32_t vi = 0;
+
+		for (int n = 0; n < 3; n++)
+		{
+			int nP = (n+1)%3, nPP = (n+2)%3;
+			for (int side = 0; side < 2; side++)
+			{
+				if (!tfsf->m_ActiveDir[n][side]) continue;
+
+				uint32_t linePos = (side == 0) ? tfsf->m_Start[n] : tfsf->m_Stop[n];
+				unsigned int ui_pos = 0;
+				unsigned int pos[3];
+
+				for (unsigned int i = 0; i < tfsf->m_numLines[nP]; i++)
+				{
+					for (unsigned int j = 0; j < tfsf->m_numLines[nPP]; j++)
+					{
+						pos[nP]  = tfsf->m_Start[nP] + i;
+						pos[nPP] = tfsf->m_Start[nPP] + j;
+						pos[n]   = linePos;
+
+						// nP component
+						uint32_t gIdx_nP = nP * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2];
+						vIdx[vi]   = gIdx_nP;
+						vAmp[vi]   = tfsf->m_VoltAmp[n][side][0][ui_pos];
+						vDelta[vi] = tfsf->m_VoltDelayDelta[n][side][0][ui_pos];
+						vDelay[vi] = tfsf->m_VoltDelay[n][side][0][ui_pos];
+						vi++;
+
+						// nPP component
+						uint32_t gIdx_nPP = nPP * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2];
+						vIdx[vi]   = gIdx_nPP;
+						vAmp[vi]   = tfsf->m_VoltAmp[n][side][1][ui_pos];
+						vDelta[vi] = tfsf->m_VoltDelayDelta[n][side][1][ui_pos];
+						vDelay[vi] = tfsf->m_VoltDelay[n][side][1][ui_pos];
+						vi++;
+
+						ui_pos++;
+					}
+				}
+			}
+		}
+
+		// Flatten current injection points
+		std::vector<float>    cAmp(currTotal), cDelta(currTotal);
+		std::vector<uint32_t> cIdx(currTotal), cDelay(currTotal);
+		uint32_t ci_idx = 0;
+
+		for (int n = 0; n < 3; n++)
+		{
+			int nP = (n+1)%3, nPP = (n+2)%3;
+			for (int side = 0; side < 2; side++)
+			{
+				if (!tfsf->m_ActiveDir[n][side]) continue;
+
+				// Current injection: lower face uses Start[n]-1, upper face uses Stop[n]
+				uint32_t linePos = (side == 0) ? tfsf->m_Start[n] - 1 : tfsf->m_Stop[n];
+				unsigned int ui_pos = 0;
+				unsigned int pos[3];
+
+				for (unsigned int i = 0; i < tfsf->m_numLines[nP]; i++)
+				{
+					for (unsigned int j = 0; j < tfsf->m_numLines[nPP]; j++)
+					{
+						pos[nP]  = tfsf->m_Start[nP] + i;
+						pos[nPP] = tfsf->m_Start[nPP] + j;
+						pos[n]   = linePos;
+
+						uint32_t gIdx_nP = nP * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2];
+						cIdx[ci_idx]   = gIdx_nP;
+						cAmp[ci_idx]   = tfsf->m_CurrAmp[n][side][0][ui_pos];
+						cDelta[ci_idx] = tfsf->m_CurrDelayDelta[n][side][0][ui_pos];
+						cDelay[ci_idx] = tfsf->m_CurrDelay[n][side][0][ui_pos];
+						ci_idx++;
+
+						uint32_t gIdx_nPP = nPP * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2];
+						cIdx[ci_idx]   = gIdx_nPP;
+						cAmp[ci_idx]   = tfsf->m_CurrAmp[n][side][1][ui_pos];
+						cDelta[ci_idx] = tfsf->m_CurrDelayDelta[n][side][1][ui_pos];
+						cDelay[ci_idx] = tfsf->m_CurrDelay[n][side][1][ui_pos];
+						ci_idx++;
+
+						ui_pos++;
+					}
+				}
+			}
+		}
+
+		m_gpuTFSF.voltCount = voltTotal;
+		m_gpuTFSF.currCount = currTotal;
+
+		// Upload voltage TF/SF data
+		if (voltTotal > 0)
+		{
+			VkDeviceSize fSize = voltTotal * sizeof(float);
+			VkDeviceSize iSize = voltTotal * sizeof(uint32_t);
+			CreateGpuBuf(m_gpuTFSF.voltAmp,   fSize, usage, dLoc);
+			CreateGpuBuf(m_gpuTFSF.voltDelta,  fSize, usage, dLoc);
+			CreateGpuBuf(m_gpuTFSF.voltIdx,    iSize, usage, dLoc);
+			CreateGpuBuf(m_gpuTFSF.voltDelay,  iSize, usage, dLoc);
+			UploadGpuBuf(m_gpuTFSF.voltAmp,   vAmp.data(),   fSize);
+			UploadGpuBuf(m_gpuTFSF.voltDelta,  vDelta.data(), fSize);
+			UploadGpuBuf(m_gpuTFSF.voltIdx,    vIdx.data(),   iSize);
+			UploadGpuBuf(m_gpuTFSF.voltDelay,  vDelay.data(), iSize);
+
+			// Signal: H-field signal for voltage injection
+			VkDeviceSize sigSize = exc->GetLength() * sizeof(FDTD_FLOAT);
+			CreateGpuBuf(m_gpuTFSF.voltSignal, sigSize, usage, dLoc);
+			UploadGpuBuf(m_gpuTFSF.voltSignal, exc->GetCurrentSignal(), sigSize);
+		}
+
+		// Upload current TF/SF data
+		if (currTotal > 0)
+		{
+			VkDeviceSize fSize = currTotal * sizeof(float);
+			VkDeviceSize iSize = currTotal * sizeof(uint32_t);
+			CreateGpuBuf(m_gpuTFSF.currAmp,   fSize, usage, dLoc);
+			CreateGpuBuf(m_gpuTFSF.currDelta,  fSize, usage, dLoc);
+			CreateGpuBuf(m_gpuTFSF.currIdx,    iSize, usage, dLoc);
+			CreateGpuBuf(m_gpuTFSF.currDelay,  iSize, usage, dLoc);
+			UploadGpuBuf(m_gpuTFSF.currAmp,   cAmp.data(),   fSize);
+			UploadGpuBuf(m_gpuTFSF.currDelta,  cDelta.data(), fSize);
+			UploadGpuBuf(m_gpuTFSF.currIdx,    cIdx.data(),   iSize);
+			UploadGpuBuf(m_gpuTFSF.currDelay,  cDelay.data(), iSize);
+
+			// Signal: E-field signal for current injection
+			VkDeviceSize sigSize = exc->GetLength() * sizeof(FDTD_FLOAT);
+			CreateGpuBuf(m_gpuTFSF.currSignal, sigSize, usage, dLoc);
+			UploadGpuBuf(m_gpuTFSF.currSignal, exc->GetVoltageSignal(), sigSize);
+		}
+
+		// Descriptor sets
+		auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
+		{
+			VkDescriptorSetAllocateInfo ai{};
+			ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+			ai.descriptorPool     = m_extDescPool;
+			ai.descriptorSetCount = 1;
+			ai.pSetLayouts        = &layout;
+			VkDescriptorSet set;
+			VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &set));
+			return set;
+		};
+
+		VkDeviceSize sigSize = exc->GetLength() * sizeof(FDTD_FLOAT);
+
+		if (voltTotal > 0)
+		{
+			m_gpuTFSF.voltDesc = allocDescSet(m_tfsfDescLayout);
+			VkDeviceSize fSize = voltTotal * sizeof(float);
+			VkDeviceSize iSize = voltTotal * sizeof(uint32_t);
+			VkBuffer bufs[6]      = {m_voltBuf, m_gpuTFSF.voltAmp.buffer, m_gpuTFSF.voltDelta.buffer,
+			                          m_gpuTFSF.voltIdx.buffer, m_gpuTFSF.voltDelay.buffer,
+			                          m_gpuTFSF.voltSignal.buffer};
+			VkDeviceSize sizes[6] = {m_fieldBufSize, fSize, fSize, iSize, iSize, sigSize};
+			WriteDescriptorBuffers(m_device, m_gpuTFSF.voltDesc, bufs, sizes, 6);
+		}
+
+		if (currTotal > 0)
+		{
+			m_gpuTFSF.currDesc = allocDescSet(m_tfsfDescLayout);
+			VkDeviceSize fSize = currTotal * sizeof(float);
+			VkDeviceSize iSize = currTotal * sizeof(uint32_t);
+			VkBuffer bufs[6]      = {m_currBuf, m_gpuTFSF.currAmp.buffer, m_gpuTFSF.currDelta.buffer,
+			                          m_gpuTFSF.currIdx.buffer, m_gpuTFSF.currDelay.buffer,
+			                          m_gpuTFSF.currSignal.buffer};
+			VkDeviceSize sizes[6] = {m_fieldBufSize, fSize, fSize, iSize, iSize, sigSize};
+			WriteDescriptorBuffers(m_device, m_gpuTFSF.currDesc, bufs, sizes, 6);
+		}
+
+		m_hasGPU_TFSF = true;
+		break;  // Only one TF/SF extension expected
+	}
+}
+
+void Engine_Vulkan::SetupGPU_Mur()
+{
+	// Iterate operator extensions
+	size_t nExts = Op->GetNumberOfExtentions();
+	VkBufferUsageFlags usage   = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
+	{
+		Operator_Extension* ext = Op->GetExtension(eIdx);
+		auto* mur = dynamic_cast<Operator_Ext_Mur_ABC*>(ext);
+		if (!mur) continue;
+
+		GpuMurData data;
+		uint32_t numLinesP  = mur->m_numLines[0];
+		uint32_t numLinesPP = mur->m_numLines[1];
+		uint32_t total      = numLinesP * numLinesPP;
+		if (total == 0) continue;
+
+		data.totalCells = total;
+		data.pc.Nx = numLines[0]; data.pc.Ny = numLines[1]; data.pc.Nz = numLines[2];
+		data.pc.ny          = mur->m_ny;
+		data.pc.lineNr      = mur->m_LineNr;
+		data.pc.lineNrShift = mur->m_LineNr_Shift;
+		data.pc.numLinesP   = numLinesP;
+		data.pc.numLinesPP  = numLinesPP;
+
+		VkDeviceSize bufSize = total * sizeof(FDTD_FLOAT);
+
+		// Intermediate value buffers (zero-init)
+		CreateGpuBuf(data.murNyP,  bufSize, rwUsage, dLoc);
+		CreateGpuBuf(data.murNyPP, bufSize, rwUsage, dLoc);
+		{
+			std::vector<float> zeros(total, 0.0f);
+			UploadGpuBuf(data.murNyP,  zeros.data(), bufSize);
+			UploadGpuBuf(data.murNyPP, zeros.data(), bufSize);
+		}
+
+		// Coefficient buffers
+		CreateGpuBuf(data.coeffNyP,  bufSize, usage, dLoc);
+		CreateGpuBuf(data.coeffNyPP, bufSize, usage, dLoc);
+		UploadGpuBuf(data.coeffNyP,  mur->m_Mur_Coeff_nyP.data(),  bufSize);
+		UploadGpuBuf(data.coeffNyPP, mur->m_Mur_Coeff_nyPP.data(), bufSize);
+
+		auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
+		{
+			VkDescriptorSetAllocateInfo ai{};
+			ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+			ai.descriptorPool     = m_extDescPool;
+			ai.descriptorSetCount = 1;
+			ai.pSetLayouts        = &layout;
+			VkDescriptorSet set;
+			VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &set));
+			return set;
+		};
+
+		// pre = [volt, murNyP, murNyPP, coeffNyP, coeffNyPP]
+		data.preDesc = allocDescSet(m_murPreDescLayout);
+		{
+			VkBuffer bufs[5]      = {m_voltBuf, data.murNyP.buffer, data.murNyPP.buffer,
+			                          data.coeffNyP.buffer, data.coeffNyPP.buffer};
+			VkDeviceSize sizes[5] = {m_fieldBufSize, bufSize, bufSize, bufSize, bufSize};
+			WriteDescriptorBuffers(m_device, data.preDesc, bufs, sizes, 5);
+		}
+
+		// post = same layout as pre
+		data.postDesc = allocDescSet(m_murPostDescLayout);
+		{
+			VkBuffer bufs[5]      = {m_voltBuf, data.murNyP.buffer, data.murNyPP.buffer,
+			                          data.coeffNyP.buffer, data.coeffNyPP.buffer};
+			VkDeviceSize sizes[5] = {m_fieldBufSize, bufSize, bufSize, bufSize, bufSize};
+			WriteDescriptorBuffers(m_device, data.postDesc, bufs, sizes, 5);
+		}
+
+		// apply = [volt, murNyP, murNyPP]
+		data.applyDesc = allocDescSet(m_murApplyDescLayout);
+		{
+			VkBuffer bufs[3]      = {m_voltBuf, data.murNyP.buffer, data.murNyPP.buffer};
+			VkDeviceSize sizes[3] = {m_fieldBufSize, bufSize, bufSize};
+			WriteDescriptorBuffers(m_device, data.applyDesc, bufs, sizes, 3);
+		}
+
+		m_gpuMur.push_back(std::move(data));
+	}
+
+	m_hasGPU_Mur = !m_gpuMur.empty();
+}
+
+void Engine_Vulkan::SetupGPU_RLC()
+{
+	// Iterate operator extensions
+	size_t nExts = Op->GetNumberOfExtentions();
+	VkBufferUsageFlags usage   = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	uint32_t N   = m_fieldN;
+	uint32_t sYZ = m_strideYZ;
+
+	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
+	{
+		Operator_Extension* ext = Op->GetExtension(eIdx);
+		auto* rlc = dynamic_cast<Operator_Ext_LumpedRLC*>(ext);
+		if (!rlc || rlc->RLC_count == 0) continue;
+
+		uint32_t cnt = rlc->RLC_count;
+		m_gpuRLC.count = cnt;
+
+		VkDeviceSize fSize = cnt * sizeof(float);
+		VkDeviceSize iSize = cnt * sizeof(uint32_t);
+
+		// Pre-linearize indices: dir*N + x*sYZ + y*Nz + z
+		std::vector<uint32_t> linIdx(cnt);
+		for (uint32_t i = 0; i < cnt; i++)
+		{
+			uint32_t dir = rlc->v_RLC_dir[i];
+			uint32_t x   = rlc->v_RLC_pos[0][i];
+			uint32_t y   = rlc->v_RLC_pos[1][i];
+			uint32_t z   = rlc->v_RLC_pos[2][i];
+			linIdx[i] = dir * N + x * sYZ + y * numLines[2] + z;
+		}
+
+		CreateGpuBuf(m_gpuRLC.linIdx, iSize, usage, dLoc);
+		UploadGpuBuf(m_gpuRLC.linIdx, linIdx.data(), iSize);
+
+		// State buffers (zero-init)
+		std::vector<float> zeros(cnt, 0.0f);
+		CreateGpuBuf(m_gpuRLC.il,   fSize, rwUsage, dLoc); UploadGpuBuf(m_gpuRLC.il,   zeros.data(), fSize);
+		CreateGpuBuf(m_gpuRLC.vdn0, fSize, rwUsage, dLoc); UploadGpuBuf(m_gpuRLC.vdn0, zeros.data(), fSize);
+		CreateGpuBuf(m_gpuRLC.vdn1, fSize, rwUsage, dLoc); UploadGpuBuf(m_gpuRLC.vdn1, zeros.data(), fSize);
+		CreateGpuBuf(m_gpuRLC.vdn2, fSize, rwUsage, dLoc); UploadGpuBuf(m_gpuRLC.vdn2, zeros.data(), fSize);
+		CreateGpuBuf(m_gpuRLC.jn0,  fSize, rwUsage, dLoc); UploadGpuBuf(m_gpuRLC.jn0,  zeros.data(), fSize);
+		CreateGpuBuf(m_gpuRLC.jn1,  fSize, rwUsage, dLoc); UploadGpuBuf(m_gpuRLC.jn1,  zeros.data(), fSize);
+		CreateGpuBuf(m_gpuRLC.jn2,  fSize, rwUsage, dLoc); UploadGpuBuf(m_gpuRLC.jn2,  zeros.data(), fSize);
+
+		// Coefficient buffers
+		auto uploadCoef = [&](GpuBuf& gb, FDTD_FLOAT* data_ptr)
+		{
+			CreateGpuBuf(gb, fSize, usage, dLoc);
+			UploadGpuBuf(gb, data_ptr, fSize);
+		};
+		uploadCoef(m_gpuRLC.i2v, rlc->v_RLC_i2v);
+		uploadCoef(m_gpuRLC.ilv, rlc->v_RLC_ilv);
+		uploadCoef(m_gpuRLC.vvd, rlc->v_RLC_vvd);
+		uploadCoef(m_gpuRLC.vv2, rlc->v_RLC_vv2);
+		uploadCoef(m_gpuRLC.vj1, rlc->v_RLC_vj1);
+		uploadCoef(m_gpuRLC.vj2, rlc->v_RLC_vj2);
+		uploadCoef(m_gpuRLC.ib0, rlc->v_RLC_ib0);
+		uploadCoef(m_gpuRLC.b1,  rlc->v_RLC_b1);
+		uploadCoef(m_gpuRLC.b2,  rlc->v_RLC_b2);
+
+		// Descriptor sets
+		auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
+		{
+			VkDescriptorSetAllocateInfo ai{};
+			ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+			ai.descriptorPool     = m_extDescPool;
+			ai.descriptorSetCount = 1;
+			ai.pSetLayouts        = &layout;
+			VkDescriptorSet set;
+			VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &set));
+			return set;
+		};
+
+		// preDesc: [il, vdn0, vdn1, vdn2, i2v, ilv]
+		m_gpuRLC.preDesc = allocDescSet(m_rlcPreDescLayout);
+		{
+			VkBuffer bufs[6]      = {m_gpuRLC.il.buffer, m_gpuRLC.vdn0.buffer,
+			                          m_gpuRLC.vdn1.buffer, m_gpuRLC.vdn2.buffer,
+			                          m_gpuRLC.i2v.buffer, m_gpuRLC.ilv.buffer};
+			VkDeviceSize sizes[6] = {fSize, fSize, fSize, fSize, fSize, fSize};
+			WriteDescriptorBuffers(m_device, m_gpuRLC.preDesc, bufs, sizes, 6);
+		}
+
+		// applyDesc: [volt, il, vdn0, vdn1, vdn2, jn0, jn1, jn2, linIdx, vvd, vv2, vj1, vj2, ib0, b1, b2]
+		m_gpuRLC.applyDesc = allocDescSet(m_rlcApplyDescLayout);
+		{
+			VkBuffer bufs[16] = {
+				m_voltBuf, m_gpuRLC.il.buffer,
+				m_gpuRLC.vdn0.buffer, m_gpuRLC.vdn1.buffer, m_gpuRLC.vdn2.buffer,
+				m_gpuRLC.jn0.buffer, m_gpuRLC.jn1.buffer, m_gpuRLC.jn2.buffer,
+				m_gpuRLC.linIdx.buffer,
+				m_gpuRLC.vvd.buffer, m_gpuRLC.vv2.buffer,
+				m_gpuRLC.vj1.buffer, m_gpuRLC.vj2.buffer,
+				m_gpuRLC.ib0.buffer, m_gpuRLC.b1.buffer, m_gpuRLC.b2.buffer
+			};
+			VkDeviceSize sizes[16] = {
+				m_fieldBufSize, fSize,
+				fSize, fSize, fSize,
+				fSize, fSize, fSize,
+				iSize,
+				fSize, fSize,
+				fSize, fSize,
+				fSize, fSize, fSize
+			};
+			WriteDescriptorBuffers(m_device, m_gpuRLC.applyDesc, bufs, sizes, 16);
+		}
+
+		m_hasGPU_RLC = true;
+		break;  // Only one RLC extension expected
+	}
+}
+
+void Engine_Vulkan::SetupGPU_Probes()
+{
+	// Placeholder for future probe gather setup
+}
+
+// ===========================================================================
+// Record extension shader dispatches into command buffer
+// ===========================================================================
+
+void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) const
+{
+	VkMemoryBarrier barrier{};
+	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+	// --- Pre-voltage: UPML pre-voltage, Mur pre-voltage ---
+	// UPML pre-voltage (highest priority, runs first)
+	if (!m_gpuUPML.empty())
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPreVoltPipeline);
+	for (const auto& u : m_gpuUPML)
+	{
+		uint32_t groups = (u.totalCells + 255) / 256;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_upmlPipeLayout, 0, 1, &u.preVoltDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+		vkCmdDispatch(cmd, groups, 1, 1);
+	}
+
+	// Mur pre-voltage (saves boundary values before Yee update)
+	if (!m_gpuMur.empty())
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPreVoltPipeline);
+	for (const auto& m : m_gpuMur)
+	{
+		if (ts < m.startTS) continue;  // Mur not yet active
+		uint32_t groups = (m.totalCells + 255) / 256;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_murPipeLayout, 0, 1, &m.preDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+		vkCmdDispatch(cmd, groups, 1, 1);
+	}
+
+	// RLC pre-voltage (inductor current update + history rotation)
+	if (m_hasGPU_RLC)
+	{
+		RlcPC pc = {m_gpuRLC.count};
+		uint32_t groups = (m_gpuRLC.count + 255) / 256;
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcPreVoltPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_rlcPrePipeLayout, 0, 1, &m_gpuRLC.preDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_rlcPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
+		vkCmdDispatch(cmd, groups, 1, 1);
+	}
+
+	// Dispersive pre-voltage (ADE update before Yee)
+	if (!m_gpuDisp.empty())
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreVoltPipeline);
+	for (const auto& d : m_gpuDisp)
+	{
+		if (!d.voltADEOn) continue;
+		uint32_t groups = (d.count + 255) / 256;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+		vkCmdDispatch(cmd, groups, 1, 1);
+	}
+
+	// Barrier: all pre-voltage writes must complete before Yee update
+	if (m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_RLC || m_hasGPU_Dispersive)
+	{
+		vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+	}
+}
+
+void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) const
+{
+	VkMemoryBarrier barrier{};
+	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+	// --- Pre-current: UPML pre-current ---
+	if (!m_gpuUPML.empty())
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPreCurrPipeline);
+	for (const auto& u : m_gpuUPML)
+	{
+		uint32_t groups = (u.totalCells + 255) / 256;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_upmlPipeLayout, 0, 1, &u.preCurrDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+		vkCmdDispatch(cmd, groups, 1, 1);
+	}
+
+	// Dispersive pre-current
+	if (!m_gpuDisp.empty())
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreCurrPipeline);
+	for (const auto& d : m_gpuDisp)
+	{
+		if (!d.currADEOn) continue;
+		uint32_t groups = (d.count + 255) / 256;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_dispPrePipeLayout, 0, 1, &d.preCurrDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+		vkCmdDispatch(cmd, groups, 1, 1);
+	}
+
+	if (m_hasGPU_UPML || m_hasGPU_Dispersive)
+	{
+		vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+	}
+}
+
+void Engine_Vulkan::FlushGPU() const
+{
+	DrainGPU();
+}
+
+void Engine_Vulkan::DrainGPU() const
+{
+	if (m_gpuDrained) return;  // Already drained — skip redundant fence syscalls
+	for (int i = 0; i < 2; ++i)
+	{
+		if (m_gpuInFlight[i])
+		{
+			vkWaitForFences(m_device, 1, &m_fences[i], VK_TRUE, UINT64_MAX);
+			m_gpuInFlight[i] = false;
+		}
+	}
+	m_gpuDrained = true;
+}
+
+void Engine_Vulkan::SyncFieldsToHost() const
+{
+	DrainGPU();  // ensure all pending GPU work is complete
+	if (!m_hostDirty) return;
+	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
+		m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
+		m_currBuf, curr_ptr->data(), m_fieldBufSize);
+	m_hostDirty = false;
+}
+
+void Engine_Vulkan::SyncFieldsToDevice()
+{
+	DrainGPU();  // must complete any pending GPU work before overwriting
+	if (!m_deviceDirty) return;
+	UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+	UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
+	m_deviceDirty = false;
+}
+
+// ===========================================================================
+// IterateTS — the main time-stepping loop
+// ===========================================================================
+
+bool Engine_Vulkan::IterateTS(unsigned int iterTS)
+{
+	if (iterTS == 0) return true;
+
+	uint32_t N  = numLines[0] * numLines[1] * numLines[2];
+	uint32_t cN = (numLines[0]-1) * (numLines[1]-1) * (numLines[2]-1);
+	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
+	GridPC gridPC = {numLines[0], numLines[1], numLines[2], opVk->GetNumCompressed()};
+	uint32_t voltGroups = (N  + 255) / 256;
+	uint32_t currGroups = (cN + 255) / 256;
+	uint32_t excVoltGroups = (m_excVoltCount + 255) / 256;
+	uint32_t excCurrGroups = (m_excCurrCount + 255) / 256;
+
+	VkMemoryBarrier barrier{};
+	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+	if (!m_hasCPUExtensions)
+	{
+		// ========== Pure GPU path: fire-and-forget double-buffered ==========
+		// Record FDTD compute into m_cmdBufs[m_cmdIdx], submit immediately,
+		// flip to the other slot.  GetVolt/GetCurr calls DrainGPU() (usually
+		// a no-op since the ~50 µs compute is already done) then reads
+		// directly from the ReBAR-mapped VRAM pointer — zero copies.
+		if (m_deviceDirty) SyncFieldsToDevice();
+
+		bool hasExcVolt = m_hasGPUExcitation && m_excVoltCount > 0;
+		bool hasExcCurr = m_hasGPUExcitation && m_excCurrCount > 0;
+
+		// Cache TF/SF signal info (invariant across iterations)
+		Excitation* tfsfExc = nullptr;
+		int         tfsfSigPeriod = 0;
+		uint32_t    tfsfSigLen = 0;
+		if (m_hasGPU_TFSF)
+		{
+			tfsfExc = const_cast<Operator*>(Op)->GetExcitationSignal();
+			if (tfsfExc)
+			{
+				tfsfSigLen = (uint32_t)tfsfExc->GetLength();
+				tfsfSigPeriod = (tfsfExc->GetSignalPeriod() > 0)
+				              ? (int)(tfsfExc->GetSignalPeriod() / tfsfExc->GetTimestep()) : 0;
+			}
+		}
+
+		// Wait for this slot if it is still in-flight from a previous round
+		if (m_gpuInFlight[m_cmdIdx])
+		{
+			vkWaitForFences(m_device, 1, &m_fences[m_cmdIdx], VK_TRUE, UINT64_MAX);
+			m_gpuInFlight[m_cmdIdx] = false;
+		}
+
+		// Begin recording
+		VkCommandBuffer cmd = m_cmdBufs[m_cmdIdx];
+		VkCommandBufferBeginInfo bi{};
+		bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkResetCommandBuffer(cmd, 0);
+		VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+		// Append all FDTD timesteps
+		for (unsigned int iter = 0; iter < iterTS; ++iter)
+		{
+			uint32_t ts = numTS + iter;
+
+			// === Pre-voltage extensions (GPU) ===
+			RecordVoltageExtensions(cmd, ts);
+
+			// --- Voltage update ---
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(GridPC), &gridPC);
+			vkCmdDispatch(cmd, voltGroups, 1, 1);
+
+			vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+			// --- Voltage excitation ---
+			if (hasExcVolt)
+			{
+				ExcPC epc = {m_excVoltCount, (int32_t)(ts+1), m_excSignalLen, m_excSignalPeriod};
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_excPipeLayout, 0, 1, &m_excVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(ExcPC), &epc);
+				vkCmdDispatch(cmd, excVoltGroups, 1, 1);
+
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+
+			// === Post-voltage extensions (GPU) ===
+			// UPML post-voltage
+			if (!m_gpuUPML.empty())
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostVoltPipeline);
+			for (const auto& u : m_gpuUPML)
+			{
+				uint32_t groups = (u.totalCells + 255) / 256;
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_upmlPipeLayout, 0, 1, &u.postVoltDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// Mur post-voltage (accumulates shifted field)
+			if (!m_gpuMur.empty())
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPostVoltPipeline);
+			for (const auto& m : m_gpuMur)
+			{
+				if (ts < m.startTS) continue;
+				uint32_t groups = (m.totalCells + 255) / 256;
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_murPipeLayout, 0, 1, &m.postDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// TF/SF voltage injection
+			if (m_hasGPU_TFSF && m_gpuTFSF.voltCount > 0 && tfsfExc)
+			{
+				TfsfPC tpc = {m_gpuTFSF.voltCount, (int32_t)(ts+1), tfsfSigLen, tfsfSigPeriod};
+				uint32_t groups = (m_gpuTFSF.voltCount + 255) / 256;
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.voltDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// Barrier for post-voltage writes
+			if (m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF)
+			{
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+
+			// === Apply2Voltages extensions (GPU) ===
+			// Dispersive apply
+			if (!m_gpuDisp.empty())
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
+			for (const auto& d : m_gpuDisp)
+			{
+				if (!d.voltADEOn) continue;
+				DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
+				uint32_t groups = (d.count + 255) / 256;
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_dispApplyPipeLayout, 0, 1, &d.applyVoltDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// Mur apply (overwrites boundary voltages)
+			if (!m_gpuMur.empty())
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
+			for (const auto& m : m_gpuMur)
+			{
+				if (ts < m.startTS) continue;
+				uint32_t groups = (m.totalCells + 255) / 256;
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_murPipeLayout, 0, 1, &m.applyDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// RLC apply
+			if (m_hasGPU_RLC)
+			{
+				RlcPC pc = {m_gpuRLC.count};
+				uint32_t groups = (m_gpuRLC.count + 255) / 256;
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_rlcApplyPipeLayout, 0, 1, &m_gpuRLC.applyDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// (No barrier needed: apply-to-voltage writes V, pre-current reads C
+			//  — different field buffers. The pre-current barrier inside
+			//  RecordCurrentExtensions covers the Yee dependency.)
+
+			// === Pre-current extensions (GPU) ===
+			RecordCurrentExtensions(cmd, ts);
+
+			// --- Current update ---
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(GridPC), &gridPC);
+			vkCmdDispatch(cmd, currGroups, 1, 1);
+
+			vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+			// --- Current excitation ---
+			if (hasExcCurr)
+			{
+				ExcPC epc = {m_excCurrCount, (int32_t)(ts+1), m_excSignalLen, m_excSignalPeriod};
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_excPipeLayout, 0, 1, &m_excCurrDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(ExcPC), &epc);
+				vkCmdDispatch(cmd, excCurrGroups, 1, 1);
+
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+
+			// === Post-current extensions (GPU) ===
+			// UPML post-current
+			if (!m_gpuUPML.empty())
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostCurrPipeline);
+			for (const auto& u : m_gpuUPML)
+			{
+				uint32_t groups = (u.totalCells + 255) / 256;
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_upmlPipeLayout, 0, 1, &u.postCurrDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// TF/SF current injection
+			if (m_hasGPU_TFSF && m_gpuTFSF.currCount > 0 && tfsfExc)
+			{
+				TfsfPC tpc = {m_gpuTFSF.currCount, (int32_t)(ts), tfsfSigLen, tfsfSigPeriod};
+				uint32_t groups = (m_gpuTFSF.currCount + 255) / 256;
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfCurrPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.currDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// Dispersive apply current
+			if (!m_gpuDisp.empty())
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyCurrPipeline);
+			for (const auto& d : m_gpuDisp)
+			{
+				if (!d.currADEOn) continue;
+				DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
+				uint32_t groups = (d.count + 255) / 256;
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_dispApplyPipeLayout, 0, 1, &d.applyCurrDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			// (No final barrier: the pre-voltage barrier in the NEXT iteration —
+			//  or the implicit queue completion for the last iteration — ensures
+			//  all post-current writes are visible before anyone reads V or C.)
+		}
+
+		// --- End + submit (fire-and-forget) ---
+		VK_CHECK(vkEndCommandBuffer(cmd));
+
+		VkSubmitInfo si{};
+		si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		si.commandBufferCount = 1;
+		si.pCommandBuffers    = &cmd;
+		vkResetFences(m_device, 1, &m_fences[m_cmdIdx]);
+		VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_fences[m_cmdIdx]));
+		m_gpuInFlight[m_cmdIdx] = true;
+		m_gpuDrained = false;  // new submission in flight
+		m_cmdIdx ^= 1;   // flip to other slot for the next call
+
+		numTS += iterTS;
+		m_hostDirty = true;
+	}
+	else
+	{
+		// ========== Hybrid path: per-timestep with CPU extension sync =====
+		// Each cycle: GPU update → 1 download → CPU extensions → 1 upload
+		// Per timestep: 2 downloads + 2 uploads (minimum possible)
+		for (unsigned int iter = 0; iter < iterTS; ++iter)
+		{
+			// --- Pre-voltage extensions (CPU) ---
+			// Host is current from previous iteration's final upload,
+			// or from Init() on the first iteration.
+			DoPreVoltageUpdates();
+			if (m_deviceDirty) SyncFieldsToDevice();
+
+			// --- GPU: voltage update + excitation ---
+			RunSingleCommand([&](VkCommandBuffer cmd)
+			{
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(GridPC), &gridPC);
+				vkCmdDispatch(cmd, voltGroups, 1, 1);
+
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+				if (m_hasGPUExcitation && m_excVoltCount > 0)
+				{
+					ExcPC epc = {m_excVoltCount, (int32_t)(numTS+1), m_excSignalLen, m_excSignalPeriod};
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_excPipeLayout, 0, 1, &m_excVoltDescSet, 0, nullptr);
+					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+					                   0, sizeof(ExcPC), &epc);
+					vkCmdDispatch(cmd, excVoltGroups, 1, 1);
+				}
+			});
+
+			// --- Post-voltage + apply + pre-current extensions (CPU) ---
+			// Single download, batch all CPU voltage+current-prep work, single upload
+			m_hostDirty = true;
+			SyncFieldsToHost();
+			DoPostVoltageUpdates();
+			Apply2Voltages();
+			DoPreCurrentUpdates();
+			if (m_deviceDirty) SyncFieldsToDevice();
+
+			// --- GPU: current update + excitation ---
+			RunSingleCommand([&](VkCommandBuffer cmd)
+			{
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(GridPC), &gridPC);
+				vkCmdDispatch(cmd, currGroups, 1, 1);
+
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+				if (m_hasGPUExcitation && m_excCurrCount > 0)
+				{
+					ExcPC epc = {m_excCurrCount, (int32_t)(numTS+1), m_excSignalLen, m_excSignalPeriod};
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_excPipeLayout, 0, 1, &m_excCurrDescSet, 0, nullptr);
+					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+					                   0, sizeof(ExcPC), &epc);
+					vkCmdDispatch(cmd, excCurrGroups, 1, 1);
+				}
+			});
+
+			// --- Post-current + apply extensions (CPU) ---
+			m_hostDirty = true;
+			SyncFieldsToHost();
+			DoPostCurrentUpdates();
+			Apply2Current();
+			// Host is now current; device upload deferred to next iteration
+			m_deviceDirty = true;
+
+			++numTS;
+		}
+		// Final upload so device is consistent
+		if (m_deviceDirty) SyncFieldsToDevice();
+		m_hostDirty = false;
+	}
+
+	return true;
+}
+
+// ===========================================================================
+// Cleanup
+// ===========================================================================
+
+void Engine_Vulkan::CleanupVulkan()
+{
+	if (m_device == VK_NULL_HANDLE) return;
+	vkDeviceWaitIdle(m_device);
+
+	// First clean up extension resources
+	CleanupExtensions();
+
+	auto destroyBufMem = [&](VkBuffer& buf, VkDeviceMemory& mem)
+	{
+		if (buf) { vkDestroyBuffer(m_device, buf, nullptr); buf = VK_NULL_HANDLE; }
+		if (mem) { vkFreeMemory(m_device, mem, nullptr);    mem = VK_NULL_HANDLE; }
+	};
+
+	// Pipelines
+	if (m_updateVoltPipeline) vkDestroyPipeline(m_device, m_updateVoltPipeline, nullptr);
+	if (m_updateCurrPipeline) vkDestroyPipeline(m_device, m_updateCurrPipeline, nullptr);
+	if (m_excPipeline)        vkDestroyPipeline(m_device, m_excPipeline, nullptr);
+	if (m_fdtdPipeLayout) vkDestroyPipelineLayout(m_device, m_fdtdPipeLayout, nullptr);
+	if (m_excPipeLayout)  vkDestroyPipelineLayout(m_device, m_excPipeLayout, nullptr);
+
+	// Descriptors
+	if (m_descPool)       vkDestroyDescriptorPool(m_device, m_descPool, nullptr);
+	if (m_fdtdDescLayout) vkDestroyDescriptorSetLayout(m_device, m_fdtdDescLayout, nullptr);
+	if (m_excDescLayout)  vkDestroyDescriptorSetLayout(m_device, m_excDescLayout, nullptr);
+
+	// Buffers
+	if (m_voltMapped) { vkUnmapMemory(m_device, m_voltMem); m_voltMapped = nullptr; }
+	if (m_currMapped) { vkUnmapMemory(m_device, m_currMem); m_currMapped = nullptr; }
+	destroyBufMem(m_voltBuf, m_voltMem);
+	destroyBufMem(m_currBuf, m_currMem);
+	destroyBufMem(m_opIndexBuf, m_opIndexMem);
+	destroyBufMem(m_vvCompBuf, m_vvCompMem);
+	destroyBufMem(m_viCompBuf, m_viCompMem);
+	destroyBufMem(m_iiCompBuf, m_iiCompMem);
+	destroyBufMem(m_ivCompBuf, m_ivCompMem);
+	destroyBufMem(m_stagingBuf, m_stagingMem);
+	destroyBufMem(m_excVoltIdxBuf, m_excVoltIdxMem);
+	destroyBufMem(m_excVoltAmpBuf, m_excVoltAmpMem);
+	destroyBufMem(m_excVoltDelayBuf, m_excVoltDelayMem);
+	destroyBufMem(m_excCurrIdxBuf, m_excCurrIdxMem);
+	destroyBufMem(m_excCurrAmpBuf, m_excCurrAmpMem);
+	destroyBufMem(m_excCurrDelayBuf, m_excCurrDelayMem);
+	destroyBufMem(m_excSignalVoltBuf, m_excSignalVoltMem);
+	destroyBufMem(m_excSignalCurrBuf, m_excSignalCurrMem);
+
+	// Command / sync
+	for (int i = 0; i < 2; ++i)
+		if (m_fences[i]) vkDestroyFence(m_device, m_fences[i], nullptr);
+	if (m_utilFence) vkDestroyFence(m_device, m_utilFence, nullptr);
+	if (m_cmdPool) vkDestroyCommandPool(m_device, m_cmdPool, nullptr);
+
+	// Energy reduction
+	CleanupGPU_EnergyReduction();
+
+	// Pipeline cache
+	if (m_pipelineCache) vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
+
+	// Device / instance
+	vkDestroyDevice(m_device, nullptr);
+	m_device = VK_NULL_HANDLE;
+	vkDestroyInstance(m_instance, nullptr);
+	m_instance = VK_NULL_HANDLE;
+}
+
+// ===========================================================================
+// Extension cleanup
+// ===========================================================================
+
+void Engine_Vulkan::CleanupExtensions()
+{
+	if (m_device == VK_NULL_HANDLE) return;
+
+	// --- Destroy extension pipelines ---
+	auto destroyPipeline = [&](VkPipeline& p)
+	{
+		if (p) { vkDestroyPipeline(m_device, p, nullptr); p = VK_NULL_HANDLE; }
+	};
+	auto destroyPipeLayout = [&](VkPipelineLayout& pl)
+	{
+		if (pl) { vkDestroyPipelineLayout(m_device, pl, nullptr); pl = VK_NULL_HANDLE; }
+	};
+	auto destroyDescLayout = [&](VkDescriptorSetLayout& dl)
+	{
+		if (dl) { vkDestroyDescriptorSetLayout(m_device, dl, nullptr); dl = VK_NULL_HANDLE; }
+	};
+
+	destroyPipeline(m_upmlPreVoltPipeline);
+	destroyPipeline(m_upmlPostVoltPipeline);
+	destroyPipeline(m_upmlPreCurrPipeline);
+	destroyPipeline(m_upmlPostCurrPipeline);
+	destroyPipeline(m_dispPreVoltPipeline);
+	destroyPipeline(m_dispPreCurrPipeline);
+	destroyPipeline(m_dispApplyVoltPipeline);
+	destroyPipeline(m_dispApplyCurrPipeline);
+	destroyPipeline(m_tfsfVoltPipeline);
+	destroyPipeline(m_tfsfCurrPipeline);
+	destroyPipeline(m_murPreVoltPipeline);
+	destroyPipeline(m_murPostVoltPipeline);
+	destroyPipeline(m_murApplyVoltPipeline);
+	destroyPipeline(m_rlcPreVoltPipeline);
+	destroyPipeline(m_rlcApplyVoltPipeline);
+	destroyPipeline(m_probePipeline);
+
+	destroyPipeLayout(m_upmlPipeLayout);
+	destroyPipeLayout(m_dispPrePipeLayout);
+	destroyPipeLayout(m_dispApplyPipeLayout);
+	destroyPipeLayout(m_tfsfPipeLayout);
+	destroyPipeLayout(m_murPipeLayout);
+	destroyPipeLayout(m_rlcPrePipeLayout);
+	destroyPipeLayout(m_rlcApplyPipeLayout);
+	destroyPipeLayout(m_probePipeLayout);
+
+	// --- Destroy extension descriptor pool (this frees all descriptor sets) ---
+	if (m_extDescPool) { vkDestroyDescriptorPool(m_device, m_extDescPool, nullptr); m_extDescPool = VK_NULL_HANDLE; }
+
+	destroyDescLayout(m_upmlPreVoltDescLayout);
+	destroyDescLayout(m_upmlPostVoltDescLayout);
+	destroyDescLayout(m_upmlPreCurrDescLayout);
+	destroyDescLayout(m_upmlPostCurrDescLayout);
+	destroyDescLayout(m_dispPreDescLayout);
+	destroyDescLayout(m_dispApplyDescLayout);
+	destroyDescLayout(m_tfsfDescLayout);
+	destroyDescLayout(m_murPreDescLayout);
+	destroyDescLayout(m_murPostDescLayout);
+	destroyDescLayout(m_murApplyDescLayout);
+	destroyDescLayout(m_rlcPreDescLayout);
+	destroyDescLayout(m_rlcApplyDescLayout);
+	destroyDescLayout(m_probeDescLayout);
+
+	// --- Destroy UPML GPU data ---
+	for (auto& u : m_gpuUPML)
+	{
+		DestroyGpuBuf(u.voltFlux); DestroyGpuBuf(u.currFlux);
+		DestroyGpuBuf(u.pmlVv);   DestroyGpuBuf(u.pmlVvfo); DestroyGpuBuf(u.pmlVvfn);
+		DestroyGpuBuf(u.pmlIi);   DestroyGpuBuf(u.pmlIifo); DestroyGpuBuf(u.pmlIifn);
+	}
+	m_gpuUPML.clear();
+
+	// --- Destroy dispersive GPU data ---
+	for (auto& d : m_gpuDisp)
+	{
+		DestroyGpuBuf(d.voltADE);    DestroyGpuBuf(d.voltLorADE);
+		DestroyGpuBuf(d.currADE);    DestroyGpuBuf(d.currLorADE);
+		DestroyGpuBuf(d.posIdx);
+		DestroyGpuBuf(d.vIntADE);    DestroyGpuBuf(d.vExtADE); DestroyGpuBuf(d.vLorADE);
+		DestroyGpuBuf(d.iIntADE);    DestroyGpuBuf(d.iExtADE); DestroyGpuBuf(d.iLorADE);
+	}
+	m_gpuDisp.clear();
+
+	// --- Destroy TF/SF GPU data ---
+	DestroyGpuBuf(m_gpuTFSF.voltAmp);   DestroyGpuBuf(m_gpuTFSF.voltDelta);
+	DestroyGpuBuf(m_gpuTFSF.voltIdx);   DestroyGpuBuf(m_gpuTFSF.voltDelay);
+	DestroyGpuBuf(m_gpuTFSF.voltSignal);
+	DestroyGpuBuf(m_gpuTFSF.currAmp);   DestroyGpuBuf(m_gpuTFSF.currDelta);
+	DestroyGpuBuf(m_gpuTFSF.currIdx);   DestroyGpuBuf(m_gpuTFSF.currDelay);
+	DestroyGpuBuf(m_gpuTFSF.currSignal);
+	m_gpuTFSF = GpuTFSFData{};
+
+	// --- Destroy Mur ABC GPU data ---
+	for (auto& m : m_gpuMur)
+	{
+		DestroyGpuBuf(m.murNyP);    DestroyGpuBuf(m.murNyPP);
+		DestroyGpuBuf(m.coeffNyP);  DestroyGpuBuf(m.coeffNyPP);
+	}
+	m_gpuMur.clear();
+
+	// --- Destroy RLC GPU data ---
+	DestroyGpuBuf(m_gpuRLC.il);
+	DestroyGpuBuf(m_gpuRLC.vdn0); DestroyGpuBuf(m_gpuRLC.vdn1); DestroyGpuBuf(m_gpuRLC.vdn2);
+	DestroyGpuBuf(m_gpuRLC.jn0);  DestroyGpuBuf(m_gpuRLC.jn1);  DestroyGpuBuf(m_gpuRLC.jn2);
+	DestroyGpuBuf(m_gpuRLC.linIdx);
+	DestroyGpuBuf(m_gpuRLC.i2v);  DestroyGpuBuf(m_gpuRLC.ilv);
+	DestroyGpuBuf(m_gpuRLC.vvd);  DestroyGpuBuf(m_gpuRLC.vv2);
+	DestroyGpuBuf(m_gpuRLC.vj1);  DestroyGpuBuf(m_gpuRLC.vj2);
+	DestroyGpuBuf(m_gpuRLC.ib0);  DestroyGpuBuf(m_gpuRLC.b1); DestroyGpuBuf(m_gpuRLC.b2);
+	m_gpuRLC = GpuRLCData{};
+
+	// --- Destroy probe GPU data ---
+	DestroyGpuBuf(m_gpuProbes.probeIdx);
+	DestroyGpuBuf(m_gpuProbes.fieldSel);
+	DestroyGpuBuf(m_gpuProbes.output);
+	m_gpuProbes = GpuProbeData{};
+
+	// Reset flags
+	m_hasGPU_UPML = false;
+	m_hasGPU_Dispersive = false;
+	m_hasGPU_TFSF = false;
+	m_hasGPU_Mur = false;
+	m_hasGPU_RLC = false;
+	m_hasGPU_Probes = false;
+}
+
+// ===========================================================================
+// GPU Energy Reduction
+// ===========================================================================
+
+void Engine_Vulkan::SetupGPU_EnergyReduction()
+{
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+	VkDeviceSize partialSize = 2 * ENERGY_NUM_WG * sizeof(float);
+
+	// Try ReBAR allocation for zero-copy readback of the tiny partials buffer
+	VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+	                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	VkMemoryPropertyFlags dLoc  = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	// Create the buffer — try ReBAR first, fall back to device-local
+	CreateGpuBuf(m_energyPartialBuf, partialSize, usage, m_voltMapped ? rebar : dLoc);
+
+	if (m_voltMapped) // we have ReBAR — map the partials buffer too
+	{
+		VkResult r = vkMapMemory(m_device, m_energyPartialBuf.memory, 0, partialSize, 0,
+		                         (void**)&m_energyMapped);
+		if (r != VK_SUCCESS)
+			m_energyMapped = nullptr;
+	}
+
+	// Descriptor layout: 3 bindings (volt, curr, partials)
+	auto makeLayout = [&](uint32_t nBindings) -> VkDescriptorSetLayout
+	{
+		std::vector<VkDescriptorSetLayoutBinding> bindings(nBindings);
+		for (uint32_t i = 0; i < nBindings; i++)
+			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+		VkDescriptorSetLayoutCreateInfo ci{};
+		ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		ci.bindingCount = nBindings;
+		ci.pBindings    = bindings.data();
+		VkDescriptorSetLayout layout;
+		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &layout));
+		return layout;
+	};
+	m_energyDescLayout = makeLayout(3);
+
+	// Pipeline layout: push constant = EnergyPC (8 bytes)
+	VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(EnergyPC)};
+	VkPipelineLayoutCreateInfo pli{};
+	pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pli.setLayoutCount         = 1;
+	pli.pSetLayouts            = &m_energyDescLayout;
+	pli.pushConstantRangeCount = 1;
+	pli.pPushConstantRanges    = &pcRange;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_energyPipeLayout));
+
+	// Descriptor pool + set
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+	VkDescriptorPoolCreateInfo dpi{};
+	dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	dpi.maxSets       = 1;
+	dpi.poolSizeCount = 1;
+	dpi.pPoolSizes    = &poolSize;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_energyDescPool));
+
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool     = m_energyDescPool;
+	ai.descriptorSetCount = 1;
+	ai.pSetLayouts        = &m_energyDescLayout;
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_energyDescSet));
+
+	// Write descriptors: volt, curr, partials
+	VkBuffer      bufs[3] = {m_voltBuf, m_currBuf, m_energyPartialBuf.buffer};
+	VkDeviceSize sizes[3] = {m_fieldBufSize, m_fieldBufSize, partialSize};
+	WriteDescriptorBuffers(m_device, m_energyDescSet, bufs, sizes, 3);
+
+	// Compute pipeline
+	VkShaderModule mod = CreateShaderModule(gpu_spirv::reduce_energy_data,
+	                                        gpu_spirv::reduce_energy_size);
+	VkPipelineShaderStageCreateInfo stage{};
+	stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+	stage.module = mod;
+	stage.pName  = "main";
+
+	VkComputePipelineCreateInfo ci{};
+	ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	ci.stage  = stage;
+	ci.layout = m_energyPipeLayout;
+	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_energyPipeline));
+	vkDestroyShaderModule(m_device, mod, nullptr);
+}
+
+void Engine_Vulkan::CleanupGPU_EnergyReduction()
+{
+	if (m_device == VK_NULL_HANDLE) return;
+	if (m_energyMapped)
+	{
+		vkUnmapMemory(m_device, m_energyPartialBuf.memory);
+		m_energyMapped = nullptr;
+	}
+	DestroyGpuBuf(m_energyPartialBuf);
+	if (m_energyPipeline)   { vkDestroyPipeline(m_device, m_energyPipeline, nullptr); m_energyPipeline = VK_NULL_HANDLE; }
+	if (m_energyPipeLayout) { vkDestroyPipelineLayout(m_device, m_energyPipeLayout, nullptr); m_energyPipeLayout = VK_NULL_HANDLE; }
+	if (m_energyDescLayout) { vkDestroyDescriptorSetLayout(m_device, m_energyDescLayout, nullptr); m_energyDescLayout = VK_NULL_HANDLE; }
+	if (m_energyDescPool)   { vkDestroyDescriptorPool(m_device, m_energyDescPool, nullptr); m_energyDescPool = VK_NULL_HANDLE; }
+	m_energyDescSet = VK_NULL_HANDLE; // freed with pool
+}
+
+double Engine_Vulkan::CalcFastEnergyGPU() const
+{
+	// Ensure GPU compute is done
+	DrainGPU();
+
+	EnergyPC pc = {m_fieldN, ENERGY_NUM_WG};
+
+	// Dispatch energy reduction
+	RunSingleCommand([&](VkCommandBuffer cmd)
+	{
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_energyPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_energyPipeLayout, 0, 1, &m_energyDescSet, 0, nullptr);
+		vkCmdPushConstants(cmd, m_energyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(EnergyPC), &pc);
+		vkCmdDispatch(cmd, ENERGY_NUM_WG, 1, 1);
+	});
+
+	// Read back the partial sums
+	VkDeviceSize partialSize = 2 * ENERGY_NUM_WG * sizeof(float);
+	float partials[2 * ENERGY_NUM_WG];
+
+	if (m_energyMapped)
+	{
+		// ReBAR: direct read
+		memcpy(partials, m_energyMapped, partialSize);
+	}
+	else
+	{
+		// Staging buffer download
+		DownloadFromDeviceBuffer(
+			m_energyPartialBuf.buffer, partials, partialSize);
+	}
+
+	// CPU-side reduction of the partial sums (256 E + 256 H floats)
+	double E_energy = 0.0, H_energy = 0.0;
+	for (uint32_t i = 0; i < ENERGY_NUM_WG; ++i)
+	{
+		E_energy += (double)partials[i];
+		H_energy += (double)partials[ENERGY_NUM_WG + i];
+	}
+
+	return __EPS0__ * E_energy + __MUE0__ * H_energy;
+}
+
+// ===========================================================================
+// GPU Voltage/Current Integral (probe support)
+// ===========================================================================
+
+double Engine_Vulkan::CalcVoltageIntegralGPU(const unsigned int* start, const unsigned int* stop) const
+{
+	// For voltage/current probes: read directly from mapped VRAM if ReBAR is available,
+	// or do a targeted small read.  The key insight is that probes only access a few cells
+	// along a line — we just need DrainGPU(), then read directly.  With ReBAR, this is
+	// zero-copy.  Without ReBAR, we fall back to the full sync (unavoidable without
+	// a dedicated gather dispatch, but this is still better than the generic path because
+	// we avoid going through virtual GetVolt calls).
+
+	if (((start[0]!=stop[0]) + (start[1]!=stop[1]) + (start[2]!=stop[2]))!=1)
+		return 0.0;
+
+	DrainGPU();
+
+	double result = 0.0;
+	uint32_t N   = m_fieldN;
+	uint32_t sYZ = m_strideYZ;
+
+	if (m_voltMapped)
+	{
+		// ReBAR: direct VRAM read — no download needed
+		for (int n = 0; n < 3; ++n)
+		{
+			if (start[n] < stop[n])
+			{
+				unsigned int pos[3] = {start[0], start[1], start[2]};
+				for (; pos[n] < stop[n]; ++pos[n])
+					result += (double)m_voltMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
+			}
+			else if (start[n] > stop[n])
+			{
+				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
+				for (; pos[n] < start[n]; ++pos[n])
+					result -= (double)m_voltMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
+			}
+		}
+	}
+	else
+	{
+		// No ReBAR — must sync full fields (cached after first call per batch)
+		if (m_hostDirty) SyncFieldsToHost();
+		for (int n = 0; n < 3; ++n)
+		{
+			if (start[n] < stop[n])
+			{
+				unsigned int pos[3] = {start[0], start[1], start[2]};
+				for (; pos[n] < stop[n]; ++pos[n])
+					result += Engine::GetVolt(n, pos[0], pos[1], pos[2]);
+			}
+			else if (start[n] > stop[n])
+			{
+				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
+				for (; pos[n] < start[n]; ++pos[n])
+					result -= Engine::GetVolt(n, pos[0], pos[1], pos[2]);
+			}
+		}
+	}
+	return result;
+}
+
+double Engine_Vulkan::CalcCurrentIntegralGPU(const unsigned int* start, const unsigned int* stop) const
+{
+	if (((start[0]!=stop[0]) + (start[1]!=stop[1]) + (start[2]!=stop[2]))!=1)
+		return 0.0;
+
+	DrainGPU();
+
+	double result = 0.0;
+	uint32_t N   = m_fieldN;
+	uint32_t sYZ = m_strideYZ;
+
+	if (m_currMapped)
+	{
+		for (int n = 0; n < 3; ++n)
+		{
+			if (start[n] < stop[n])
+			{
+				unsigned int pos[3] = {start[0], start[1], start[2]};
+				for (; pos[n] < stop[n]; ++pos[n])
+					result += (double)m_currMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
+			}
+			else if (start[n] > stop[n])
+			{
+				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
+				for (; pos[n] < start[n]; ++pos[n])
+					result -= (double)m_currMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
+			}
+		}
+	}
+	else
+	{
+		if (m_hostDirty) SyncFieldsToHost();
+		for (int n = 0; n < 3; ++n)
+		{
+			if (start[n] < stop[n])
+			{
+				unsigned int pos[3] = {start[0], start[1], start[2]};
+				for (; pos[n] < stop[n]; ++pos[n])
+					result += Engine::GetCurr(n, pos[0], pos[1], pos[2]);
+			}
+			else if (start[n] > stop[n])
+			{
+				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
+				for (; pos[n] < start[n]; ++pos[n])
+					result -= Engine::GetCurr(n, pos[0], pos[1], pos[2]);
+			}
+		}
+	}
+	return result;
+}
+
+// ===========================================================================
+// Async Processing Thread
+// ===========================================================================
+
+void Engine_Vulkan::StartAsyncProcessing()
+{
+	if (m_hasCPUExtensions) return;  // hybrid mode can't overlap
+
+	m_asyncShutdown  = false;
+	m_asyncWorkReady = false;
+	m_asyncWorkDone  = true;
+
+	m_asyncThread = std::thread(&Engine_Vulkan::AsyncWorkerLoop, this);
+}
+
+void Engine_Vulkan::AsyncWorkerLoop()
+{
+	while (true)
+	{
+		std::unique_lock<std::mutex> lk(m_asyncMutex);
+		m_asyncCond.wait(lk, [this] { return m_asyncWorkReady || m_asyncShutdown.load(); });
+
+		if (m_asyncShutdown) break;
+
+		m_asyncWorkReady = false;
+		lk.unlock();
+
+		// Do the actual processing work (reads field data, writes files)
+		// The GPU is concurrently running the next batch.
+		// Processing calls GetVolt/GetCurr which go through the ReBAR path
+		// or cached host data — no GPU stall since DrainGPU was already
+		// called before we were triggered.
+
+		// The processing is done by the caller via a function pointer/callback.
+		// For now, the async thread simply signals completion.
+		// The actual PA->Process() call happens in the RunFDTD integration.
+
+		lk.lock();
+		m_asyncWorkDone = true;
+		m_asyncDoneCond.notify_one();
+	}
+}
+
+void Engine_Vulkan::TriggerAsyncProcessing(int& step)
+{
+	std::lock_guard<std::mutex> lk(m_asyncMutex);
+	m_asyncStepPtr   = &step;
+	m_asyncWorkReady = true;
+	m_asyncWorkDone  = false;
+	m_asyncCond.notify_one();
+}
+
+void Engine_Vulkan::WaitAsyncProcessing()
+{
+	std::unique_lock<std::mutex> lk(m_asyncMutex);
+	m_asyncDoneCond.wait(lk, [this] { return m_asyncWorkDone; });
+}
+
+#endif // WITH_GPU
