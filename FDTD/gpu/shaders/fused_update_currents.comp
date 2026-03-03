@@ -1,0 +1,226 @@
+/*
+ * Fused FDTD H-field (current) update + UPML pre/post compute shader.
+ *
+ * Combines the standard Yee current update with UPML (PML) pre-current and
+ * post-current operations into a single dispatch.  Same fusion strategy as
+ * fused_update_voltages.comp.
+ *
+ * Dispatch domain: ALL N = Nx*Ny*Nz cells (same as voltage shader).
+ * - Interior cells (x<Nx-1, y<Ny-1, z<Nz-1): Yee current update is applied.
+ * - Boundary cells: Yee update skipped (matches the original (Nx-1)(Ny-1)(Nz-1) domain).
+ * - PML cells: PML pre/post always applied regardless of Yee domain.
+ *
+ * For PML boundary cells outside the Yee domain, this correctly applies the
+ * PML flux swap without a Yee curl update, reproducing the separate-dispatch
+ * behaviour.
+ */
+#version 450
+
+#define MAX_PML_REGIONS 6
+
+layout(local_size_x = 256) in;
+
+// --- Standard Yee bindings ---
+layout(set=0, binding=0) buffer CurrBuf   { float curr[];    };
+layout(set=0, binding=1) buffer VoltBuf   { float volt[];    };
+layout(set=0, binding=2) buffer OpIdxBuf  { uint  opIdx[];   };
+layout(set=0, binding=3) buffer IIBuf     { float ii_comp[]; };
+layout(set=0, binding=4) buffer IVBuf     { float iv_comp[]; };
+
+// --- PML region metadata ---
+struct PMLRegion {
+    uint startX, startY, startZ;
+    uint sizeX,  sizeY,  sizeZ;
+    uint fluxOffset;
+};
+layout(set=0, binding=5) buffer PMLInfoBuf {
+    PMLRegion pmlRegions[MAX_PML_REGIONS];
+};
+
+// --- Concatenated PML buffers ---
+layout(set=0, binding=6) buffer CurrFluxBuf { float curr_flux[];  };
+layout(set=0, binding=7) buffer PmlIIBuf    { float pml_ii[];     };
+layout(set=0, binding=8) buffer PmlIIFOBuf  { float pml_iifo[];   };
+layout(set=0, binding=9) buffer PmlIIFNBuf  { float pml_iifn[];   };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz, numComp;
+    uint numPmlRegions;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint N = Nx * Ny * Nz;
+    if (gid >= N) return;
+
+    // Decompose linear index → (x, y, z)
+    uint z = gid % Nz;
+    uint y = (gid / Nz) % Ny;
+    uint x = gid / (Ny * Nz);
+
+    uint sYZ = Ny * Nz;
+
+    // Is this cell in the Yee current-update domain?
+    bool inYeeDomain = (x < Nx - 1u) && (y < Ny - 1u) && (z < Nz - 1u);
+
+    // --- Check if this cell is in a PML region ---
+    int  pmlIdx    = -1;
+    uint pmlLocal  = 0;
+    uint pmlPN     = 0;
+
+    for (uint r = 0; r < numPmlRegions; r++)
+    {
+        uint px = x - pmlRegions[r].startX;
+        uint py = y - pmlRegions[r].startY;
+        uint pz = z - pmlRegions[r].startZ;
+        if (px < pmlRegions[r].sizeX &&
+            py < pmlRegions[r].sizeY &&
+            pz < pmlRegions[r].sizeZ)
+        {
+            pmlIdx   = int(r);
+            uint pSYZ = pmlRegions[r].sizeY * pmlRegions[r].sizeZ;
+            pmlLocal = px * pSYZ + py * pmlRegions[r].sizeZ + pz;
+            pmlPN    = pmlRegions[r].sizeX * pSYZ;
+            break;
+        }
+    }
+
+    // Early exit: not in PML and not in Yee domain → nothing to do
+    if (pmlIdx < 0 && !inYeeDomain) return;
+
+    uint base = x * sYZ + y * Nz + z;
+
+    // Per-cell compressed coefficient index
+    uint oi = opIdx[base];
+
+    float ii0 = ii_comp[oi];
+    float iv0 = iv_comp[oi];
+    float ii1 = ii_comp[numComp + oi];
+    float iv1 = iv_comp[numComp + oi];
+    float ii2 = ii_comp[2u * numComp + oi];
+    float iv2 = iv_comp[2u * numComp + oi];
+
+    // ====================================================================
+    // Component 0 (x)
+    // ====================================================================
+    {
+        uint gi = base;  // component 0
+
+        if (pmlIdx >= 0)
+        {
+            uint fo = pmlRegions[pmlIdx].fluxOffset;
+            uint li = fo + pmlLocal;
+
+            float I = curr[gi];
+            float F = curr_flux[li];
+
+            // Pre-current
+            float f_help = pml_ii[li] * I - pml_iifo[li] * F;
+            float temp = F;  // "curr = old flux" for Yee input
+
+            // Yee update (if in domain) or keep as old flux
+            float yee_result;
+            if (inYeeDomain)
+            {
+                float curl0 = volt[2u*N + base      ] - volt[2u*N + base + Nz    ]
+                             - volt[   N + base      ] + volt[   N + base + 1     ];
+                yee_result = fma(ii0, temp, iv0 * curl0);
+            }
+            else
+            {
+                yee_result = temp;  // no Yee update for boundary PML cells
+            }
+
+            // Post-current
+            curr_flux[li] = yee_result;
+            curr[gi] = f_help + pml_iifn[li] * yee_result;
+        }
+        else if (inYeeDomain)
+        {
+            float curl0 = volt[2u*N + base      ] - volt[2u*N + base + Nz    ]
+                         - volt[   N + base      ] + volt[   N + base + 1     ];
+            curr[gi] = fma(ii0, curr[gi], iv0 * curl0);
+        }
+    }
+
+    // ====================================================================
+    // Component 1 (y)
+    // ====================================================================
+    {
+        uint gi = N + base;
+
+        if (pmlIdx >= 0)
+        {
+            uint fo = pmlRegions[pmlIdx].fluxOffset;
+            uint li = fo + pmlPN + pmlLocal;
+
+            float I = curr[gi];
+            float F = curr_flux[li];
+
+            float f_help = pml_ii[li] * I - pml_iifo[li] * F;
+            float temp = F;
+
+            float yee_result;
+            if (inYeeDomain)
+            {
+                float curl1 = volt[        base      ] - volt[        base + 1     ]
+                             - volt[2u*N  + base      ] + volt[2u*N  + base + sYZ  ];
+                yee_result = fma(ii1, temp, iv1 * curl1);
+            }
+            else
+            {
+                yee_result = temp;
+            }
+
+            curr_flux[li] = yee_result;
+            curr[gi] = f_help + pml_iifn[li] * yee_result;
+        }
+        else if (inYeeDomain)
+        {
+            float curl1 = volt[        base      ] - volt[        base + 1     ]
+                         - volt[2u*N  + base      ] + volt[2u*N  + base + sYZ  ];
+            curr[gi] = fma(ii1, curr[gi], iv1 * curl1);
+        }
+    }
+
+    // ====================================================================
+    // Component 2 (z)
+    // ====================================================================
+    {
+        uint gi = 2u*N + base;
+
+        if (pmlIdx >= 0)
+        {
+            uint fo = pmlRegions[pmlIdx].fluxOffset;
+            uint li = fo + 2u * pmlPN + pmlLocal;
+
+            float I = curr[gi];
+            float F = curr_flux[li];
+
+            float f_help = pml_ii[li] * I - pml_iifo[li] * F;
+            float temp = F;
+
+            float yee_result;
+            if (inYeeDomain)
+            {
+                float curl2 = volt[   N + base      ] - volt[   N + base + sYZ  ]
+                             - volt[        base      ] + volt[        base + Nz   ];
+                yee_result = fma(ii2, temp, iv2 * curl2);
+            }
+            else
+            {
+                yee_result = temp;
+            }
+
+            curr_flux[li] = yee_result;
+            curr[gi] = f_help + pml_iifn[li] * yee_result;
+        }
+        else if (inYeeDomain)
+        {
+            float curl2 = volt[   N + base      ] - volt[   N + base + sYZ  ]
+                         - volt[        base      ] + volt[        base + Nz   ];
+            curr[gi] = fma(ii2, curr[gi], iv2 * curl2);
+        }
+    }
+}

@@ -1,0 +1,201 @@
+/*
+ * Fused FDTD E-field (voltage) update + UPML pre/post compute shader.
+ *
+ * Combines the standard Yee voltage update with UPML (PML) pre-voltage and
+ * post-voltage operations into a single dispatch.  This eliminates 2×R
+ * separate PML dispatches and 2 barriers per timestep (where R = number of
+ * PML regions, typically 6).
+ *
+ * For non-PML cells: standard Yee update (identical to update_voltages.comp).
+ * For PML cells:
+ *   1. PML pre-voltage  (flux ↔ voltage swap + partial result)
+ *   2. Yee voltage curl  (on the modified voltage = old flux)
+ *   3. PML post-voltage  (combine partial + Yee result → final voltage)
+ * All three phases run in-register — no intermediate memory writes needed.
+ *
+ * PML region detection is coordinate-based: each thread checks its (x,y,z)
+ * against up to MAX_PML_REGIONS axis-aligned boxes stored in an SSBO.
+ * Since PML regions are spatially coherent, divergence is minimal (only
+ * wavefronts at PML boundaries diverge; interior wavefronts take a uniform path).
+ *
+ * Memory layout: N-I-J-K (component-major), same as ArrayNIJK<float>.
+ *   index(n, x, y, z) = n * Nx*Ny*Nz + x * Ny*Nz + y * Nz + z
+ *
+ * Each thread handles one (x,y,z) cell for all 3 field components.
+ */
+#version 450
+
+#define MAX_PML_REGIONS 6
+
+layout(local_size_x = 256) in;
+
+// --- Standard Yee bindings (same as update_voltages.comp) ---
+layout(set=0, binding=0) buffer VoltBuf   { float volt[];    };
+layout(set=0, binding=1) buffer CurrBuf   { float curr[];    };
+layout(set=0, binding=2) buffer OpIdxBuf  { uint  opIdx[];   };
+layout(set=0, binding=3) buffer VVBuf     { float vv_comp[]; };
+layout(set=0, binding=4) buffer VIBuf     { float vi_comp[]; };
+
+// --- PML region metadata (small SSBO, ≤ 168 bytes) ---
+struct PMLRegion {
+    uint startX, startY, startZ;
+    uint sizeX,  sizeY,  sizeZ;
+    uint fluxOffset;  // element offset into concatenated arrays (per-component)
+};
+layout(set=0, binding=5) buffer PMLInfoBuf {
+    PMLRegion pmlRegions[MAX_PML_REGIONS];
+};
+
+// --- Concatenated PML buffers (all regions back-to-back) ---
+layout(set=0, binding=6) buffer VoltFluxBuf { float volt_flux[];  };  // RW
+layout(set=0, binding=7) buffer PmlVVBuf    { float pml_vv[];     };  // RO
+layout(set=0, binding=8) buffer PmlVVFOBuf  { float pml_vvfo[];   };  // RO
+layout(set=0, binding=9) buffer PmlVVFNBuf  { float pml_vvfn[];   };  // RO
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz, numComp;
+    uint numPmlRegions;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint N = Nx * Ny * Nz;
+    if (gid >= N) return;
+
+    // Decompose linear index → (x, y, z).  z changes fastest for coalescing.
+    uint z = gid % Nz;
+    uint y = (gid / Nz) % Ny;
+    uint x = gid / (Ny * Nz);
+
+    uint sYZ = Ny * Nz;
+
+    // --- Check if this cell is in a PML region ---
+    int  pmlIdx    = -1;     // -1 = not in PML
+    uint pmlLocal  = 0;      // local linear index within PML region
+    uint pmlPN     = 0;      // pNx * pNy * pNz for the matched region
+
+    for (uint r = 0; r < numPmlRegions; r++)
+    {
+        uint px = x - pmlRegions[r].startX;
+        uint py = y - pmlRegions[r].startY;
+        uint pz = z - pmlRegions[r].startZ;
+        // Unsigned underflow makes out-of-range values very large
+        if (px < pmlRegions[r].sizeX &&
+            py < pmlRegions[r].sizeY &&
+            pz < pmlRegions[r].sizeZ)
+        {
+            pmlIdx   = int(r);
+            uint pSYZ = pmlRegions[r].sizeY * pmlRegions[r].sizeZ;
+            pmlLocal = px * pSYZ + py * pmlRegions[r].sizeZ + pz;
+            pmlPN    = pmlRegions[r].sizeX * pSYZ;
+            break;
+        }
+    }
+
+    // Per-cell compressed coefficient index (same for all 3 components)
+    uint oi = opIdx[gid];
+
+    // Fetch compressed Yee coefficients
+    float vv0 = vv_comp[oi];
+    float vi0 = vi_comp[oi];
+    float vv1 = vv_comp[numComp + oi];
+    float vi1 = vi_comp[numComp + oi];
+    float vv2 = vv_comp[2u * numComp + oi];
+    float vi2 = vi_comp[2u * numComp + oi];
+
+    // Shifted neighbor indices for curl computation
+    uint xm = max(x, 1u) - 1u;
+    uint ym = max(y, 1u) - 1u;
+    uint zm = max(z, 1u) - 1u;
+    uint base = x * sYZ;
+
+    // ====================================================================
+    // Component 0 (x)
+    // ====================================================================
+    {
+        uint gi = base + y * Nz + z;  // global field index (component 0)
+
+        // Curl of H for x-component
+        float curl0 = curr[2u*N + base + y*Nz + z ] - curr[2u*N + base + ym*Nz + z ]
+                     - curr[   N + base + y*Nz + z ] + curr[   N + base + y*Nz  + zm];
+
+        if (pmlIdx >= 0)
+        {
+            uint fo = pmlRegions[pmlIdx].fluxOffset;
+            uint li = fo + pmlLocal;  // component 0 index into concatenated flux
+
+            float V = volt[gi];
+            float F = volt_flux[li];
+
+            // Pre-voltage: compute partial, use old flux as Yee input
+            float f_help = pml_vv[li] * V - pml_vvfo[li] * F;
+            // Yee update on old flux value
+            float yee_result = fma(vv0, F, vi0 * curl0);
+            // Post-voltage: store new flux, compute final voltage
+            volt_flux[li] = yee_result;
+            volt[gi] = f_help + pml_vvfn[li] * yee_result;
+        }
+        else
+        {
+            // Standard Yee update
+            volt[gi] = fma(vv0, volt[gi], vi0 * curl0);
+        }
+    }
+
+    // ====================================================================
+    // Component 1 (y)
+    // ====================================================================
+    {
+        uint gi = N + base + y * Nz + z;
+
+        float curl1 = curr[          base + y*Nz + z ] - curr[          base + y*Nz + zm]
+                     - curr[2u*N    + base + y*Nz + z ] + curr[2u*N + xm*sYZ + y*Nz + z ];
+
+        if (pmlIdx >= 0)
+        {
+            uint fo = pmlRegions[pmlIdx].fluxOffset;
+            uint li = fo + pmlPN + pmlLocal;  // component 1 offset
+
+            float V = volt[gi];
+            float F = volt_flux[li];
+
+            float f_help = pml_vv[li] * V - pml_vvfo[li] * F;
+            float yee_result = fma(vv1, F, vi1 * curl1);
+            volt_flux[li] = yee_result;
+            volt[gi] = f_help + pml_vvfn[li] * yee_result;
+        }
+        else
+        {
+            volt[gi] = fma(vv1, volt[gi], vi1 * curl1);
+        }
+    }
+
+    // ====================================================================
+    // Component 2 (z)
+    // ====================================================================
+    {
+        uint gi = 2u*N + base + y * Nz + z;
+
+        float curl2 = curr[   N + base + y*Nz + z ] - curr[   N + xm*sYZ + y*Nz + z ]
+                     - curr[        base + y*Nz + z ] + curr[        base + ym*Nz + z];
+
+        if (pmlIdx >= 0)
+        {
+            uint fo = pmlRegions[pmlIdx].fluxOffset;
+            uint li = fo + 2u * pmlPN + pmlLocal;  // component 2 offset
+
+            float V = volt[gi];
+            float F = volt_flux[li];
+
+            float f_help = pml_vv[li] * V - pml_vvfo[li] * F;
+            float yee_result = fma(vv2, F, vi2 * curl2);
+            volt_flux[li] = yee_result;
+            volt[gi] = f_help + pml_vvfn[li] * yee_result;
+        }
+        else
+        {
+            volt[gi] = fma(vv2, volt[gi], vi2 * curl2);
+        }
+    }
+}

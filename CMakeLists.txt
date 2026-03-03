@@ -97,6 +97,7 @@ if (WITH_GPU)
 		mur_pre_voltage mur_post_voltage mur_apply_voltage
 		rlc_pre_voltage rlc_apply_voltage
 		gather_probes reduce_energy
+		fused_update_voltages fused_update_currents
 	)
 	set(GPU_SPV_FILES)
 	foreach(S ${GPU_SHADER_NAMES})
