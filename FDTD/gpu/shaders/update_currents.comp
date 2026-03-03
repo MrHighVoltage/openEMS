@@ -1,0 +1,83 @@
+/*
+ * FDTD H-field (current) update compute shader — compressed operator.
+ *
+ * Implements:
+ *   curr[n][x][y][z] = ii_comp[n*C + idx] * curr[n][x][y][z]
+ *                     + iv_comp[n*C + idx] * curl_E(x,y,z)
+ *
+ * where idx = opIdx[gid_full] is a per-cell index into compressed
+ * coefficient tables.  gid_full is the index into the full N grid,
+ * not the reduced (Nx-1)*(Ny-1)*(Nz-1) dispatch domain.
+ *
+ * Loop domain: x ∈ [0, Nx-2], y ∈ [0, Ny-2], z ∈ [0, Nz-2]
+ * (one fewer than voltage update in each dimension due to Yee staggering).
+ * Index into the full field arrays still uses Nx, Ny, Nz strides.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer CurrBuf   { float curr[];    };
+layout(set=0, binding=1) buffer VoltBuf   { float volt[];    };
+layout(set=0, binding=2) buffer OpIdxBuf  { uint  opIdx[];   };
+layout(set=0, binding=3) buffer IIBuf     { float ii_comp[]; };
+layout(set=0, binding=4) buffer IVBuf     { float iv_comp[]; };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz, numComp;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+
+    // Current update domain is (Nx-1) × (Ny-1) × (Nz-1)
+    uint cNx = Nx - 1u;
+    uint cNy = Ny - 1u;
+    uint cNz = Nz - 1u;
+    uint cN  = cNx * cNy * cNz;
+    if (gid >= cN) return;
+
+    // Decompose within the reduced domain
+    uint z = gid % cNz;
+    uint y = (gid / cNz) % cNy;
+    uint x = gid / (cNy * cNz);
+
+    // Full field strides
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+
+    uint base = x * sYZ + y * Nz + z;
+
+    // Per-cell compressed coefficient index (using full-grid cell index)
+    uint oi = opIdx[base];
+
+    // Fetch compressed coefficients for all 3 components
+    float ii0 = ii_comp[oi];
+    float iv0 = iv_comp[oi];
+    float ii1 = ii_comp[numComp + oi];
+    float iv1 = iv_comp[numComp + oi];
+    float ii2 = ii_comp[2u * numComp + oi];
+    float iv2 = iv_comp[2u * numComp + oi];
+
+    // --- Component 0 (x) ---
+    // curl_x = volt_z(x,y,z) - volt_z(x,y+1,z) - volt_y(x,y,z) + volt_y(x,y,z+1)
+    uint idx0 = base;
+    float curl0 = volt[2u*N + base      ] - volt[2u*N + base + Nz    ]
+                - volt[   N + base      ] + volt[   N + base + 1     ];
+    curr[idx0] = fma(ii0, curr[idx0], iv0 * curl0);
+
+    // --- Component 1 (y) ---
+    // curl_y = volt_x(x,y,z) - volt_x(x,y,z+1) - volt_z(x,y,z) + volt_z(x+1,y,z)
+    uint idx1 = N + base;
+    float curl1 = volt[        base      ] - volt[        base + 1     ]
+                - volt[2u*N  + base      ] + volt[2u*N  + base + sYZ  ];
+    curr[idx1] = fma(ii1, curr[idx1], iv1 * curl1);
+
+    // --- Component 2 (z) ---
+    // curl_z = volt_y(x,y,z) - volt_y(x+1,y,z) - volt_x(x,y,z) + volt_x(x,y+1,z)
+    uint idx2 = 2u*N + base;
+    float curl2 = volt[   N + base      ] - volt[   N + base + sYZ  ]
+                - volt[        base      ] + volt[        base + Nz   ];
+    curr[idx2] = fma(ii2, curr[idx2], iv2 * curl2);
+}

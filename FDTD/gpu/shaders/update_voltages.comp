@@ -1,0 +1,82 @@
+/*
+ * FDTD E-field (voltage) update compute shader — compressed operator.
+ *
+ * Implements:
+ *   volt[n][x][y][z] = vv_comp[n*C + idx] * volt[n][x][y][z]
+ *                     + vi_comp[n*C + idx] * curl_H(x,y,z)
+ *
+ * where idx = opIdx[gid] is a per-cell index into compressed coefficient
+ * tables (typically a few hundred entries vs millions of cells).  The small
+ * tables stay L2-resident, eliminating VRAM round-trips for coefficients.
+ *
+ * Memory layout: N-I-J-K (component-major), same as ArrayNIJK<float>.
+ *   index(n, x, y, z) = n * Nx*Ny*Nz + x * Ny*Nz + y * Nz + z
+ *
+ * Each thread handles one (x,y,z) cell for all 3 field components.
+ * Boundary handling: at pos==0, the shifted neighbor index clamps to 0.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf   { float volt[];    };
+layout(set=0, binding=1) buffer CurrBuf   { float curr[];    };
+layout(set=0, binding=2) buffer OpIdxBuf  { uint  opIdx[];   };
+layout(set=0, binding=3) buffer VVBuf     { float vv_comp[]; };
+layout(set=0, binding=4) buffer VIBuf     { float vi_comp[]; };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz, numComp;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint N = Nx * Ny * Nz;
+    if (gid >= N) return;
+
+    // Decompose linear index → (x, y, z).  z changes fastest for coalescing.
+    uint z = gid % Nz;
+    uint y = (gid / Nz) % Ny;
+    uint x = gid / (Ny * Nz);
+
+    // Shifted indices: clamp to 0 at boundaries
+    uint xm = max(x, 1u) - 1u;
+    uint ym = max(y, 1u) - 1u;
+    uint zm = max(z, 1u) - 1u;
+
+    uint sYZ = Ny * Nz;
+
+    // Per-cell compressed coefficient index (same for all 3 components)
+    uint oi = opIdx[gid];
+
+    // Fetch compressed coefficients for all 3 components
+    float vv0 = vv_comp[oi];
+    float vi0 = vi_comp[oi];
+    float vv1 = vv_comp[numComp + oi];
+    float vi1 = vi_comp[numComp + oi];
+    float vv2 = vv_comp[2u * numComp + oi];
+    float vi2 = vi_comp[2u * numComp + oi];
+
+    // --- Component 0 (x) ---
+    // curl_x = curr_z(x,y,z) - curr_z(x,ym,z) - curr_y(x,y,z) + curr_y(x,y,zm)
+    uint base = x * sYZ;
+    uint idx0 = base + y * Nz + z;
+    float curl0 = curr[2u*N + base + y*Nz + z ] - curr[2u*N + base + ym*Nz + z ]
+                - curr[   N + base + y*Nz + z ] + curr[   N + base + y*Nz  + zm];
+    volt[idx0] = fma(vv0, volt[idx0], vi0 * curl0);
+
+    // --- Component 1 (y) ---
+    // curl_y = curr_x(x,y,z) - curr_x(x,y,zm) - curr_z(x,y,z) + curr_z(xm,y,z)
+    uint idx1 = N + base + y * Nz + z;
+    float curl1 = curr[          base + y*Nz + z ] - curr[          base + y*Nz + zm]
+                - curr[2u*N    + base + y*Nz + z ] + curr[2u*N + xm*sYZ + y*Nz + z ];
+    volt[idx1] = fma(vv1, volt[idx1], vi1 * curl1);
+
+    // --- Component 2 (z) ---
+    // curl_z = curr_y(x,y,z) - curr_y(xm,y,z) - curr_x(x,y,z) + curr_x(x,ym,z)
+    uint idx2 = 2u*N + base + y * Nz + z;
+    float curl2 = curr[   N + base + y*Nz + z ] - curr[   N + xm*sYZ + y*Nz + z ]
+                - curr[        base + y*Nz + z ] + curr[        base + ym*Nz + z];
+    volt[idx2] = fma(vv2, volt[idx2], vi2 * curl2);
+}
