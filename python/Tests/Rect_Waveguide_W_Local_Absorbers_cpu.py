@@ -121,7 +121,7 @@ if 1:  # debugging only
     os.system(AppCSXCAD_BIN + ' "{}"'.format(CSX_file))
 
 if not post_proc_only:
-    FDTD.Run(Sim_Path, cleanup=True, engine="gpu")
+    FDTD.Run(Sim_Path, cleanup=True, engine="multithreaded")
 
 ### Postprocessing & plotting
 freq = linspace(f_start,f_stop,201)
