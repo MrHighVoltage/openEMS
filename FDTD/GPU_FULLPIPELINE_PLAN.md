@@ -176,6 +176,11 @@ separate dispatch + full pipeline drain.
 **Recommendation: Start with separate dispatches (8 shaders), profile, then
 selectively fuse based on measured overhead.**
 
+> **UPDATE (2026-03):** Fused Yee+UPML kernels have been implemented as
+> `fused_update_voltages.comp` and `fused_update_currents.comp`, along with a
+> pipelined main loop using speculative submission. See
+> `GPU_FUSION_AND_PIPELINING.md` for the implementation details.
+
 ---
 
 ## 3. Extension-by-Extension GPU Porting Analysis

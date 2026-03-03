@@ -144,15 +144,18 @@ StartAsyncProcessing()
 
 ## Future Work
 
-- **Async processing integration**: Hook `PA->Process()` into `AsyncWorkerLoop()`
-  via the `RunFDTD()` loop in `openems.cpp`. Requires moving the processing call
-  from the main thread into the async trigger/wait pattern.
+- ~~**Async processing integration**~~ — Superseded by the pipelined main loop
+  with speculative submission (see `GPU_FUSION_AND_PIPELINING.md`), which
+  provides better overlap without thread-safety concerns.
 
-- **GPU probe gather shader**: `gather_probes.comp` is ready but `SetupGPU_Probes()`
-  is still a placeholder. For systems without ReBAR, this would eliminate the need
-  for `SyncFieldsToHost()` when only probe values are needed. With ReBAR, the
-  direct-read path is already fast enough for typical probe counts.
+- ~~**GPU probe gather shader**~~ — ✅ Implemented. `gather_probes.comp` is now
+  wired up via `SetupProbeCache()` using a recording-based cell discovery
+  approach.  See `GPU_FUSION_AND_PIPELINING.md` §3.
 
 - **Batched energy reduction**: Instead of a separate `RunSingleCommand()` dispatch,
   the energy reduction could be appended to the main FDTD command buffer every N
   timesteps, eliminating the extra submit/fence overhead entirely.
+
+- **Full kernel fusion**: Extend the fused Yee+UPML shaders to also inline
+  dispersive, Mur, and RLC operations for further dispatch reduction.
+  See `GPU_FUSION_AND_PIPELINING.md` §8.

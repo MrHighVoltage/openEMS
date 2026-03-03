@@ -353,19 +353,21 @@ GPU compute time significantly.
 
 ### Possible Future Improvements
 
-1. **Batch multiple timesteps** between `PA->Process()` calls — the `step`
-   variable from `PA->Process()` already tells us how many steps until the
-   next probe triggers.  More timesteps per batch = higher GPU utilization.
-   (This already works: `IterateTS(step)` records `step` timesteps into one
-   command buffer.  The issue is when `step == 1`.)
+1. ~~**Batch multiple timesteps**~~ — Already works via `IterateTS(step)`.
 
 2. **Move probe processing to GPU** — compute integrals, DFTs, and field
    probes as additional compute shaders.  This would eliminate the
    GPU→CPU→GPU round-trip entirely.
 
-3. **Asynchronous probe download** with double-buffered snapshots (was tried;
-   the 2×176 MB VRAM→VRAM copy took longer than the compute itself).
+3. ~~**Asynchronous probe download**~~ — Superseded by pipelined main loop
+   (see `GPU_FUSION_AND_PIPELINING.md`).
 
-4. **Sparse field readback** — instead of reading the full field through
-   ReBAR, have the GPU write only the probed field values into a small
-   buffer that the CPU can read quickly.
+4. ~~**Sparse field readback**~~ — ✅ Implemented via `gather_probes.comp` +
+   probe cache in the pipelined main loop.  See `GPU_FUSION_AND_PIPELINING.md`.
+
+5. ~~**Kernel fusion (UPML + Yee)**~~ — ✅ Implemented via
+   `fused_update_voltages.comp` / `fused_update_currents.comp`.
+   See `GPU_FUSION_AND_PIPELINING.md`.
+
+6. ~~**Pipelined main loop**~~ — ✅ Implemented with speculative submission
+   in `openems.cpp`.  See `GPU_FUSION_AND_PIPELINING.md`.
