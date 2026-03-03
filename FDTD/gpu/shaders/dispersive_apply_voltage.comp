@@ -1,0 +1,40 @@
+/*
+ * Dispersive material Apply2Voltages shader.
+ *
+ * Sparse dispatch: one thread per dispersive cell.
+ * For each active ADE order: V[n][global] -= volt_ADE[n][i]
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf    { float volt[];     };
+layout(set=0, binding=1) buffer VoltADEBuf { float volt_ADE[]; }; // [3][count]
+layout(set=0, binding=2) buffer PosIdxBuf  { uint  posIdx[];   }; // [3][count]
+
+layout(push_constant) uniform PC {
+    uint count;
+    uint Nx, Ny, Nz;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+
+    uint px = posIdx[gid];
+    uint py = posIdx[count + gid];
+    uint pz = posIdx[2*count + gid];
+    uint g_base = px * sYZ + py * Nz + pz;
+
+    for (uint n = 0; n < 3; n++)
+    {
+        uint ade_idx = n * count + gid;
+        uint g_idx   = n * N + g_base;
+
+        volt[g_idx] -= volt_ADE[ade_idx];
+    }
+}

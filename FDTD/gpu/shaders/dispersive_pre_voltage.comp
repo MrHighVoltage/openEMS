@@ -1,0 +1,82 @@
+/*
+ * Lorentz/Drude dispersive material ADE pre-voltage update.
+ *
+ * Sparse dispatch: one thread per dispersive cell.
+ *
+ * For Lorentz mode (hasLorADE=1):
+ *   volt_Lor_ADE[n][i] += v_Lor_ADE[n][i] * volt_ADE[n][i]
+ *   volt_ADE[n][i]      = v_int_ADE[n][i] * volt_ADE[n][i]
+ *                        + v_ext_ADE[n][i] * (volt[global] - volt_Lor_ADE[n][i])
+ *
+ * For Drude mode (hasLorADE=0):
+ *   volt_ADE[n][i]      = v_int_ADE[n][i] * volt_ADE[n][i]
+ *                        + v_ext_ADE[n][i] * volt[global]
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf       { float volt[];         };
+layout(set=0, binding=1) buffer VoltADEBuf    { float volt_ADE[];     };  // [3][count]
+layout(set=0, binding=2) buffer VoltLorADEBuf { float volt_Lor_ADE[]; };  // [3][count] (unused if Drude)
+layout(set=0, binding=3) buffer PosIdxBuf     { uint  posIdx[];       };  // [3][count]: x,y,z indices
+layout(set=0, binding=4) buffer VIntADEBuf    { float v_int_ADE[];    };  // [3][count]
+layout(set=0, binding=5) buffer VExtADEBuf    { float v_ext_ADE[];    };  // [3][count]
+layout(set=0, binding=6) buffer VLorADEBuf    { float v_Lor_ADE[];    };  // [3][count] coefficients
+
+layout(push_constant) uniform PC {
+    uint count;       // number of dispersive cells for this order
+    uint Nx, Ny, Nz;  // global grid dimensions
+    uint hasLorADE;   // 1 = Lorentz, 0 = Drude
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+
+    // Get global position from sparse index arrays
+    uint px = posIdx[gid];               // pos[0][i]
+    uint py = posIdx[count + gid];       // pos[1][i]
+    uint pz = posIdx[2*count + gid];     // pos[2][i]
+    uint g_base = px * sYZ + py * Nz + pz;
+
+    if (hasLorADE != 0)
+    {
+        // Lorentz mode: 3 components
+        for (uint n = 0; n < 3; n++)
+        {
+            uint ade_idx = n * count + gid;
+            uint g_idx   = n * N + g_base;
+
+            float lor = volt_Lor_ADE[ade_idx];
+            float ade = volt_ADE[ade_idx];
+            float V   = volt[g_idx];
+
+            lor += v_Lor_ADE[ade_idx] * ade;
+            ade  = v_int_ADE[ade_idx] * ade + v_ext_ADE[ade_idx] * (V - lor);
+
+            volt_Lor_ADE[ade_idx] = lor;
+            volt_ADE[ade_idx]     = ade;
+        }
+    }
+    else
+    {
+        // Drude mode: 3 components
+        for (uint n = 0; n < 3; n++)
+        {
+            uint ade_idx = n * count + gid;
+            uint g_idx   = n * N + g_base;
+
+            float ade = volt_ADE[ade_idx];
+            float V   = volt[g_idx];
+
+            ade = v_int_ADE[ade_idx] * ade + v_ext_ADE[ade_idx] * V;
+
+            volt_ADE[ade_idx] = ade;
+        }
+    }
+}

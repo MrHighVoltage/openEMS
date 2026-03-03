@@ -1,0 +1,49 @@
+/*
+ * Total-Field/Scattered-Field (TF/SF) current injection shader.
+ *
+ * Same structure as tfsf_voltage.comp but uses the E-field (voltage) signal
+ * for current injection, and operates on the current field buffer.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer FieldBuf  { float field[];  };
+layout(set=0, binding=1) buffer AmpBuf    { float amp[];    };
+layout(set=0, binding=2) buffer DeltaBuf  { float delta[];  };
+layout(set=0, binding=3) buffer IdxBuf    { uint  linIdx[]; };
+layout(set=0, binding=4) buffer DelayBuf  { uint  delay[];  };
+layout(set=0, binding=5) buffer SignalBuf { float signal[]; };  // voltage signal
+
+layout(push_constant) uniform PC {
+    uint count;
+    int  numTS;
+    uint sigLen;
+    int  sigPeriod;
+};
+
+int lookupDelay(int ts, uint d)
+{
+    int pos = ts - int(d);
+    if (pos < 0) return 0;
+    int p = (sigPeriod > 0) ? sigPeriod : (ts + 1);
+    pos = pos % p;
+    if (pos >= int(sigLen)) return 0;
+    return pos;
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    uint d = delay[gid];
+    int pos0 = lookupDelay(numTS, d);
+    int pos1 = lookupDelay(numTS, d + 1);
+
+    float s0 = signal[pos0];
+    float s1 = signal[pos1];
+    float del = delta[gid];
+
+    field[linIdx[gid]] += ((1.0 - del) * s0 + del * s1) * amp[gid];
+}

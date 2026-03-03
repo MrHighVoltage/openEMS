@@ -1,0 +1,61 @@
+/*
+ * Total-Field/Scattered-Field (TF/SF) voltage injection shader.
+ *
+ * Sparse dispatch: one thread per injection point.
+ * All 12 face×component combinations are pre-flattened into linear arrays
+ * by the CPU setup code.
+ *
+ * For each injection point:
+ *   field[linIdx] += ((1-delta)*signal[pos0] + delta*signal[pos1]) * amp
+ *
+ * where pos0 = lookup(delay), pos1 = lookup(delay+1),
+ * and lookup(d) = clamp_and_wrap(numTS - d, sigLen, sigPeriod).
+ *
+ * Uses the H-field (current) signal for voltage injection.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer FieldBuf  { float field[];  };
+layout(set=0, binding=1) buffer AmpBuf    { float amp[];    };  // amplitude per injection point
+layout(set=0, binding=2) buffer DeltaBuf  { float delta[];  };  // interpolation fraction per point
+layout(set=0, binding=3) buffer IdxBuf    { uint  linIdx[]; };  // pre-linearized field index
+layout(set=0, binding=4) buffer DelayBuf  { uint  delay[];  };  // per-point delay
+layout(set=0, binding=5) buffer SignalBuf { float signal[]; };  // excitation signal (H-field / current)
+
+layout(push_constant) uniform PC {
+    uint count;       // total injection points
+    int  numTS;       // current timestep
+    uint sigLen;      // signal length
+    int  sigPeriod;   // signal period (<=0 if non-periodic)
+};
+
+int lookupDelay(int ts, uint d)
+{
+    int pos = ts - int(d);
+    // Zero if before signal starts
+    if (pos < 0) return 0;
+    // Periodic wrapping
+    int p = (sigPeriod > 0) ? sigPeriod : (ts + 1);
+    pos = pos % p;
+    // Zero if beyond signal length (non-periodic case)
+    if (pos >= int(sigLen)) return 0;
+    return pos;
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    uint d = delay[gid];
+    int pos0 = lookupDelay(numTS, d);
+    int pos1 = lookupDelay(numTS, d + 1);
+
+    float s0 = signal[pos0];
+    float s1 = signal[pos1];
+    float del = delta[gid];
+
+    field[linIdx[gid]] += ((1.0 - del) * s0 + del * s1) * amp[gid];
+}

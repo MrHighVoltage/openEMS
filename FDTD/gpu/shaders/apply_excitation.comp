@@ -1,0 +1,45 @@
+/*
+ * Soft excitation compute shader (works for both voltage and current).
+ *
+ * Every excitation point adds:
+ *   field[linearIdx[n]] += amp[n] * signal[exc_pos]
+ *
+ * where exc_pos accounts for per-source delay and optional signal periodicity.
+ *
+ * The linear index is precomputed on CPU:
+ *   linearIdx = dir * N + x * Ny*Nz + y * Nz + z
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer FieldBuf  { float field[];   };
+layout(set=0, binding=1) buffer AmpBuf    { float amp[];     };
+layout(set=0, binding=2) buffer IdxBuf    { uint  linIdx[];  };
+layout(set=0, binding=3) buffer DelayBuf  { uint  delay[];   };
+layout(set=0, binding=4) buffer SignalBuf { float signal[];  };
+
+layout(push_constant) uniform PC {
+    uint excCount;     // number of excitation points
+    int  numTS;        // current timestep
+    uint sigLen;       // signal length
+    int  sigPeriod;    // signal period (<=0 if non-periodic)
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= excCount) return;
+
+    int exc_pos = numTS - int(delay[gid]);
+    // Clamp negative to zero
+    exc_pos *= int(exc_pos > 0);
+    // Wrap periodically if needed
+    int p = (sigPeriod > 0) ? sigPeriod : (numTS + 1);
+    exc_pos = exc_pos % p;
+    // Zero out if beyond signal length
+    exc_pos *= int(exc_pos < int(sigLen));
+
+    uint fIdx = linIdx[gid];
+    field[fIdx] += amp[gid] * signal[exc_pos];
+}

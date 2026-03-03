@@ -1,0 +1,73 @@
+/*
+ * Lumped RLC: Apply to voltages (RLC ADE correction).
+ *
+ * Sparse dispatch: one thread per RLC element.
+ *
+ * Steps:
+ * 1. Rotate Jn history: Jn[2] = Jn[1], Jn[1] = Jn[0]
+ * 2. Read Yee-updated voltage: Vdn[0] = volt[dir][pos]
+ * 3. Compute corrected voltage:
+ *    Vdn[0] = vvd * (Vdn[0] - Il + vv2*Vdn[2] + vj1*Jn[1] + vj2*Jn[2])
+ * 4. Update J:
+ *    Jn[0] = ib0*(Vdn[0]-Vdn[2]) - b1*ib0*Jn[1] - b2*ib0*Jn[2]
+ * 5. Write back: volt[dir][pos] = Vdn[0]
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf { float volt[];    };
+layout(set=0, binding=1) buffer IlBuf   { float v_Il[];    };  // [count]
+layout(set=0, binding=2) buffer Vdn0Buf { float v_Vdn0[];  };  // [count]
+layout(set=0, binding=3) buffer Vdn1Buf { float v_Vdn1[];  };  // [count] (unused here but part of state)
+layout(set=0, binding=4) buffer Vdn2Buf { float v_Vdn2[];  };  // [count]
+layout(set=0, binding=5) buffer Jn0Buf  { float v_Jn0[];   };  // [count]
+layout(set=0, binding=6) buffer Jn1Buf  { float v_Jn1[];   };  // [count]
+layout(set=0, binding=7) buffer Jn2Buf  { float v_Jn2[];   };  // [count]
+layout(set=0, binding=8) buffer LinIdxBuf { uint linIdx[];  };  // [count] pre-linearized: dir*N + x*Ny*Nz + y*Nz + z
+layout(set=0, binding=9)  buffer VvdBuf  { float v_vvd[];  };  // [count]
+layout(set=0, binding=10) buffer Vv2Buf  { float v_vv2[];  };  // [count]
+layout(set=0, binding=11) buffer Vj1Buf  { float v_vj1[];  };  // [count]
+layout(set=0, binding=12) buffer Vj2Buf  { float v_vj2[];  };  // [count]
+layout(set=0, binding=13) buffer Ib0Buf  { float v_ib0[];  };  // [count]
+layout(set=0, binding=14) buffer B1Buf   { float v_b1[];   };  // [count]
+layout(set=0, binding=15) buffer B2Buf   { float v_b2[];   };  // [count]
+
+layout(push_constant) uniform PC {
+    uint count;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    // Rotate Jn history
+    float oldJn0 = v_Jn0[gid];
+    float oldJn1 = v_Jn1[gid];
+    v_Jn2[gid] = oldJn1;
+    v_Jn1[gid] = oldJn0;
+
+    // Read Yee-updated voltage at this RLC element position
+    uint idx = linIdx[gid];
+    float V = volt[idx];
+    v_Vdn0[gid] = V;
+
+    // Read state
+    float Il   = v_Il[gid];
+    float Vdn2 = v_Vdn2[gid];
+    float Jn1  = oldJn0;   // after rotation, Jn[1] = old Jn[0]
+    float Jn2  = oldJn1;   // after rotation, Jn[2] = old Jn[1]
+
+    // Compute corrected voltage
+    float vvd = v_vvd[gid];
+    V = vvd * (V - Il + v_vv2[gid]*Vdn2 + v_vj1[gid]*Jn1 + v_vj2[gid]*Jn2);
+    v_Vdn0[gid] = V;
+
+    // Update J[0]
+    float ib0 = v_ib0[gid];
+    v_Jn0[gid] = ib0*(V - Vdn2) - v_b1[gid]*ib0*Jn1 - v_b2[gid]*ib0*Jn2;
+
+    // Write corrected voltage back
+    volt[idx] = V;
+}

@@ -1,0 +1,39 @@
+/*
+ * Lumped RLC: Pre-voltage update (inductor current update).
+ *
+ * Sparse dispatch: one thread per RLC element.
+ * Rotates Vdn history and updates parallel inductor current:
+ *   Vdn[2] = Vdn[1]
+ *   Vdn[1] = Vdn[0]
+ *   Il += i2v * ilv * Vdn[1]  (using the value just shifted from old Vdn[0])
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer IlBuf   { float v_Il[];   };  // [count]
+layout(set=0, binding=1) buffer Vdn0Buf { float v_Vdn0[]; };  // [count] - Vdn[0]
+layout(set=0, binding=2) buffer Vdn1Buf { float v_Vdn1[]; };  // [count] - Vdn[1]
+layout(set=0, binding=3) buffer Vdn2Buf { float v_Vdn2[]; };  // [count] - Vdn[2]
+layout(set=0, binding=4) buffer I2vBuf  { float v_i2v[];  };  // [count] coefficient
+layout(set=0, binding=5) buffer IlvBuf  { float v_ilv[];  };  // [count] coefficient
+
+layout(push_constant) uniform PC {
+    uint count;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    // Rotate Vdn history: [2] <- [1] <- [0]
+    float oldVdn0 = v_Vdn0[gid];
+    float oldVdn1 = v_Vdn1[gid];
+
+    v_Vdn2[gid] = oldVdn1;
+    v_Vdn1[gid] = oldVdn0;
+
+    // Update parallel inductor current using newly rotated Vdn[1] (= old Vdn[0])
+    v_Il[gid] += v_i2v[gid] * v_ilv[gid] * oldVdn0;
+}

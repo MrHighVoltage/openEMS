@@ -1,0 +1,71 @@
+/*
+ * Lorentz/Drude dispersive material ADE pre-current update.
+ *
+ * Sparse dispatch: one thread per dispersive cell.
+ * Same logic as pre-voltage but operates on current field.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer CurrBuf       { float curr[];         };
+layout(set=0, binding=1) buffer CurrADEBuf    { float curr_ADE[];     };  // [3][count]
+layout(set=0, binding=2) buffer CurrLorADEBuf { float curr_Lor_ADE[]; };  // [3][count]
+layout(set=0, binding=3) buffer PosIdxBuf     { uint  posIdx[];       };  // [3][count]
+layout(set=0, binding=4) buffer IIntADEBuf    { float i_int_ADE[];    };  // [3][count]
+layout(set=0, binding=5) buffer IExtADEBuf    { float i_ext_ADE[];    };  // [3][count]
+layout(set=0, binding=6) buffer ILorADEBuf    { float i_Lor_ADE[];    };  // [3][count] coefficients
+
+layout(push_constant) uniform PC {
+    uint count;
+    uint Nx, Ny, Nz;
+    uint hasLorADE;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+
+    uint px = posIdx[gid];
+    uint py = posIdx[count + gid];
+    uint pz = posIdx[2*count + gid];
+    uint g_base = px * sYZ + py * Nz + pz;
+
+    if (hasLorADE != 0)
+    {
+        for (uint n = 0; n < 3; n++)
+        {
+            uint ade_idx = n * count + gid;
+            uint g_idx   = n * N + g_base;
+
+            float lor = curr_Lor_ADE[ade_idx];
+            float ade = curr_ADE[ade_idx];
+            float I   = curr[g_idx];
+
+            lor += i_Lor_ADE[ade_idx] * ade;
+            ade  = i_int_ADE[ade_idx] * ade + i_ext_ADE[ade_idx] * (I - lor);
+
+            curr_Lor_ADE[ade_idx] = lor;
+            curr_ADE[ade_idx]     = ade;
+        }
+    }
+    else
+    {
+        for (uint n = 0; n < 3; n++)
+        {
+            uint ade_idx = n * count + gid;
+            uint g_idx   = n * N + g_base;
+
+            float ade = curr_ADE[ade_idx];
+            float I   = curr[g_idx];
+
+            ade = i_int_ADE[ade_idx] * ade + i_ext_ADE[ade_idx] * I;
+
+            curr_ADE[ade_idx] = ade;
+        }
+    }
+}
