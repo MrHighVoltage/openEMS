@@ -40,6 +40,11 @@ using std::cout;
 using std::endl;
 
 // ---------------------------------------------------------------------------
+// Static members
+// ---------------------------------------------------------------------------
+int Engine_Vulkan::s_requestedGPUDevice = -1;
+
+// ---------------------------------------------------------------------------
 // Vulkan error checking
 // ---------------------------------------------------------------------------
 #define VK_CHECK(call) \
@@ -61,6 +66,69 @@ Engine_Vulkan* Engine_Vulkan::New(const Operator* op)
 	Engine_Vulkan* e = new Engine_Vulkan(op);
 	e->Init();
 	return e;
+}
+
+unsigned int Engine_Vulkan::ListGPUDevices()
+{
+	VkApplicationInfo appInfo{};
+	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	appInfo.pApplicationName = "openEMS";
+	appInfo.apiVersion = VK_API_VERSION_1_0;
+
+	VkInstanceCreateInfo instInfo{};
+	instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	instInfo.pApplicationInfo = &appInfo;
+
+	VkInstance inst = VK_NULL_HANDLE;
+	if (vkCreateInstance(&instInfo, nullptr, &inst) != VK_SUCCESS)
+	{
+		cerr << "Engine_Vulkan::ListGPUDevices: failed to create Vulkan instance" << endl;
+		return 0;
+	}
+
+	uint32_t devCount = 0;
+	vkEnumeratePhysicalDevices(inst, &devCount, nullptr);
+	if (devCount == 0)
+	{
+		cout << "No Vulkan-capable GPU devices found." << endl;
+		vkDestroyInstance(inst, nullptr);
+		return 0;
+	}
+
+	std::vector<VkPhysicalDevice> devs(devCount);
+	vkEnumeratePhysicalDevices(inst, &devCount, devs.data());
+
+	cout << "Available Vulkan GPU devices:" << endl;
+	for (uint32_t i = 0; i < devCount; i++)
+	{
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(devs[i], &props);
+
+		const char* typeStr = "Unknown";
+		switch (props.deviceType)
+		{
+		case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   typeStr = "Discrete GPU"; break;
+		case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: typeStr = "Integrated GPU"; break;
+		case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    typeStr = "Virtual GPU"; break;
+		case VK_PHYSICAL_DEVICE_TYPE_CPU:            typeStr = "CPU"; break;
+		default: break;
+		}
+
+		// Check for compute capability
+		uint32_t qfCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qfCount, nullptr);
+		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qfCount, qfProps.data());
+		bool hasCompute = false;
+		for (uint32_t q = 0; q < qfCount; q++)
+			if (qfProps[q].queueFlags & VK_QUEUE_COMPUTE_BIT) { hasCompute = true; break; }
+
+		cout << "  [" << i << "] " << props.deviceName << " (" << typeStr << ")"
+		     << (hasCompute ? "" : " [NO COMPUTE]") << endl;
+	}
+
+	vkDestroyInstance(inst, nullptr);
+	return devCount;
 }
 
 Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
@@ -243,32 +311,68 @@ void Engine_Vulkan::InitVulkan()
 	std::vector<VkPhysicalDevice> devs(devCount);
 	vkEnumeratePhysicalDevices(m_instance, &devCount, devs.data());
 
-	// Prefer discrete GPU, fall back to anything with compute
-	m_physDevice = VK_NULL_HANDLE;
-	for (auto& dev : devs)
+	// If the user explicitly requested a device index, use it directly
+	if (s_requestedGPUDevice >= 0)
 	{
-		uint32_t qfCount = 0;
-		vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, nullptr);
-		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-		vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, qfProps.data());
+		if ((uint32_t)s_requestedGPUDevice >= devCount)
+		{
+			cerr << "Engine_Vulkan: requested GPU device index " << s_requestedGPUDevice
+			     << " but only " << devCount << " device(s) available" << endl;
+			throw std::runtime_error("Engine_Vulkan: invalid GPU device index");
+		}
+		m_physDevice = devs[s_requestedGPUDevice];
 
+		// Find first compute queue family on the chosen device
+		uint32_t qfCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, nullptr);
+		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, qfProps.data());
+		bool foundCompute = false;
 		for (uint32_t i = 0; i < qfCount; i++)
 		{
 			if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
 			{
-				VkPhysicalDeviceProperties props;
-				vkGetPhysicalDeviceProperties(dev, &props);
-				if (!m_physDevice || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-				{
-					m_physDevice = dev;
-					m_computeQueueFamily = i;
-				}
+				m_computeQueueFamily = i;
+				foundCompute = true;
 				break;
 			}
 		}
+		if (!foundCompute)
+		{
+			cerr << "Engine_Vulkan: GPU device " << s_requestedGPUDevice
+			     << " has no compute queue" << endl;
+			throw std::runtime_error("Engine_Vulkan: selected GPU has no compute queue");
+		}
 	}
-	if (m_physDevice == VK_NULL_HANDLE)
-		throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
+	else
+	{
+		// Auto-select: prefer discrete GPU, fall back to anything with compute
+		m_physDevice = VK_NULL_HANDLE;
+		for (auto& dev : devs)
+		{
+			uint32_t qfCount = 0;
+			vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, nullptr);
+			std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+			vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, qfProps.data());
+
+			for (uint32_t i = 0; i < qfCount; i++)
+			{
+				if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+				{
+					VkPhysicalDeviceProperties props;
+					vkGetPhysicalDeviceProperties(dev, &props);
+					if (!m_physDevice || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+					{
+						m_physDevice = dev;
+						m_computeQueueFamily = i;
+					}
+					break;
+				}
+			}
+		}
+		if (m_physDevice == VK_NULL_HANDLE)
+			throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
+	}
 
 	// --- Logical device ---
 	float priority = 1.0f;
@@ -1878,7 +1982,22 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 		             VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
 	}
 
-	// Create probe gather pipeline (re-use existing m_probeDescLayout with 5 bindings)
+	// Ensure the probe descriptor layout exists (it may not if no GPU
+	// extensions were set up, since CreateExtensionDescriptorLayouts()
+	// is skipped when totalDescSets == 0).
+	if (m_probeDescLayout == VK_NULL_HANDLE)
+	{
+		std::vector<VkDescriptorSetLayoutBinding> bindings(5);
+		for (uint32_t i = 0; i < 5; i++)
+			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+			               VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+		VkDescriptorSetLayoutCreateInfo ci{};
+		ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		ci.bindingCount = 5;
+		ci.pBindings    = bindings.data();
+		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &m_probeDescLayout));
+	}
+
 	// Descriptor pool for 1 set, 5 storage buffer descriptors
 	VkDescriptorPoolSize poolSz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
 	VkDescriptorPoolCreateInfo dpi{};

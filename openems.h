@@ -83,6 +83,10 @@ public:
 
 	void SetNumberOfThreads(int val);
 
+	//! Set the GPU device index for the Vulkan engine (0-based, -1 = auto)
+	void SetGPUDevice(int val) { m_gpuDevice = val; }
+	int  GetGPUDevice() const  { return m_gpuDevice; }
+
 	void DebugMaterial() {DebugMat=true;}
 	void DebugOperator() {DebugOp=true;}
 	void DebugBox() {m_debugBox=true;}
@@ -170,6 +174,7 @@ protected:
 #endif
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
+	int m_gpuDevice; //!< GPU device index for Vulkan engine (-1 = auto)
 
 	//! Setup an operator matching the requested engine
 	virtual bool SetupOperator();
