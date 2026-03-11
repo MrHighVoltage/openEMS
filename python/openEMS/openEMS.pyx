@@ -107,6 +107,9 @@ cdef class openEMS:
         if 'MultiGrid' in kw:
             self.SetMultiGrid(kw['MultiGrid'])
             del kw['MultiGrid']
+        if 'GPUDevice' in kw:
+            self.SetGPUDevice(kw['GPUDevice'])
+            del kw['GPUDevice']
 
         assert len(kw)==0, 'Unknown keyword arguments: "{}"'.format(kw)
 
@@ -230,6 +233,25 @@ cdef class openEMS:
         Set max simulation time for a max. number of timesteps.
         """
         self.thisptr.SetMaxTime(val)
+
+    def SetGPUDevice(self, val):
+        """ SetGPUDevice(val)
+
+        Select which GPU device to use for the Vulkan compute engine.
+
+        :param val: int -- 0-based GPU device index, or -1 for auto-select (default).
+
+        Use ``--list-gpu-devices`` on the command line (or pass
+        ``list_gpu_devices=True`` to :func:`Run`) to see the available devices
+        and their indices.
+
+        Examples
+        --------
+        >>> FDTD = openEMS(NrTS=1e4, GPUDevice=0)       # via constructor
+        >>> FDTD.SetGPUDevice(1)                          # or explicit call
+        >>> FDTD.Run(sim_path, engine='gpu')              # run on selected GPU
+        """
+        self.thisptr.SetGPUDevice(val)
 
     def SetGaussExcite(self, f0, fc):
         """ SetGaussExcite(f0, fc)
@@ -638,6 +660,12 @@ cdef class openEMS:
           for debugging
         * nativeFieldDumps (bool) - dump all fields using the native field
           components
+        * engine (str) - choose engine type: 'fastest', 'basic', 'sse',
+          'sse-compressed', 'multithreaded', 'avx2', 'avx2-multithreaded',
+          'gpu'
+        * gpu_device (int) - select GPU device by index (0-based, -1 = auto).
+          Use ``list_gpu_devices=True`` to list available devices and exit.
+        * list_gpu_devices (bool) - list available Vulkan GPU devices and exit
         """
         if cleanup and os.path.exists(sim_path):
             self._cleanup_sim_path(sim_path, verbose=kw.get('verbose'))
