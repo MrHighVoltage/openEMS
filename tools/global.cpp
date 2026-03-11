@@ -21,7 +21,6 @@
 #include "global.h"
 
 using namespace std;
-namespace po = boost::program_options;
 
 // create global object
 Global g_settings;
@@ -37,66 +36,63 @@ Global::Global()
 	m_optionDesc = NULL;
 }
 
-po::options_description
+OptionDesc
 Global::optionDesc()
 {
-	po::options_description optdesc("Additional global arguments");
-	optdesc.add_options()
-		(
-			"showProbeDiscretization",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - showing probe discretization information" << endl;
-					m_showProbeDiscretization = true;
-				}
-			),
-			"Show probe discretization information"
-		)
-		(
-			"nativeFieldDumps",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dumping all fields using the native field components" << endl;
-					m_nativeFieldDumps = true;
-				}
-			),
-			"Dump all fields using the native field components"
-		)
-		(
-			"legacyHDF5Dumps",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dumping all fields using the legacy HDF5 file format as required for Octave/Matlab import" << endl;
-					m_legacyHDF5 = true;
-				}
-			),
-			"Dump all fields using the legacy HDF5 file format as required for Octave/Matlab import"
-		)
-		(
-			"verbose,v",
-			po::value<unsigned int>()->default_value(0)->implicit_value(1)->
-			notifier(
-				[&](unsigned int val)
-				{
-					// Don't apply settings if the default value 0 is unchanged,
-					// Apply settings and print messages if we have a non-default value
-					// or if the non-default value is changed back to default in another
-					// call (when running as a shared library).
-					if (val == 0 && m_VerboseLevel == 0) return;
+	OptionDesc optdesc("Additional global arguments");
 
-					m_VerboseLevel = val;
-					cout << "openEMS - verbose level " << m_VerboseLevel << endl;
-				}
-			),
-			"Verbose level, select debug level 1 to 3, "
-			"also accept -v, -vv, -vvv"
-		);
+	optdesc.addBoolSwitch(
+		"showProbeDiscretization",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - showing probe discretization information" << endl;
+			m_showProbeDiscretization = true;
+		},
+		"Show probe discretization information"
+	);
+
+	optdesc.addBoolSwitch(
+		"nativeFieldDumps",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dumping all fields using the native field components" << endl;
+			m_nativeFieldDumps = true;
+		},
+		"Dump all fields using the native field components"
+	);
+
+	optdesc.addBoolSwitch(
+		"legacyHDF5Dumps",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dumping all fields using the legacy HDF5 file format as required for Octave/Matlab import" << endl;
+			m_legacyHDF5 = true;
+		},
+		"Dump all fields using the legacy HDF5 file format as required for Octave/Matlab import"
+	);
+
+	optdesc.addUintOption(
+		"verbose,v",
+		0, // default
+		1, // implicit (bare -v means 1)
+		[this](unsigned int val)
+		{
+			// Don't apply settings if the default value 0 is unchanged,
+			// Apply settings and print messages if we have a non-default value
+			// or if the non-default value is changed back to default in another
+			// call (when running as a shared library).
+			if (val == 0 && m_VerboseLevel == 0) return;
+
+			m_VerboseLevel = val;
+			cout << "openEMS - verbose level " << m_VerboseLevel << endl;
+		},
+		"Verbose level, select debug level 1 to 3, "
+		"also accept -v, -vv, -vvv"
+	);
+
 	return optdesc;
 }
 
@@ -106,18 +102,16 @@ void Global::clearOptionDesc()
 	m_optionDesc = NULL;
 }
 
-void Global::appendOptionDesc(po::options_description desc)
+void Global::appendOptionDesc(OptionDesc desc)
 {
 	if (m_optionDesc == NULL)
-		m_optionDesc = new po::options_description();
+		m_optionDesc = new OptionDesc();
 
-	m_optionDesc->add(desc);
+	m_optionDesc->merge(desc);
 }
 
 void Global::parseLibraryArguments(std::vector<std::string> allOptions)
 {
-	clearOptions();
-
 	for (std::string& option : allOptions)
 	{
 		if (option.length() == 1)
@@ -126,26 +120,13 @@ void Global::parseLibraryArguments(std::vector<std::string> allOptions)
 			option = "--" + option;
 	}
 
-	// may throw
-	po::store(
-		po::command_line_parser(allOptions).options(*m_optionDesc)
-			.style(
-				po::command_line_style::unix_style |
-				po::command_line_style::case_insensitive)
-			.run(),
-		m_options
-	);
-
-	// run all registered callback functions in m_optionDesc
-	po::notify(m_options);
+	m_optionDesc->parse(allOptions);
 }
 
 void Global::parseCommandLineArguments(int argc, const char* argv[])
 {
-	// Hack: boost::program_options doesn't support repeated "-vv"
-	// and "-vvv" syntax and causes validation failure. It's
-	// not worthwhile to write a custom validator for exactly a
-	// single special case. Just change argv[] to avoid them.
+	// Handle repeated "-vv" and "-vvv" syntax by rewriting argv[]
+	// to the equivalent --verbose=N form.
 	std::pair<std::string, std::string> replaceTable[] =
 	{
 		{"-vv",  "--verbose=2"},
@@ -161,39 +142,25 @@ void Global::parseCommandLineArguments(int argc, const char* argv[])
 		}
 	}
 
-	// may throw
-	po::store(
-		po::command_line_parser(argc, argv).options(*m_optionDesc)
-			.style(
-				po::command_line_style::unix_style |
-				po::command_line_style::case_insensitive)
-			.run(),
-		m_options
-	);
-
-	// run all registered callback functions in m_optionDesc
-	po::notify(m_options);
+	m_optionDesc->parse(argc, argv);
 }
 
 void Global::showOptionUsage(std::ostream& ostr)
 {
-	ostr << *m_optionDesc << endl;
+	m_optionDesc->printUsage(ostr);
 }
 
 bool Global::hasOption(std::string option)
 {
-	if (m_options.count(option) > 0)
-		return true;
-	else
-		return false;
-}
-
-po::variable_value Global::getOption(std::string option)
-{
-	return m_options[option];
+	// No longer backed by a variables_map; this method is unused
+	// externally and retained only for API compatibility.
+	(void)option;
+	return false;
 }
 
 void Global::clearOptions()
 {
-	m_options.clear();
+	// Previously cleared the boost variables_map.
+	// With the callback-based parser, state is set directly on members,
+	// so there is nothing to clear here.
 }

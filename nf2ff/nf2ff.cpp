@@ -18,13 +18,12 @@
 #include "nf2ff.h"
 #include "nf2ff_calc.h"
 #include "../tools/array_ops.h"
-#include "../tools/arraylib/array_ij.h"
 #include "../tools/useful.h"
 #include "../tools/hdf5_file_reader.h"
 #include "../tools/hdf5_file_writer.h"
 #include <hdf5.h>
-#include <boost/algorithm/string.hpp>
-#include <clocale>
+#include <stdio.h>
+#include <stdlib.h>
 #include <vector>
 #include <cmath>
 #include <complex>
@@ -145,6 +144,21 @@ double nf2ff::GetMaxDirectivity(size_t f_idx) const
 	return m_nf2ff.at(f_idx)->GetMaxDirectivity();
 }
 
+complex<double>** nf2ff::GetETheta(size_t f_idx) const
+{
+	return m_nf2ff.at(f_idx)->GetETheta();
+}
+
+complex<double>** nf2ff::GetEPhi(size_t f_idx) const
+{
+	return m_nf2ff.at(f_idx)->GetEPhi();
+}
+
+double** nf2ff::GetRadPower(size_t f_idx) const
+{
+	return m_nf2ff.at(f_idx)->GetRadPower();
+}
+
 bool nf2ff::AnalyseXMLNode(TiXmlElement* ti_nf2ff)
 {
 	if (ti_nf2ff==NULL)
@@ -167,7 +181,7 @@ bool nf2ff::AnalyseXMLNode(TiXmlElement* ti_nf2ff)
 	attr = ti_nf2ff->Attribute("freq");
 	if (attr==NULL)
 	{
-		cerr << "nf2ff::AnalyseXMLNode: Can't read frequency information..." << endl;
+		cerr << "nf2ff::AnalyseXMLNode: Can't read frequency inforamtions ... " << endl;
 		return false;
 	}
 	vector<float> freq = SplitString2Float(attr);
@@ -180,7 +194,7 @@ bool nf2ff::AnalyseXMLNode(TiXmlElement* ti_nf2ff)
 	attr = ti_nf2ff->Attribute("Outfile");
 	if (attr==NULL)
 	{
-		cerr << "nf2ff::AnalyseXMLNode: Can't read output file name..." << endl;
+		cerr << "nf2ff::AnalyseXMLNode: Can't read frequency inforamtions ... " << endl;
 		return false;
 	}
 	string outfile = string(attr);
@@ -246,22 +260,22 @@ bool nf2ff::AnalyseXMLNode(TiXmlElement* ti_nf2ff)
 		l_nf2ff->SetRadius(radius);
 
 	// read mirrors
-	TiXmlElement* ti_Mirror = ti_nf2ff->FirstChildElement("Mirror");
+	TiXmlElement* ti_Mirros = ti_nf2ff->FirstChildElement("Mirror");
 	int dir=-1;
 	string type;
 	float pos=0.0;
-	while (ti_Mirror!=NULL)
+	while (ti_Mirros!=NULL)
 	{
-		type = string(ti_Mirror->Attribute("Type"));
-		if (ti_Mirror->QueryIntAttribute("Dir",&dir) != TIXML_SUCCESS)
+		type = string(ti_Mirros->Attribute("Type"));
+		if (ti_Mirros->QueryIntAttribute("Dir",&dir) != TIXML_SUCCESS)
 			dir = -1;
-		if (ti_Mirror->QueryFloatAttribute("Pos",&pos) != TIXML_SUCCESS)
+		if (ti_Mirros->QueryFloatAttribute("Pos",&pos) != TIXML_SUCCESS)
 			dir = -1;
 		if ((dir>=0) && (strcmp(type.c_str(),"PEC")==0))
 			l_nf2ff->SetMirror(MIRROR_PEC, dir, pos);
 		else if ((dir>=0) && (strcmp(type.c_str(),"PMC")==0))
 			l_nf2ff->SetMirror(MIRROR_PMC, dir, pos);
-		ti_Mirror = ti_Mirror->NextSiblingElement("Mirror");
+		ti_Mirros = ti_Mirros->NextSiblingElement("Mirror");
 	}
 
 	TiXmlElement* ti_Planes = ti_nf2ff->FirstChildElement("Planes");
@@ -276,14 +290,12 @@ bool nf2ff::AnalyseXMLNode(TiXmlElement* ti_nf2ff)
 			if (l_nf2ff->AnalyseFile(E_name,H_name)==false)
 			{
 				cerr << "nf2ff::AnalyseXMLNode: Error, analysing Plane ... " << endl;
-				delete l_nf2ff;
 				return false;
 			}
 		}
 		else
 		{
 			cerr << "nf2ff::AnalyseXMLNode: Error, invalid plane entry ... " << endl;
-			delete l_nf2ff;
 			return false;
 		}
 		ti_Planes = ti_Planes->NextSiblingElement("Planes");
@@ -437,55 +449,50 @@ bool nf2ff::AnalyseFile(string E_Field_file, string H_Field_file)
 
 	if (fallBack_TD)
 	{
-		vector<ArrayLib::ArrayNIJK<std::complex<float>>*> E_fd_data;
-		vector<ArrayLib::ArrayNIJK<std::complex<float>>*> H_fd_data;
+		vector<complex<float>****> E_fd_data;
+		vector<complex<float>****> H_fd_data;
 
 		if (m_Verbose>1)
 			cerr << "nf2ff: calculate dft..." << endl;
 
-		if (E_file.CalcFDVectorData(m_freq,E_fd_data)==false)
+		unsigned int data_size[4];
+		if (E_file.CalcFDVectorData(m_freq,E_fd_data,data_size)==false)
 		{
 			for (int n=0;n<3;++n)
 				delete[] E_lines[n];
 			return false;
 		}
-		for (size_t fn=0;fn<E_fd_data.size();++fn)
-		{
-			if ((E_fd_data.at(fn)->extent(1)!=E_numLines[0]) || (E_fd_data.at(fn)->extent(2)!=E_numLines[1]) || (E_fd_data.at(fn)->extent(3)!=E_numLines[2]) )
-			{
-				cerr << E_fd_data.at(fn)->extent(1) << " != " << E_numLines[0]  << ", " <<  E_fd_data.at(fn)->extent(2) << " != " << E_numLines[1]  << ", " <<  E_fd_data.at(fn)->extent(3) << " != " << E_numLines[2] << endl;
-				cerr << "nf2ff::AnalyseFile: E FD data size mismatch... " << endl;
-				for (size_t fn=0;fn<m_nf2ff.size();++fn)
-					delete E_fd_data.at(fn);
-				for (int n=0;n<3;++n)
-					delete[] E_lines[n];
-				return false;
-			}
-		}
-
-		if (H_file.CalcFDVectorData(m_freq,H_fd_data)==false)
+		if ((data_size[0]!=E_numLines[0]) || (data_size[1]!=E_numLines[1]) || (data_size[2]!=E_numLines[2]) )
 		{
 			for (size_t fn=0;fn<m_nf2ff.size();++fn)
-				delete E_fd_data.at(fn);
+			{
+				Delete_N_3DArray<complex<float> >(E_fd_data.at(fn),data_size);
+			}
 			for (int n=0;n<3;++n)
 				delete[] E_lines[n];
 			return false;
 		}
-		for (size_t fn=0;fn<E_fd_data.size();++fn)
+
+		if (H_file.CalcFDVectorData(m_freq,H_fd_data,data_size)==false)
 		{
-			if ((H_fd_data.at(fn)->extent(1)!=E_numLines[0]) || (H_fd_data.at(fn)->extent(2)!=E_numLines[1]) || (H_fd_data.at(fn)->extent(3)!=E_numLines[2]) )
-			{
-				cerr << H_fd_data.at(fn)->extent(1) << " != " << E_numLines[0]  << ", " <<  H_fd_data.at(fn)->extent(2) << " != " << E_numLines[1]  << ", " <<  H_fd_data.at(fn)->extent(3) << " != " << E_numLines[2] << endl;
-				cerr << "nf2ff::AnalyseFile: H FD data size mismatch... " << endl;
-				for (size_t fn=0;fn<m_nf2ff.size();++fn)
-					delete E_fd_data.at(fn);
-				for (size_t fn=0;fn<m_nf2ff.size();++fn)
-					delete H_fd_data.at(fn);
-				for (int n=0;n<3;++n)
-					delete[] E_lines[n];
-				return false;
-			}
+			for (size_t fn=0;fn<m_nf2ff.size();++fn)
+				Delete_N_3DArray<complex<float> >(E_fd_data.at(fn),data_size);
+			for (int n=0;n<3;++n)
+				delete[] E_lines[n];
+			return false;
 		}
+		if ((data_size[0]!=E_numLines[0]) || (data_size[1]!=E_numLines[1]) || (data_size[2]!=E_numLines[2]) )
+		{
+			for (size_t fn=0;fn<m_nf2ff.size();++fn)
+			{
+				Delete_N_3DArray<complex<float> >(E_fd_data.at(fn),data_size);
+				Delete_N_3DArray<complex<float> >(H_fd_data.at(fn),data_size);
+			}
+			for (int n=0;n<3;++n)
+				delete[] E_lines[n];
+			return false;
+		}
+
 		if (m_Verbose>0)
 			cerr << "nf2ff: Analysing far-field for " <<  m_nf2ff.size() << " frequencies.  " << endl;
 
@@ -493,7 +500,7 @@ bool nf2ff::AnalyseFile(string E_Field_file, string H_Field_file)
 		{
 			if (m_Verbose>1)
 				cerr << "nf2ff: f = " << m_freq.at(fn) << "Hz (" << fn+1 << "/" << m_freq.size() << ") ...";
-			m_nf2ff.at(fn)->AddPlane(E_lines, E_numLines, *E_fd_data.at(fn), *H_fd_data.at(fn),E_meshType);
+			m_nf2ff.at(fn)->AddPlane(E_lines, E_numLines, E_fd_data.at(fn), H_fd_data.at(fn),E_meshType);
 			if (m_Verbose>1)
 				cerr << " done." << endl;
 		}
@@ -501,43 +508,46 @@ bool nf2ff::AnalyseFile(string E_Field_file, string H_Field_file)
 	}
 	else
 	{
-		ArrayLib::ArrayNIJK<std::complex<float>> E_fd_data;
-		ArrayLib::ArrayNIJK<std::complex<float>> H_fd_data;
+		complex<float>**** E_fd_data;
+		complex<float>**** H_fd_data;
+		unsigned int data_size[4];
 		for (size_t n=0;n<m_freq.size();++n)
 		{
-			if (!E_file.GetFDVectorData(FD_index.at(n), E_fd_data))
+			E_fd_data = E_file.GetFDVectorData(FD_index.at(n),data_size);
+			if ((data_size[0]!=E_numLines[0]) || (data_size[1]!=E_numLines[1]) || (data_size[2]!=E_numLines[2]) )
 			{
-				for (int n=0;n<3;++n)
-					delete[] E_lines[n];
-				return false;
-			}
-			if ((E_fd_data.extent(1)!=E_numLines[0]) || (E_fd_data.extent(2)!=E_numLines[1]) || (E_fd_data.extent(3)!=E_numLines[2]) )
-			{
-				cerr << E_fd_data.extent(1) << " != " << E_numLines[0]  << ", " <<  E_fd_data.extent(2) << " != " << E_numLines[1]  << ", " <<  E_fd_data.extent(3) << " != " << E_numLines[2] << endl;
-				cerr << "nf2ff::AnalyseFile: E- FD data size mismatch... " << endl;
-				for (int n=0;n<3;++n)
-					delete[] E_lines[n];
-				return false;
-			}
-
-			if (!H_file.GetFDVectorData(FD_index.at(n), H_fd_data))
-			{
-				for (int n=0;n<3;++n)
-					delete[] E_lines[n];
-				return false;
-			}
-			if ((H_fd_data.extent(1)!=E_numLines[0]) || (H_fd_data.extent(2)!=E_numLines[1]) || (H_fd_data.extent(3)!=E_numLines[2]) )
-			{
-				cerr << H_fd_data.extent(1) << " != " << E_numLines[0]  << ", " <<  H_fd_data.extent(2) << " != " << E_numLines[1]  << ", " <<  H_fd_data.extent(3) << " != " << E_numLines[2] << endl;
-				cerr << "nf2ff::AnalyseFile: H- FD data size mismatch... " << endl;
+				cerr << data_size[0] << "," << data_size[1] << "," <<  data_size[2] << endl;
+				cerr << "nf2ff::AnalyseFile: FD data size mismatch... " << endl;
+				Delete_N_3DArray<complex<float> >(E_fd_data,data_size);
 				for (int n=0;n<3;++n)
 					delete[] E_lines[n];
 				return false;
 			}
 
+			H_fd_data = H_file.GetFDVectorData(FD_index.at(n),data_size);
+			if ((data_size[0]!=E_numLines[0]) || (data_size[1]!=E_numLines[1]) || (data_size[2]!=E_numLines[2]) )
+			{
+				cerr << data_size[0] << "," << data_size[1] << "," <<  data_size[2] << endl;
+				cerr << "nf2ff::AnalyseFile: FD data size mismatch... " << endl;
+				Delete_N_3DArray<complex<float> >(H_fd_data,data_size);
+				Delete_N_3DArray<complex<float> >(E_fd_data,data_size);
+				for (int n=0;n<3;++n)
+					delete[] E_lines[n];
+				return false;
+			}
+
+			if ((E_fd_data==NULL) || (H_fd_data==NULL))
+			{
+				cerr << "nf2ff::AnalyseFile: Reaing FD data failed... " << endl;
+				Delete_N_3DArray<complex<float> >(E_fd_data,data_size);
+				Delete_N_3DArray<complex<float> >(H_fd_data,data_size);
+				for (int n=0;n<3;++n)
+					delete[] E_lines[n];
+				return false;
+			}
 			if (m_Verbose>1)
 				cerr << "nf2ff: f = " << m_freq.at(n) << "Hz (" << n+1 << "/" << m_freq.size() << ") ...";
-			m_nf2ff.at(n)->AddPlane(E_lines, E_numLines, E_fd_data, H_fd_data, E_meshType);
+			m_nf2ff.at(n)->AddPlane(E_lines, E_numLines, E_fd_data, H_fd_data,E_meshType);
 			if (m_Verbose>1)
 				cerr << " done." << endl;
 		}
@@ -567,7 +577,7 @@ bool nf2ff::Write2HDF5(string filename)
 		return false;
 
 	float attr_value = 2;
-	hdf_file.WriteAttribute("/Mesh", "MeshType", &attr_value, 1);
+	hdf_file.WriteAtrribute("/Mesh", "MeshType", &attr_value, 1);
 
 	//write field data
 	size_t dim = 2;
@@ -575,7 +585,7 @@ bool nf2ff::Write2HDF5(string filename)
 	size_t datasize[2]={m_numPhi,m_numTheta};
 	size_t size = datasize[0]*datasize[1];
 	double* buffer = new double[size];
-	ArrayLib::ArrayIJ<std::complex<double> >* field_data;
+	complex<double>** field_data;
 	string field_names[2]={"E_theta", "E_phi"};
 	for (int n=0;n<2;++n)
 	{
@@ -586,13 +596,13 @@ bool nf2ff::Write2HDF5(string filename)
 			ss << "f" << fn;
 			pos = 0;
 			if (n==0)
-				field_data = m_nf2ff.at(fn)->GetETheta();
+				field_data = GetETheta(fn);
 			else
-				field_data = m_nf2ff.at(fn)->GetEPhi();
+				field_data = GetEPhi(fn);
 			for (size_t j=0;j<m_numPhi;++j)
 				for (size_t i=0;i<m_numTheta;++i)
 				{
-					buffer[pos++]=real((*field_data)(i, j));
+					buffer[pos++]=real(field_data[i][j]);
 				}
 			if (hdf_file.WriteData(ss.str() + "_real",buffer,dim,datasize)==false)
 			{
@@ -605,7 +615,7 @@ bool nf2ff::Write2HDF5(string filename)
 			for (size_t j=0;j<m_numPhi;++j)
 				for (size_t i=0;i<m_numTheta;++i)
 				{
-					buffer[pos++]=imag((*field_data)(i, j));
+					buffer[pos++]=imag(field_data[i][j]);
 				}
 			if (hdf_file.WriteData(ss.str() + "_imag",buffer,dim,datasize)==false)
 			{
@@ -623,11 +633,11 @@ bool nf2ff::Write2HDF5(string filename)
 		stringstream ss;
 		ss << "f" << fn;
 		pos = 0;
-		ArrayLib::ArrayIJ<double>* field_data = m_nf2ff.at(fn)->GetRadPower();
+		double** field_data = GetRadPower(fn);
 		for (size_t j=0;j<m_numPhi;++j)
 			for (size_t i=0;i<m_numTheta;++i)
 			{
-				buffer[pos++]=(*field_data)(i, j);
+				buffer[pos++]=field_data[i][j];
 			}
 		if (hdf_file.WriteData(ss.str(),buffer,dim,datasize)==false)
 		{
@@ -639,20 +649,20 @@ bool nf2ff::Write2HDF5(string filename)
 	delete[] buffer;
 
 	//write frequency attribute
-	hdf_file.WriteAttribute("/nf2ff", "Frequency",m_freq);
+	hdf_file.WriteAtrribute("/nf2ff", "Frequency",m_freq);
 
 	buffer = new double[m_freq.size()];
 	//write radiated power attribute
 	for (size_t fn=0;fn<m_freq.size();++fn)
 		buffer[fn] = GetTotalRadPower(fn);
-	hdf_file.WriteAttribute("/nf2ff", "Prad",buffer,m_freq.size());
+	hdf_file.WriteAtrribute("/nf2ff", "Prad",buffer,m_freq.size());
 	delete[] buffer;
 
 	//write max directivity attribute
 	buffer = new double[m_freq.size()];
 	for (size_t fn=0;fn<m_freq.size();++fn)
 		buffer[fn] = GetMaxDirectivity(fn);
-	hdf_file.WriteAttribute("/nf2ff", "Dmax",buffer,m_freq.size());
+	hdf_file.WriteAtrribute("/nf2ff", "Dmax",buffer,m_freq.size());
 	delete[] buffer;
 
 	if (m_permittivity.size()>0)
@@ -660,7 +670,7 @@ bool nf2ff::Write2HDF5(string filename)
 		buffer = new double[m_permittivity.size()];
 		for (size_t n=0;n<m_permittivity.size();++n)
 			buffer[n] = m_permittivity.at(n);
-		hdf_file.WriteAttribute("/nf2ff", "Eps_r",buffer,m_permittivity.size());
+		hdf_file.WriteAtrribute("/nf2ff", "Eps_r",buffer,m_permittivity.size());
 		delete[] buffer;
 	}
 
@@ -669,7 +679,7 @@ bool nf2ff::Write2HDF5(string filename)
 		buffer = new double[m_permeability.size()];
 		for (size_t n=0;n<m_permeability.size();++n)
 			buffer[n] = m_permeability.at(n);
-		hdf_file.WriteAttribute("/nf2ff", "Mue_r",buffer,m_permeability.size());
+		hdf_file.WriteAtrribute("/nf2ff", "Mue_r",buffer,m_permeability.size());
 		delete[] buffer;
 	}
 

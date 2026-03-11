@@ -1,4 +1,4 @@
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 
 # define build type
 IF( DEFINED CMAKE_BUILD_TYPE )
@@ -174,24 +174,6 @@ INCLUDE_DIRECTORIES (${HDF5_INCLUDE_DIRS})
 #ADD_DEFINITIONS( -DH5_USE_16_API )
 #ADD_DEFINITIONS( -DH5_BUILT_AS_DYNAMIC_LIB )
 
-# boost
-find_package(Boost 1.46 COMPONENTS
-  thread
-  date_time
-  serialization
-  chrono
-  program_options
-  REQUIRED
-)
-if (${Boost_MINOR_VERSION} LESS 69)
-    # Since Boost 1.69, "system" is header only, so a check
-    # is needed only in Boost 1.68 and earlier.
-    find_package(Boost 1.46 COMPONENTS system thread date_time serialization chrono program_options REQUIRED)
-endif()
-message(STATUS "Boost_INCLUDE_DIRS: ${Boost_INCLUDE_DIRS}")
-message(STATUS "Boost_LIBRARIES: ${Boost_LIBRARIES}")
-INCLUDE_DIRECTORIES (${Boost_INCLUDE_DIRS})
-
 # std::thread / std::mutex support
 find_package(Threads REQUIRED)
 
@@ -262,7 +244,6 @@ TARGET_LINK_LIBRARIES( openEMS
   ${TinyXML_LIBRARY}
   ${HDF5_LIBRARIES}
   ${HDF5_HL_LIBRARIES}
-  ${Boost_LIBRARIES}
   ${vtk_LIBS}
   ${MPI_LIBRARIES}
   Threads::Threads

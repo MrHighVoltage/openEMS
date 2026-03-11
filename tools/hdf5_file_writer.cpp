@@ -18,7 +18,6 @@
 using namespace std;
 
 #include "hdf5_file_writer.h"
-#include <boost/algorithm/string.hpp>
 #include <hdf5.h>
 
 #include <sstream>
@@ -94,7 +93,20 @@ hid_t HDF5_File_Writer::OpenGroup(hid_t hdf5_file, string group)
 	}
 
 	vector<string> results;
-	boost::split(results, group, boost::is_any_of("/"));
+	{
+		string::size_type start = 0;
+		while (start < group.size())
+		{
+			auto pos = group.find('/', start);
+			if (pos == string::npos)
+			{
+				results.push_back(group.substr(start));
+				break;
+			}
+			results.push_back(group.substr(start, pos - start));
+			start = pos + 1;
+		}
+	}
 
 	hid_t grp=H5Gopen(hdf5_file,"/", H5P_DEFAULT);
 	if (grp<0)

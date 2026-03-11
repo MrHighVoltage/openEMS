@@ -29,8 +29,6 @@
 #include "extensions/engine_extension.h"
 #include "tools/denormal.h"
 
-#include "boost/date_time/posix_time/posix_time.hpp"
-#include "boost/date_time/gregorian/gregorian.hpp"
 #include <iomanip>
 
 using std::cout;
@@ -54,8 +52,7 @@ Engine_Multithread::Engine_Multithread(const Operator_Multithread* op) : ENGINE_
 	m_IterateBarrier = 0;
 	m_startBarrier = 0;
 	m_stopBarrier = 0;
-	m_thread_group = 0;
-	m_max_numThreads = boost::thread::hardware_concurrency();
+	m_max_numThreads = std::thread::hardware_concurrency();
 	m_numThreads = 0;
 	m_last_speed = 0;
 	m_opt_speed = false;
@@ -70,7 +67,7 @@ Engine_Multithread::~Engine_Multithread()
 {
 #ifdef ENABLE_DEBUG_TIME
 	NS_Engine_Multithread::DBG().cout() << "Engine_Multithread::~Engine_Multithread()" << endl;
-	std::map<boost::thread::id, std::vector<double> >::iterator it;
+	std::map<std::thread::id, std::vector<double> >::iterator it;
 	for (it=m_timer_list.begin(); it!=m_timer_list.end(); it++)
 	{
 		NS_Engine_Multithread::DBG().cout() << "*** DEBUG Thread: " << it->first << std::endl;
@@ -118,22 +115,21 @@ void Engine_Multithread::Init()
 
 void Engine_Multithread::Reset()
 {
-	if (m_thread_group!=0) // prevent multiple invocations
+	if (!m_threads.empty()) // prevent multiple invocations
 	{
 		ClearExtensions(); //prevent extensions from interfering with thread reset...
 
-		// stop the threads
-		//NS_Engine_Multithread::DBG().cout() << "stopping all threads" << endl;
-		m_thread_group->interrupt_all();
-		m_thread_group->join_all(); // wait for termination
+		// stop the threads: signal them and complete the start barrier so they wake up
+		m_stopThreads = true;
+		m_startBarrier->wait();
+		for (auto& t : m_threads) t.join();
+		m_threads.clear();
 		delete m_IterateBarrier;
 		m_IterateBarrier = 0;
 		delete m_startBarrier;
 		m_startBarrier = 0;
 		delete m_stopBarrier;
 		m_stopBarrier = 0;
-		delete m_thread_group;
-		m_thread_group = 0;
 	}
 
 	ENGINE_MULTITHREAD_BASE::Reset();
@@ -141,16 +137,16 @@ void Engine_Multithread::Reset()
 
 void Engine_Multithread::changeNumThreads(unsigned int numThreads)
 {
-	if (m_thread_group!=0)
+	if (!m_threads.empty())
 	{
-		m_thread_group->interrupt_all();
-		m_thread_group->join_all(); // wait for termination
-		delete m_thread_group;
-		m_thread_group = 0;
-		//m_stopThreads = false;
+		m_stopThreads = true;
+		m_startBarrier->wait();
+		for (auto& t : m_threads) t.join();
+		m_threads.clear();
 	}
 
 	m_numThreads = numThreads;
+	m_stopThreads = false;
 
 	if (g_settings.GetVerboseLevel()>0)
 		cout << "Multithreaded engine using " << m_numThreads << " threads. Utilization: (";
@@ -162,20 +158,19 @@ void Engine_Multithread::changeNumThreads(unsigned int numThreads)
 	if (m_IterateBarrier!=0)
 		delete m_IterateBarrier;
 	// make sure all threads are waiting
-	m_IterateBarrier = new boost::barrier(m_numThreads); // numThread workers
+	m_IterateBarrier = new Barrier(m_numThreads); // numThread workers
 
 	if (m_startBarrier!=0)
 		delete m_startBarrier;
-	m_startBarrier = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+	m_startBarrier = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 
 	if (m_stopBarrier!=0)
 		delete m_stopBarrier;
-	m_stopBarrier = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+	m_stopBarrier = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 #ifdef MPI_SUPPORT
 	m_MPI_Barrier = 0;
 #endif
 
-	m_thread_group = new boost::thread_group();
 	for (unsigned int n=0; n<m_numThreads; n++)
 	{
 		unsigned int start = m_Start_Lines.at(n);
@@ -191,8 +186,8 @@ void Engine_Multithread::changeNumThreads(unsigned int numThreads)
 		else
 			if (g_settings.GetVerboseLevel()>0)
 				cout << stop-start+1 << ";";
-		boost::thread *t = new boost::thread( NS_Engine_Multithread::thread(this,start,stop,stop_h,n) );
-		m_thread_group->add_thread( t );
+//		NS_Engine_Multithread::DBG().cout() << "###DEBUG## Thread " << n << ": start=" << start << " stop=" << stop  << " stop_h=" << stop_h << std::endl;
+		m_threads.emplace_back( NS_Engine_Multithread::thread(this,start,stop,stop_h,n) );
 	}
 
 	for (size_t n=0; n<m_Eng_exts.size(); ++n)
@@ -309,7 +304,7 @@ thread::thread( Engine_Multithread* ptr, unsigned int start, unsigned int stop, 
 void thread::operator()()
 {
 	//std::cout << "thread::operator() Parameters: " << m_start << " " << m_stop << std::endl;
-	//DBG().cout() << "Thread " << m_threadID << " (" << boost::this_thread::get_id() << ") started." << endl;
+	//DBG().cout() << "Thread " << m_threadID << " (" << std::this_thread::get_id() << ") started." << endl;
 
 	// speed up the calculation of denormal floating point values (flush-to-zero)
 	Denormal::Disable();
@@ -317,13 +312,13 @@ void thread::operator()()
 	while (!m_enginePtr->m_stopThreads)
 	{
 		// wait for start
-		//DBG().cout() << "Thread " << m_threadID << " (" << boost::this_thread::get_id() << ") waiting..." << endl;
+		//DBG().cout() << "Thread " << m_threadID << " (" << std::this_thread::get_id() << ") waiting..." << endl;
 		m_enginePtr->m_startBarrier->wait();
-		//cout << "Thread " << boost::this_thread::get_id() << " waiting... started." << endl;
+		//cout << "Thread " << std::this_thread::get_id() << " waiting... started." << endl;
 
 		if (m_enginePtr->m_stopThreads)
 		{
-			//DBG().cout() << "Thread " << m_threadID << " (" << boost::this_thread::get_id() << ") stop!." << endl;
+			//DBG().cout() << "Thread " << m_threadID << " (" << std::this_thread::get_id() << ") stop!." << endl;
 			return;
 		}
 
@@ -338,13 +333,13 @@ void thread::operator()()
 			m_enginePtr->UpdateVoltages(m_start,m_stop-m_start+1);
 
 			// record time
-			DEBUG_TIME( m_enginePtr->m_timer_list[boost::this_thread::get_id()].push_back( timer1.elapsed() ); )
+			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
 
-			//cout << "Thread " << boost::this_thread::get_id() << " m_barrier1 waiting..." << endl;
+			//cout << "Thread " << std::this_thread::get_id() << " m_barrier1 waiting..." << endl;
 			m_enginePtr->m_IterateBarrier->wait();
 
 			// record time
-			DEBUG_TIME( m_enginePtr->m_timer_list[boost::this_thread::get_id()].push_back( timer1.elapsed() ); )
+			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
 
 			//post voltage stuff...
 			m_enginePtr->DoPostVoltageUpdates(m_threadID);
@@ -361,7 +356,7 @@ void thread::operator()()
 #endif
 
 			// record time
-			DEBUG_TIME( m_enginePtr->m_timer_list[boost::this_thread::get_id()].push_back( timer1.elapsed() ); )
+			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
 
 			//pre current stuff
 			m_enginePtr->DoPreCurrentUpdates(m_threadID);
@@ -370,11 +365,11 @@ void thread::operator()()
 			m_enginePtr->UpdateCurrents(m_start,m_stop_h-m_start+1);
 
 			// record time
-			DEBUG_TIME( m_enginePtr->m_timer_list[boost::this_thread::get_id()].push_back( timer1.elapsed() ); )
+			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
 			m_enginePtr->m_IterateBarrier->wait();
 
 			// record time
-			DEBUG_TIME( m_enginePtr->m_timer_list[boost::this_thread::get_id()].push_back( timer1.elapsed() ); )
+			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
 
 			//post current stuff
 			m_enginePtr->DoPostCurrentUpdates(m_threadID);
@@ -397,7 +392,7 @@ void thread::operator()()
 		m_enginePtr->m_stopBarrier->wait();
 	}
 
-	//DBG().cout() << "Thread " << m_threadID << " (" << boost::this_thread::get_id() << ") finished." << endl;
+	//DBG().cout() << "Thread " << m_threadID << " (" << std::this_thread::get_id() << ") finished." << endl;
 }
 
 } // namespace

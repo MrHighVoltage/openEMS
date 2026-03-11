@@ -27,6 +27,7 @@
 #include <ctime>
 #include <vector>
 
+#include "tools/option_parser.h"
 #include "openems_global.h"
 
 #define OPENEMS_STAT_FILE "openEMS_stats.txt"
@@ -52,6 +53,7 @@ public:
 	openEMS();
 	virtual ~openEMS();
 
+	OptionDesc optionDesc();
 	virtual void showUsage();
 
 	bool ParseFDTDSetup(std::string file);
@@ -113,7 +115,6 @@ public:
 	Excitation* InitExcitation();
 
 	void SetCSX(ContinuousStructure* csx);
-	ContinuousStructure* GetCSX() const;
 
 	Engine_Interface_FDTD* NewEngineInterface(int multigridlevel = 0);
 

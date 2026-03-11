@@ -35,9 +35,9 @@ Engine_CylinderMultiGrid::Engine_CylinderMultiGrid(const Operator_CylinderMultiG
 {
 	Op_CMG = op;
 
-	m_WaitOnBase = new boost::barrier(2);
-	m_WaitOnChild = new boost::barrier(2);
-	m_WaitOnSync = new boost::barrier(2);
+	m_WaitOnBase = new Barrier(2);
+	m_WaitOnChild = new Barrier(2);
+	m_WaitOnSync = new Barrier(2);
 
 	m_Eng_Ext_MG = new Engine_Ext_CylinderMultiGrid(NULL,true);
 	m_Eng_Ext_MG->SetBarrier(m_WaitOnBase, m_WaitOnChild, m_WaitOnSync);
@@ -73,7 +73,8 @@ Engine_CylinderMultiGrid::~Engine_CylinderMultiGrid()
 	m_Thread_NumTS = 0;
 	m_startBarrier->wait();
 
-	m_IteratorThread_Group.join_all();
+	for (auto& t : m_IteratorThreads) t.join();
+	m_IteratorThreads.clear();
 
 	delete m_InnerEngine;
 	m_InnerEngine = NULL;
@@ -97,23 +98,19 @@ void Engine_CylinderMultiGrid::Init()
 
 	m_Eng_exts.push_back(m_Eng_Ext_MG);
 
-	m_startBarrier = new boost::barrier(3); //both engines + organizer
-	m_stopBarrier = new boost::barrier(3); //both engines + organizer
+	m_startBarrier = new Barrier(3); //both engines + organizer
+	m_stopBarrier = new Barrier(3); //both engines + organizer
 
-	boost::thread *t = NULL;
+	m_IteratorThreads.emplace_back( Engine_CylinderMultiGrid_Thread(this,m_startBarrier,m_stopBarrier,&m_Thread_NumTS, true) );
 
-	t = new boost::thread( Engine_CylinderMultiGrid_Thread(this,m_startBarrier,m_stopBarrier,&m_Thread_NumTS, true) );
-	m_IteratorThread_Group.add_thread( t );
-
-	t = new boost::thread( Engine_CylinderMultiGrid_Thread(m_InnerEngine,m_startBarrier,m_stopBarrier,&m_Thread_NumTS, false) );
-	m_IteratorThread_Group.add_thread( t );
+	m_IteratorThreads.emplace_back( Engine_CylinderMultiGrid_Thread(m_InnerEngine,m_startBarrier,m_stopBarrier,&m_Thread_NumTS, false) );
 
 	m_InnerEngine->SortExtensionByPriority();
 	SortExtensionByPriority();
 
 #ifdef MPI_SUPPORT
 	//assign an MPI barrier to inner Engine
-	m_InnerEngine->m_MPI_Barrier  = new boost::barrier(2);
+	m_InnerEngine->m_MPI_Barrier  = new Barrier(2);
 #endif
 }
 
@@ -210,7 +207,7 @@ void Engine_CylinderMultiGrid::InterpolCurrChild2Base(unsigned int rPos)
 #endif
 
 /****************************************************************************************/
-Engine_CylinderMultiGrid_Thread::Engine_CylinderMultiGrid_Thread( Engine_Multithread* engine, boost::barrier *start, boost::barrier *stop, volatile unsigned int* numTS, bool isBase)
+Engine_CylinderMultiGrid_Thread::Engine_CylinderMultiGrid_Thread( Engine_Multithread* engine, Barrier *start, Barrier *stop, volatile unsigned int* numTS, bool isBase)
 {
 	m_startBarrier = start;
 	m_stopBarrier = stop;

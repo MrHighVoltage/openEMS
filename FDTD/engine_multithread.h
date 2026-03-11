@@ -21,10 +21,10 @@
 #include "operator_multithread.h"
 #include "engine_sse_compressed.h"
 
-#include <boost/thread.hpp>
-#include <boost/fusion/include/list.hpp>
-#include <boost/fusion/container/list/list_fwd.hpp>
-#include <boost/fusion/include/list_fwd.hpp>
+#include <thread>
+#include <vector>
+#include <map>
+#include "tools/barrier.h"
 
 #include "tools/useful.h"
 #if defined(_WIN32) && !defined(__GNUC__)
@@ -113,9 +113,9 @@ protected:
 	Engine_Multithread(const Operator_Multithread* op);
 	void changeNumThreads(unsigned int numThreads);
 	const Operator_Multithread* m_Op_MT;
-	boost::thread_group *m_thread_group;
-	boost::barrier *m_startBarrier, *m_stopBarrier;
-	boost::barrier *m_IterateBarrier;
+	std::vector<std::thread> m_threads;
+	Barrier *m_startBarrier, *m_stopBarrier;
+	Barrier *m_IterateBarrier;
 	volatile unsigned int m_iterTS;
 	unsigned int m_numThreads; //!< number of worker threads
 	unsigned int m_max_numThreads; //!< max. number of worker threads
@@ -129,11 +129,11 @@ protected:
 	 This engine will not initialize or cleanup this barrier, but check for it and wait before executing any MPI sync.
 	 Make sure to cleanup (delete) this barriere before Engine_Multithread::Reset() is called.
 	 */
-	boost::barrier *m_MPI_Barrier;
+	Barrier *m_MPI_Barrier;
 #endif
 
 #ifdef ENABLE_DEBUG_TIME
-	std::map<boost::thread::id, std::vector<double> > m_timer_list;
+	std::map<std::thread::id, std::vector<double> > m_timer_list;
 #endif
 };
 

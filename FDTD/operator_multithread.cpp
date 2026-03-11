@@ -71,7 +71,8 @@ void Operator_Multithread::Init()
 
 void Operator_Multithread::Delete()
 {
-	m_thread_group.join_all();
+	for (auto& t : m_threads) t.join();
+	m_threads.clear();
 
 	delete m_CalcEC_Start;
 	m_CalcEC_Start=NULL;
@@ -115,8 +116,8 @@ void Operator_Multithread::CalcStartStopLines(
 
 int Operator_Multithread::CalcECOperator( DebugFlags debugFlags )
 {
-	if ((m_numThreads == 0) || (m_numThreads > boost::thread::hardware_concurrency()))
-		m_numThreads = boost::thread::hardware_concurrency();
+	if ((m_numThreads == 0) || (m_numThreads > std::thread::hardware_concurrency()))
+		m_numThreads = std::thread::hardware_concurrency();
 
 	std::vector<unsigned int> m_Start_Lines;
 	std::vector<unsigned int> m_Stop_Lines;
@@ -125,21 +126,21 @@ int Operator_Multithread::CalcECOperator( DebugFlags debugFlags )
 	if (g_settings.GetVerboseLevel()>0)
 		cout << "Multithreaded operator using " << m_numThreads << " threads." << std::endl;
 
-	m_thread_group.join_all();
+	for (auto& t : m_threads) t.join();
+	m_threads.clear();
 	delete m_CalcEC_Start;
-	m_CalcEC_Start = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+	m_CalcEC_Start = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 	delete m_CalcEC_Stop;
-	m_CalcEC_Stop = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+	m_CalcEC_Stop = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 
 	delete m_CalcPEC_Start;
-	m_CalcPEC_Start = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+	m_CalcPEC_Start = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 	delete m_CalcPEC_Stop;
-	m_CalcPEC_Stop = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+	m_CalcPEC_Stop = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 
 	for (unsigned int n=0; n<m_numThreads; n++)
 	{
-		boost::thread *t = new boost::thread( Operator_Thread(this,m_Start_Lines.at(n),m_Stop_Lines.at(n),n) );
-		m_thread_group.add_thread( t );
+		m_threads.emplace_back( Operator_Thread(this,m_Start_Lines.at(n),m_Stop_Lines.at(n),n) );
 	}
 
 	return OPERATOR_MULTITHREAD_BASE::CalcECOperator( debugFlags );

@@ -18,8 +18,7 @@
 #include "engine_sse_compressed.h"
 
 // enable AltiVec mode on ppc64le in GCC's emmintrin.h
-#include <boost/predef.h>
-#if BOOST_ARCH_PPC_64 && BOOST_ENDIAN_LITTLE_BYTE
+#if defined(__ppc64__) && defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
 #define NO_WARN_X86_INTRINSICS
 #include <emmintrin.h>
 #endif

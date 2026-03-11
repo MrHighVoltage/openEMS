@@ -36,7 +36,7 @@ Engine_Ext_CylinderMultiGrid::~Engine_Ext_CylinderMultiGrid()
 {
 }
 
-void Engine_Ext_CylinderMultiGrid::SetBarrier(boost::barrier* waitBase, boost::barrier* waitChild, boost::barrier* waitSync)
+void Engine_Ext_CylinderMultiGrid::SetBarrier(Barrier* waitBase, Barrier* waitChild, Barrier* waitSync)
 {
 	m_WaitOnBase = waitBase;
 	m_WaitOnChild = waitChild;

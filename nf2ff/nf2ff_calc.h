@@ -18,19 +18,24 @@
 #ifndef NF2FF_CALC_H
 #define NF2FF_CALC_H
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <vector>
 #include <cmath>
 #include <complex>
-#include <boost/thread.hpp>
-#include "../tools/arraylib/array_ij.h"
-#include "../tools/arraylib/array_nijk.h"
+#include <thread>
+#include <vector>
+#include "../tools/barrier.h"
+#define _USE_MATH_DEFINES
 
 class nf2ff_calc;
 
-enum MirrorType { MIRROR_OFF = 0, MIRROR_PEC = 1, MIRROR_PMC = 2 };
+#define MIRROR_OFF 0
+#define MIRROR_PEC 1
+#define MIRROR_PMC 2
 
 // data structure to exchange data between thread-controller and worker-threads
-struct nf2ff_data
+typedef struct
 {
 	//local working data IN
 	int ny;
@@ -41,17 +46,18 @@ struct nf2ff_data
 	float* edge_length_P;
 	float* edge_length_PP;
 
-	ArrayLib::ArrayNIJK<std::complex<float>>* E_field;
-	ArrayLib::ArrayNIJK<std::complex<float>>* H_field;
-	ArrayLib::ArrayNIJK<std::complex<float>>* Js;
-	ArrayLib::ArrayNIJK<std::complex<float>>* Ms;
+	std::complex<float>**** E_field;
+	std::complex<float>**** H_field;
+	std::complex<float>**** Js;
+	std::complex<float>**** Ms;
 
 	//local working data OUT
-	ArrayLib::ArrayIJ<std::complex<double>>* m_Nt;
-	ArrayLib::ArrayIJ<std::complex<double>>* m_Np;
-	ArrayLib::ArrayIJ<std::complex<double>>* m_Lt;
-	ArrayLib::ArrayIJ<std::complex<double>>* m_Lp;
-};
+	std::complex<double>** m_Nt;
+	std::complex<double>** m_Np;
+	std::complex<double>** m_Lt;
+	std::complex<double>** m_Lp;
+
+} nf2ff_data;
 
 class nf2ff_calc_thread
 {
@@ -81,16 +87,16 @@ public:
 	double GetTotalRadPower() const {return m_radPower;}
 	double GetMaxDirectivity() const {return m_maxDir;}
 
-	ArrayLib::ArrayIJ<std::complex<double>>* GetETheta() const {return m_E_theta;}
-	ArrayLib::ArrayIJ<std::complex<double>>* GetEPhi()   const {return m_E_phi;}
-	ArrayLib::ArrayIJ<double>* GetRadPower() const {return m_P_rad;}
+	std::complex<double>** GetETheta() const {return m_E_theta;}
+	std::complex<double>** GetEPhi() const {return m_E_phi;}
+	double** GetRadPower() const {return m_P_rad;}
 
 	unsigned int GetNumThreads() const {return m_numThreads;}
 	void SetNumThreads(unsigned int n) {m_numThreads=n;}
 
 	void SetMirror(int type, int dir, float pos);
 
-	bool AddPlane(float **lines, unsigned int* numLines, ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field, int MeshType=0);
+	bool AddPlane(float **lines, unsigned int* numLines, std::complex<float>**** E_field, std::complex<float>**** H_field, int MeshType=0);
 
 protected:
 	float m_freq;
@@ -102,11 +108,11 @@ protected:
 	double m_radPower;
 	double m_maxDir;
 
-	ArrayLib::ArrayIJ<std::complex<double>>* m_E_theta;
-	ArrayLib::ArrayIJ<std::complex<double>>* m_E_phi;
-	ArrayLib::ArrayIJ<std::complex<double>>* m_H_theta;
-	ArrayLib::ArrayIJ<std::complex<double>>* m_H_phi;
-	ArrayLib::ArrayIJ<double>* m_P_rad;
+	std::complex<double>** m_E_theta;
+	std::complex<double>** m_E_phi;
+	std::complex<double>** m_H_theta;
+	std::complex<double>** m_H_phi;
+	double** m_P_rad;
 
 	float m_centerCoord[3];
 	unsigned int m_numTheta;
@@ -115,17 +121,18 @@ protected:
 	float* m_phi;
 
 	//mirror settings
-	MirrorType m_MirrorType[3];
+	bool m_EnableMirror;
+	int m_MirrorType[3];
 	float m_MirrorPos[3];
 
 	int GetNormalDir(unsigned int* numLines);
-	bool AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field, int MeshType=0);
-	bool AddMirrorPlane(int n, float **lines, unsigned int* numLines, ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field, int MeshType=0);
+	bool AddSinglePlane(float **lines, unsigned int* numLines, std::complex<float>**** E_field, std::complex<float>**** H_field, int MeshType=0);
+	bool AddMirrorPlane(int n, float **lines, unsigned int* numLines, std::complex<float>**** E_field, std::complex<float>**** H_field, int MeshType=0);
 
 	//boost multi-threading
 	unsigned int m_numThreads;
-	boost::thread_group m_thread_group;
-	boost::barrier *m_Barrier;
+	std::vector<std::thread> m_threads;
+	Barrier *m_Barrier;
 };
 
 

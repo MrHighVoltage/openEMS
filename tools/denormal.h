@@ -1,9 +1,7 @@
 #ifndef DENORMAL_H
 #define DENORMAL_H
 
-#include <boost/predef.h>
-
-#if BOOST_ARCH_X86
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 #include <xmmintrin.h>
 #endif
 
@@ -21,7 +19,7 @@ namespace Denormal
 
 inline void Denormal::Disable()
 {
-#if BOOST_ARCH_X86
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 	// read the old MXCSR setting
 	unsigned int oldMXCSR = _mm_getcsr();
 

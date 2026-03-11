@@ -21,7 +21,9 @@
 #include "operator_avx2_multithread.h"
 #include "engine_avx2.h"
 
-#include <boost/thread.hpp>
+#include <thread>
+#include <vector>
+#include "tools/barrier.h"
 
 #include "tools/useful.h"
 #if defined(_WIN32) && !defined(__GNUC__)
@@ -84,10 +86,10 @@ protected:
 	Engine_AVX2_Multithread(const Operator_AVX2_Multithread* op);
 	void changeNumThreads(unsigned int numThreads);
 	const Operator_AVX2_Multithread* m_Op_MT;
-	boost::thread_group* m_thread_group;
-	boost::barrier* m_startBarrier;
-	boost::barrier* m_stopBarrier;
-	boost::barrier* m_IterateBarrier;
+	std::vector<std::thread> m_threads;
+	Barrier* m_startBarrier;
+	Barrier* m_stopBarrier;
+	Barrier* m_IterateBarrier;
 	volatile unsigned int m_iterTS;
 	unsigned int m_numThreads;
 	unsigned int m_max_numThreads;

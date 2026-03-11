@@ -19,6 +19,9 @@
 #define ENGINE_CYLINDERMULTIGRID_H
 
 #include "engine_cylinder.h"
+#include <thread>
+#include <vector>
+#include "tools/barrier.h"
 
 class Operator_CylinderMultiGrid;
 class Engine_CylinderMultiGrid_Thread;
@@ -48,16 +51,16 @@ protected:
 	Engine_Multithread* m_InnerEngine;
 
 	volatile unsigned int m_Thread_NumTS;
-	boost::thread_group m_IteratorThread_Group;
-	boost::barrier *m_startBarrier;
-	boost::barrier *m_stopBarrier;
+	std::vector<std::thread> m_IteratorThreads;
+	Barrier *m_startBarrier;
+	Barrier *m_stopBarrier;
 	Engine_CylinderMultiGrid_Thread* m_IteratorThread;
 	Engine_CylinderMultiGrid_Thread* m_InnerIteratorThread;
 
 	//extension barrier
-	boost::barrier *m_WaitOnBase;
-	boost::barrier *m_WaitOnChild;
-	boost::barrier *m_WaitOnSync;
+	Barrier *m_WaitOnBase;
+	Barrier *m_WaitOnChild;
+	Barrier *m_WaitOnSync;
 
 	Engine_Ext_CylinderMultiGrid* m_Eng_Ext_MG;
 
@@ -71,14 +74,14 @@ protected:
 class Engine_CylinderMultiGrid_Thread
 {
 public:
-	Engine_CylinderMultiGrid_Thread( Engine_Multithread* engine, boost::barrier *start, boost::barrier *stop, volatile unsigned int* numTS, bool isBase);
+	Engine_CylinderMultiGrid_Thread( Engine_Multithread* engine, Barrier *start, Barrier *stop, volatile unsigned int* numTS, bool isBase);
 	void operator()();
 
 protected:
 	Engine_Multithread *m_Eng;
 	bool m_isBase;
-	boost::barrier *m_startBarrier;
-	boost::barrier *m_stopBarrier;
+	Barrier *m_startBarrier;
+	Barrier *m_stopBarrier;
 	volatile unsigned int *m_numTS;
 };
 

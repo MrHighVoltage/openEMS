@@ -30,7 +30,7 @@ public:
 	Engine_Ext_CylinderMultiGrid(Operator_Extension* op_ext, bool isBase);
 	virtual ~Engine_Ext_CylinderMultiGrid();
 
-	void SetBarrier(boost::barrier* waitBase, boost::barrier* waitChild, boost::barrier* waitSync);
+	void SetBarrier(Barrier* waitBase, Barrier* waitChild, Barrier* waitSync);
 
 	virtual void DoPreVoltageUpdates();
 	virtual void DoPostVoltageUpdates();
@@ -48,9 +48,9 @@ protected:
 
 	Engine_CylinderMultiGrid* m_Eng_MG;
 
-	boost::barrier *m_WaitOnBase;
-	boost::barrier *m_WaitOnChild;
-	boost::barrier *m_WaitOnSync;
+	Barrier *m_WaitOnBase;
+	Barrier *m_WaitOnChild;
+	Barrier *m_WaitOnSync;
 
 	bool m_IsBase;
 };

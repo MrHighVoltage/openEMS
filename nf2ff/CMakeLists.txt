@@ -37,7 +37,7 @@ set(HEADERS
 
 add_library( nf2ff SHARED ${SOURCES})
 set_target_properties(nf2ff PROPERTIES VERSION ${LIB_VERSION_STRING} SOVERSION ${LIB_VERSION_MAJOR})
-set_target_properties(nf2ff PROPERTIES CXX_STANDARD 11)
+set_target_properties(nf2ff PROPERTIES CXX_STANDARD 17)
 if (WIN32)
     target_compile_definitions(nf2ff PRIVATE -DBUILD_NF2FF_LIB )
 endif (WIN32)
@@ -45,8 +45,8 @@ endif (WIN32)
 TARGET_LINK_LIBRARIES( nf2ff
   ${TinyXML_LIBRARY}
   ${HDF5_LIBRARIES}
-  ${Boost_LIBRARIES}
   ${MPI_LIBRARIES}
+  Threads::Threads
 )
 
 ADD_EXECUTABLE( nf2ff_bin main.cpp )

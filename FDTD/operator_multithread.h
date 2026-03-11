@@ -20,7 +20,9 @@
 
 #include "operator_sse_compressed.h"
 
-#include <boost/thread.hpp>
+#include <thread>
+#include <vector>
+#include "tools/barrier.h"
 
 #ifdef MPI_SUPPORT
 	#define OPERATOR_MULTITHREAD_BASE Operator_MPI
@@ -56,13 +58,13 @@ protected:
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
 
 	//Calc_EC barrier
-	boost::barrier* m_CalcEC_Start;
-	boost::barrier* m_CalcEC_Stop;
+	Barrier* m_CalcEC_Start;
+	Barrier* m_CalcEC_Stop;
 	//CalcPEC barrier
-	boost::barrier* m_CalcPEC_Start;
-	boost::barrier* m_CalcPEC_Stop;
+	Barrier* m_CalcPEC_Start;
+	Barrier* m_CalcPEC_Stop;
 
-	boost::thread_group m_thread_group;
+	std::vector<std::thread> m_threads;
 	unsigned int m_numThreads; // number of worker threads
 	unsigned int m_orig_numThreads;
 

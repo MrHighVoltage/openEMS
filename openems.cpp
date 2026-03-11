@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <iostream>
 #include <fstream>
+#include <thread>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -54,7 +55,6 @@
 #include "Common/processfields_fd.h"
 #include "Common/processfields_sar.h"
 #include <hdf5.h>            // only for H5get_libversion()
-#include <boost/version.hpp> // only for BOOST_LIB_VERSION
 #include <vtkVersion.h>
 
 //external libs
@@ -65,7 +65,6 @@
 #include "CSPropDumpBox.h"
 
 using namespace std;
-namespace po = boost::program_options;
 
 double CalcDiffTime(timeval t1, timeval t2)
 {
@@ -142,209 +141,217 @@ void openEMS::Reset()
 
 void openEMS::collectCommandLineArguments()
 {
-	po::options_description optdesc("Options");
-	optdesc.add_options()
-		(
-			"help,h",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					showUsage();
-					std::exit(0);
-				}
-			),
-			"Show this help message and exit"
-		)
-		(
-			"disable-dumps",
-			po::bool_switch()->notifier(
-				[&](bool val) {
-					if (!val) return;
-					cout << "openEMS - force-disabling all field dumps" << endl;
-					SetEnableDumps(!val);
-				}
-			),
-			"Disable all field dumps for faster simulation"
-		)
-		(
-			"debug-material",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dumping material to 'material_dump.vtk'" << endl;
-					DebugMaterial();
-				}
-			),
-			"Dump material distribution to a vtk file for debugging"
-		)
-		(
-			"debug-PEC",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dumping PEC info to 'PEC_dump.vtk'" << endl;
-					DebugPEC();
-				}
-			),
-			"Dump metal distribution to a vtk file for debugging"
-		)
-		(
-			"debug-operator",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dumping operator to 'operator_dump.vtk'" << endl;
-					DebugOperator();
-				}
-			),
-			"Dump operator to vtk file for debugging"
-		)
-		(
-			"debug-boxes",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dumping boxes to 'box_dump*.vtk'" << endl;
-					DebugBox();
-				}
-			),
-			"Dump e.g. probe boxes to vtk file for debugging"
-		)
-		(
-			"debug-CSX",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dumping CSX geometry to 'debugCSX.xml'" << endl;
-					DebugCSX();
-				}
-			),
-			"Write CSX geometry file to debugCSX.xml"
-		)
-		(
-			"engine",
-			po::value<std::string>()->default_value("fastest")->notifier(
-				[&](std::string val)
-				{
-					if (val == "fastest")
-					{
-						// default, don't show console output
-#ifdef WITH_GPU
-						m_engine = EngineType_GPU;
-#else
-						m_engine = EngineType_AVX2_Multithreaded;
-#endif
-					}
-					else if (val == "basic")
-					{
-						cout << "openEMS - enabled basic engine" << endl;
-						m_engine = EngineType_Basic;
-					}
-					else if (val == "sse")
-					{
-						cout << "openEMS - enabled sse engine" << endl;
-						m_engine = EngineType_SSE;
-					}
-					else if (val == "sse-compressed")
-					{
-						cout << "openEMS - enabled compressed sse engine" << endl;
-						m_engine = EngineType_SSE_Compressed;
-					}
-					else if (val == "multithreaded")
-					{
-						cout << "openEMS - enabled multithreading" << endl;
-						m_engine = EngineType_Multithreaded;
-					}
-#ifdef WITH_GPU
-					else if (val == "gpu")
-					{
-						cout << "openEMS - enabled Vulkan GPU engine" << endl;
-						m_engine = EngineType_GPU;
-					}
-#endif
-					else if (val == "avx2")
-					{
-						cout << "openEMS - enabled AVX2+FMA engine" << endl;
-						m_engine = EngineType_AVX2;
-					}
-					else if (val == "avx2-multithreaded")
-					{
-						cout << "openEMS - enabled AVX2+FMA multithreaded engine" << endl;
-						m_engine = EngineType_AVX2_Multithreaded;
-					}
-				}
-			),
-		    "Choose engine type \n\n"
-			"  fastest: \tfastest available engine (default)\n"
-			"  basic: \tbasic FDTD engine\n"
-			"  sse: \tengine using SSE vector extensions\n"
-			"  sse-compressed: \tengine using compressed "
-			"operator + sse vector extensions\n"
-#ifdef WITH_GPU
-			"  gpu: \tVulkan GPU-accelerated engine\n"
-#endif
-			"  avx2: \tengine using AVX2+FMA vector extensions\n"
-			"  avx2-multithreaded: \tengine using AVX2+FMA + multithreading\n"
-			"  multithreaded: \tengine using compressed "
-#ifdef MPI_SUPPORT
-			"operator + sse vector extensions + MPI + multithreading\n"
-#else
-			"operator + sse vector extensions + multithreading\n"
-#endif
-		)
-		(
-			"numThreads",
-			po::value<int>()->default_value(0)->notifier(
-				[&](int val)
-				{
-					this->SetNumberOfThreads(val);
-					if (val > 0)
-						cout << "openEMS - fixed number of threads: "
-							 << m_engine_numThreads << endl;
-				}
-			),
-			"Force use n threads for multithreaded engine "
-			"(needs: --engine=multithreaded)"
-		)
-		(
-			"no-simulation",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - disabling simulation => preprocessing only" << endl;
-					m_no_simulation = true;
-				}
-			),
-			"only run preprocessing; do not simulate"
-		)
-		(
-			"dump-statistics",
-			po::bool_switch()->notifier(
-				[&](bool val)
-				{
-					if (!val) return;
-					cout << "openEMS - dump simulation statistics to '"
-						 << OPENEMS_RUN_STAT_FILE << "' and '"
-						 << OPENEMS_STAT_FILE << "'" << endl;
-					m_DumpStats = true;
-				}
-			),
-			"dump simulation statistics to '" OPENEMS_RUN_STAT_FILE
-			"' and '" OPENEMS_STAT_FILE "'"
-		);
-
-	// register our supported options to g_settings
 	// see commands in tools/global.h
 	g_settings.clearOptionDesc();
-	g_settings.appendOptionDesc(optdesc);
+
+	// register our supported options to g_settings
+	g_settings.appendOptionDesc(optionDesc());
 	g_settings.appendOptionDesc(g_settings.optionDesc());
+}
+
+OptionDesc
+openEMS::optionDesc()
+{
+	OptionDesc optdesc("Options");
+
+	optdesc.addBoolSwitch("help,h",
+		[this](bool val)
+		{
+			if (!val) return;
+			showUsage();
+			std::exit(0);
+		},
+		"Show this help message and exit"
+	);
+
+	optdesc.addBoolSwitch("disable-dumps",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - force-disabling all field dumps" << endl;
+			SetEnableDumps(!val);
+		},
+		"Disable all field dumps for faster simulation"
+	);
+
+	optdesc.addBoolSwitch("debug-material",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dumping material to 'material_dump.vtk'" << endl;
+			DebugMaterial();
+		},
+		"Dump material distribution to a vtk file for debugging"
+	);
+
+	optdesc.addBoolSwitch("debug-PEC",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dumping PEC info to 'PEC_dump.vtk'" << endl;
+			DebugPEC();
+		},
+		"Dump metal distribution to a vtk file for debugging"
+	);
+
+	optdesc.addBoolSwitch("debug-operator",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dumping operator to 'operator_dump.vtk'" << endl;
+			DebugOperator();
+		},
+		"Dump operator to vtk file for debugging"
+	);
+
+	optdesc.addBoolSwitch("debug-boxes",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dumping boxes to 'box_dump*.vtk'" << endl;
+			DebugBox();
+		},
+		"Dump e.g. probe boxes to vtk file for debugging"
+	);
+
+	optdesc.addBoolSwitch("debug-CSX",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dumping CSX geometry to 'debugCSX.xml'" << endl;
+			DebugCSX();
+		},
+		"Write CSX geometry file to debugCSX.xml"
+	);
+
+	optdesc.addStringOption("engine", "fastest",
+		[this](const std::string& val)
+		{
+			if (val == "fastest")
+			{
+				// default, don't show console output
+#ifdef WITH_GPU
+				m_engine = EngineType_GPU;
+#else
+				m_engine = EngineType_AVX2_Multithreaded;
+#endif
+			}
+			else if (val == "basic")
+			{
+				cout << "openEMS - enabled basic engine" << endl;
+				m_engine = EngineType_Basic;
+			}
+			else if (val == "sse")
+			{
+				cout << "openEMS - enabled sse engine" << endl;
+				m_engine = EngineType_SSE;
+			}
+			else if (val == "sse-compressed")
+			{
+				cout << "openEMS - enabled compressed sse engine" << endl;
+				m_engine = EngineType_SSE_Compressed;
+			}
+			else if (val == "multithreaded")
+			{
+				cout << "openEMS - enabled multithreading" << endl;
+				m_engine = EngineType_Multithreaded;
+			}
+#ifdef WITH_GPU
+			else if (val == "gpu")
+			{
+				cout << "openEMS - enabled Vulkan GPU engine" << endl;
+				m_engine = EngineType_GPU;
+			}
+#endif
+			else if (val == "avx2")
+			{
+				cout << "openEMS - enabled AVX2+FMA engine" << endl;
+				m_engine = EngineType_AVX2;
+			}
+			else if (val == "avx2-multithreaded")
+			{
+				cout << "openEMS - enabled AVX2+FMA multithreaded engine" << endl;
+				m_engine = EngineType_AVX2_Multithreaded;
+			}
+		},
+		"Choose engine type \n\n"
+		"  fastest: \tfastest available engine (default)\n"
+		"  basic: \tbasic FDTD engine\n"
+		"  sse: \tengine using SSE vector extensions\n"
+		"  sse-compressed: \tengine using compressed "
+		"operator + sse vector extensions\n"
+#ifdef WITH_GPU
+		"  gpu: \tVulkan GPU-accelerated engine\n"
+#endif
+		"  avx2: \tengine using AVX2+FMA vector extensions\n"
+		"  avx2-multithreaded: \tengine using AVX2+FMA + multithreading\n"
+		"  multithreaded: \tengine using compressed "
+#ifdef MPI_SUPPORT
+		"operator + sse vector extensions + MPI + multithreading\n"
+#else
+		"operator + sse vector extensions + multithreading\n"
+#endif
+	);
+
+	optdesc.addIntOption("numThreads", 0,
+		[this](int val)
+		{
+			this->SetNumberOfThreads(val);
+			if (val > 0)
+				cout << "openEMS - fixed number of threads: "
+					 << m_engine_numThreads << endl;
+		},
+		"Force use n threads for multithreaded engine "
+		"(needs: --engine=multithreaded)"
+	);
+
+#ifdef WITH_GPU
+	optdesc.addIntOption("gpu-device", -1,
+		[this](int val)
+		{
+			this->SetGPUDevice(val);
+			if (val >= 0)
+				cout << "openEMS - using GPU device index: " << val << endl;
+		},
+		"Select GPU device by index (0-based, -1 = auto-select). "
+		"Use --list-gpu-devices to see available devices."
+	);
+
+	optdesc.addBoolSwitch("list-gpu-devices",
+		[this](bool val)
+		{
+			if (!val) return;
+			Engine_Vulkan::ListGPUDevices();
+			std::exit(0);
+		},
+		"List available Vulkan GPU devices and exit"
+	);
+#endif
+
+	optdesc.addBoolSwitch("no-simulation",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - disabling simulation => preprocessing only" << endl;
+			m_no_simulation = true;
+		},
+		"only run preprocessing; do not simulate"
+	);
+
+	optdesc.addBoolSwitch("dump-statistics",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - dump simulation statistics to '"
+				 << OPENEMS_RUN_STAT_FILE << "' and '"
+				 << OPENEMS_STAT_FILE << "'" << endl;
+			m_DumpStats = true;
+		},
+		"dump simulation statistics to '" OPENEMS_RUN_STAT_FILE
+		"' and '" OPENEMS_STAT_FILE "'"
+	);
+
+	return optdesc;
 }
 
 void openEMS::showUsage()
@@ -364,8 +371,8 @@ void openEMS::SetLibraryArguments(std::vector<std::string> allOptions)
 
 void openEMS::SetNumberOfThreads(int val)
 {
-	if ((val<0) || (val>(int)boost::thread::hardware_concurrency()))
-		val = boost::thread::hardware_concurrency();
+	if ((val<0) || (val>(int)std::thread::hardware_concurrency()))
+		val = std::thread::hardware_concurrency();
 	m_engine_numThreads = val;
 }
 
@@ -390,9 +397,6 @@ string openEMS::GetExtLibsInfo(string prefix)
 	// fparser
 	str << prefix << "\t" << "fparser" << endl;
 
-	// boost
-	str << prefix << "\t" << "boost  -- compiled against: " << BOOST_LIB_VERSION << endl;
-
 	//vtk
 	str << prefix << "\t" << "vtk -- Version: " << vtkVersion::GetVTKMajorVersion() << "." << vtkVersion::GetVTKMinorVersion() << "." << vtkVersion::GetVTKBuildVersion() << endl;
 	str << prefix << "\t" << "       compiled against: " << VTK_VERSION << endl;
@@ -410,7 +414,7 @@ void openEMS::WelcomeScreen()
 
 	cout << " ---------------------------------------------------------------------- " << endl;
 	cout << " | openEMS " << bits << " -- version " << GIT_VERSION << endl;
-	cout << " | (C) 2010-2026 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license"   << endl;
+	cout << " | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license"   << endl;
 	cout << " ---------------------------------------------------------------------- " << endl;
 	cout << openEMS::GetExtLibsInfo("\t") << endl;
 }
@@ -584,16 +588,9 @@ bool openEMS::SetupProcessing()
 				{
 					ProcessModeMatch* pmm = new ProcessModeMatch(NewEngineInterface());
 					pmm->SetFieldType(pb->GetProbeType()-10);
-
-					if (!pb->GetModeFile().empty())
-						pmm->SetWeightFile(pb->GetModeFile());
-					else
-					{
-						pmm->SetWeightFunction(0, pb->GetModeFunction(0));
-						pmm->SetWeightFunction(1, pb->GetModeFunction(1));
-						pmm->SetWeightFunction(2, pb->GetModeFunction(2));
-					}
-					pmm->SetWeightOrigin(pb->GetModeOrigin(0), pb->GetModeOrigin(1), pb->GetModeOrigin(2));
+					pmm->SetModeFunction(0,pb->GetAttributeValue("ModeFunctionX"));
+					pmm->SetModeFunction(1,pb->GetAttributeValue("ModeFunctionY"));
+					pmm->SetModeFunction(2,pb->GetAttributeValue("ModeFunctionZ"));
 					proc = pmm;
 				}
 				else
@@ -862,7 +859,7 @@ bool openEMS::ParseFDTDSetup(std::string file)
 	if (!doc.LoadFile())
 	{
 		cerr << "openEMS: Error File-Loading failed!!! File: " << file << endl;
-		return false;
+		exit(-1);
 	}
 
 	if (g_settings.GetVerboseLevel()>0)
@@ -871,14 +868,14 @@ bool openEMS::ParseFDTDSetup(std::string file)
 	if (openEMSxml==NULL)
 	{
 		cerr << "Can't read openEMS ... " << endl;
-		return false;
+		exit(-1);
 	}
 	TiXmlElement* FDTD_Opts = openEMSxml->FirstChildElement("FDTD");
 
 	if (FDTD_Opts==NULL)
 	{
 		cerr << "Can't read openEMS FDTD Settings... " << endl;
-		return false;
+		exit(-1);
 	}
 
 	if (g_settings.GetVerboseLevel()>0)
@@ -937,8 +934,13 @@ bool openEMS::Parse_XML_FDTDSetup(TiXmlElement* FDTD_Opts)
 	if (BC==NULL)
 	{
 		cerr << "Can't read openEMS boundary cond Settings... " << endl;
-		return false;
+		exit(-3);
 	}
+
+//	const char* tmp = BC->Attribute("PML_Grading");
+//	string pml_gradFunc;
+//	if (tmp)
+//		pml_gradFunc = string(tmp);
 
 	string bound_names[] = {"xmin","xmax","ymin","ymax","zmin","zmax"};
 	string s_bc;
@@ -1172,11 +1174,6 @@ void openEMS::SetCSX(ContinuousStructure* csx)
 	m_CSX = csx;
 }
 
-ContinuousStructure* openEMS::GetCSX() const
-{
-	return m_CSX;
-}
-
 int openEMS::SetupFDTD()
 {
 	timeval startTime;
@@ -1323,7 +1320,7 @@ int openEMS::SetupFDTD()
 		NrTS = maxTime_TS;
 
 	if (!m_Exc->buildExcitationSignal(NrTS))
-		return 2;
+		exit(2);
 	m_Exc->DumpVoltageExcite("et");
 	m_Exc->DumpCurrentExcite("ht");
 
@@ -1455,6 +1452,8 @@ void openEMS::RunFDTD()
 
 	//add all timesteps to end-crit field processing with max excite amplitude
 	unsigned int maxExcite = FDTD_Op->GetExcitationSignal()->GetMaxExcitationTimestep();
+//	for (unsigned int n=0; n<FDTD_Op->Exc->Volt_Count; ++n)
+//		ProcField->AddStep(FDTD_Op->Exc->Volt_delay[n]+maxExcite);
 	ProcField->AddStep(maxExcite);
 
 	double change=1;
@@ -1577,7 +1576,7 @@ void openEMS::RunFDTD()
 				PA->FlushNext();
 
 				if (m_DumpStats)
-					DumpRunStatistics(__OPENEMS_RUN_STAT_FILE__, t_run, currTS, speed, currE);
+					DumpRunStatistics(OPENEMS_RUN_STAT_FILE, t_run, currTS, speed, currE);
 				FDTD_Eng->NextInterval(speed);
 			}
 		}
@@ -1603,6 +1602,7 @@ void openEMS::RunFDTD()
 				maxE=currE;
 		}
 
+//		cout << " do " << step << " steps; current: " << eng.GetNumberOfTimesteps() << endl;
 		currTS = FDTD_Eng->GetNumberOfTimesteps();
 		if ((step<0) || (step>(int)(NrTS - currTS))) step=NrTS - currTS;
 

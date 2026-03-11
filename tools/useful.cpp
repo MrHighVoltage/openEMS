@@ -22,7 +22,7 @@
 #include <climits>
 #include <iomanip>
 #include <sstream>
-#include <boost/algorithm/string.hpp>
+#include <string>
 #include <iostream>
 
 unsigned int CalcNyquistNum(double fmax, double dT)
@@ -72,11 +72,28 @@ std::vector<unsigned int> AssignJobs2Threads(unsigned int jobs, unsigned int nrT
 	return jpt;
 }
 
+static std::vector<std::string> SplitString(const std::string& str, const std::string& delimiters)
+{
+	std::vector<std::string> tokens;
+	std::string::size_type start = 0;
+	while (start < str.size())
+	{
+		auto pos = str.find_first_of(delimiters, start);
+		if (pos == std::string::npos)
+		{
+			tokens.push_back(str.substr(start));
+			break;
+		}
+		tokens.push_back(str.substr(start, pos - start));
+		start = pos + 1;
+	}
+	return tokens;
+}
+
 std::vector<float> SplitString2Float(std::string str, std::string delimiter)
 {
 	std::vector<float> v_f;
-	std::vector<std::string> results;
-	boost::split(results, str, boost::is_any_of(delimiter));
+	auto results = SplitString(str, delimiter);
 
 	for (size_t n=0;n<results.size();++n)
 	{
@@ -91,8 +108,7 @@ std::vector<float> SplitString2Float(std::string str, std::string delimiter)
 std::vector<double> SplitString2Double(std::string str, std::string delimiter)
 {
 	std::vector<double> v_f;
-	std::vector<std::string> results;
-	boost::split(results, str, boost::is_any_of(delimiter));
+	auto results = SplitString(str, delimiter);
 
 	for (size_t n=0;n<results.size();++n)
 	{

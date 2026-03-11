@@ -45,8 +45,7 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	m_IterateBarrier = nullptr;
 	m_startBarrier = nullptr;
 	m_stopBarrier = nullptr;
-	m_thread_group = nullptr;
-	m_max_numThreads = boost::thread::hardware_concurrency();
+	m_max_numThreads = std::thread::hardware_concurrency();
 	m_numThreads = 0;
 	m_last_speed = 0;
 	m_opt_speed = false;
@@ -84,20 +83,20 @@ void Engine_AVX2_Multithread::Init()
 
 void Engine_AVX2_Multithread::Reset()
 {
-	if (m_thread_group != nullptr)
+	if (!m_threads.empty())
 	{
 		ClearExtensions();
 
-		m_thread_group->interrupt_all();
-		m_thread_group->join_all();
+		m_stopThreads = true;
+		m_startBarrier->wait();
+		for (auto& t : m_threads) t.join();
+		m_threads.clear();
 		delete m_IterateBarrier;
 		m_IterateBarrier = nullptr;
 		delete m_startBarrier;
 		m_startBarrier = nullptr;
 		delete m_stopBarrier;
 		m_stopBarrier = nullptr;
-		delete m_thread_group;
-		m_thread_group = nullptr;
 	}
 
 	Engine_AVX2::Reset();
@@ -105,15 +104,16 @@ void Engine_AVX2_Multithread::Reset()
 
 void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 {
-	if (m_thread_group != nullptr)
+	if (!m_threads.empty())
 	{
-		m_thread_group->interrupt_all();
-		m_thread_group->join_all();
-		delete m_thread_group;
-		m_thread_group = nullptr;
+		m_stopThreads = true;
+		m_startBarrier->wait();
+		for (auto& t : m_threads) t.join();
+		m_threads.clear();
 	}
 
 	m_numThreads = numThreads;
+	m_stopThreads = false;
 
 	if (g_settings.GetVerboseLevel() > 0)
 		cout << "AVX2 multithreaded engine using " << m_numThreads << " threads. Utilization: (";
@@ -123,15 +123,14 @@ void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 	m_Op_MT->CalcStartStopLines(m_numThreads, m_Start_Lines, m_Stop_Lines);
 
 	delete m_IterateBarrier;
-	m_IterateBarrier = new boost::barrier(m_numThreads);
+	m_IterateBarrier = new Barrier(m_numThreads);
 
 	delete m_startBarrier;
-	m_startBarrier = new boost::barrier(m_numThreads + 1);
+	m_startBarrier = new Barrier(m_numThreads + 1);
 
 	delete m_stopBarrier;
-	m_stopBarrier = new boost::barrier(m_numThreads + 1);
+	m_stopBarrier = new Barrier(m_numThreads + 1);
 
-	m_thread_group = new boost::thread_group();
 	for (unsigned int n = 0; n < m_numThreads; n++)
 	{
 		unsigned int start = m_Start_Lines.at(n);
@@ -148,10 +147,9 @@ void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 			if (g_settings.GetVerboseLevel() > 0)
 				cout << stop - start + 1 << ";";
 
-		boost::thread* t = new boost::thread(
+		m_threads.emplace_back(
 			NS_Engine_AVX2_Multithread::thread(this, start, stop, stop_h, n)
 		);
-		m_thread_group->add_thread(t);
 	}
 
 	for (size_t n = 0; n < m_Eng_exts.size(); ++n)

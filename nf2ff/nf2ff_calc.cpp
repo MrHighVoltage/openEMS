@@ -206,7 +206,7 @@ nf2ff_calc::nf2ff_calc(float freq, vector<float> theta, vector<float> phi, vecto
 	}
 
 	m_Barrier = NULL;
-	m_numThreads = boost::thread::hardware_concurrency();
+	m_numThreads = std::thread::hardware_concurrency();
 }
 
 nf2ff_calc::~nf2ff_calc()
@@ -419,7 +419,7 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 	vector<unsigned int> jpt = AssignJobs2Threads(numLines[nP], m_numThreads, true);
 	m_numThreads = jpt.size();
 	nf2ff_data* thread_data = new nf2ff_data[m_numThreads];
-	m_Barrier = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+	m_Barrier = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 	unsigned int start=0;
 	unsigned int stop=jpt.at(0)-1;
 	for (unsigned int n=0; n<m_numThreads; n++)
@@ -440,9 +440,7 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 		thread_data[n].m_Lt=new ArrayLib::ArrayIJ<complex<double> >("Lt", numAngles);
 		thread_data[n].m_Lp=new ArrayLib::ArrayIJ<complex<double> >("Lp", numAngles);
 
-		boost::thread *t = new boost::thread( nf2ff_calc_thread(this,start,stop,n,thread_data[n]) );
-
-		m_thread_group.add_thread( t );
+		m_threads.emplace_back( nf2ff_calc_thread(this,start,stop,n,thread_data[n]) );
 
 		start = stop+1;
 		if (n<m_numThreads-1)
@@ -479,7 +477,8 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 	}
 
 	m_Barrier->wait(); //wait for termination
-	m_thread_group.join_all(); // wait for termination
+	for (auto& t : m_threads) t.join();
+	m_threads.clear();
 	delete m_Barrier;
 	m_Barrier = NULL;
 

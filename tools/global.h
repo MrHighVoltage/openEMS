@@ -20,7 +20,7 @@
 #define GLOBAL_H
 
 #include <sstream>
-#include <boost/program_options.hpp>
+#include "option_parser.h"
 #define _USE_MATH_DEFINES
 
 #include "openems_global.h"
@@ -86,11 +86,11 @@ public:
 
 	// Return a list of supported options. If a class accepts options,
 	// it should have its own method.
-	boost::program_options::options_description optionDesc();
+	OptionDesc optionDesc();
 
 	// The optionDesc() of all classes are collected by openems.cpp by
 	// calling appendOptionDesc.
-	void appendOptionDesc(boost::program_options::options_description desc);
+	void appendOptionDesc(OptionDesc desc);
 
 	// If multiple openEMS() instances are created within the application, two
 	// problem occurs. First, identical optionDesc are registered to Global()
@@ -123,7 +123,6 @@ public:
 	// Set, get, and clear options, provide access of options to all modules
 	// globally.
 	bool hasOption(std::string option);
-	boost::program_options::variable_value getOption(std::string option);
 	void clearOptions();
 
 protected:
@@ -133,8 +132,7 @@ protected:
 	int m_VerboseLevel;
 	int m_SavedVerboseLevel;
 
-	boost::program_options::variables_map m_options;
-	boost::program_options::options_description* m_optionDesc;
+	OptionDesc* m_optionDesc;
 };
 
 OPENEMS_EXPORT extern Global g_settings;
