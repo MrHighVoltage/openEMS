@@ -23,12 +23,9 @@ function RunOpenEMS(Sim_Path, Sim_File, opts, Settings)
 %          --engine=basic           basic FDTD engine
 %          --engine=sse             engine using sse vector extensions
 %          --engine=sse-compressed  engine using compressed operator + sse vector extensions
-%          --engine=gpu             Vulkan GPU-accelerated engine
 %          --engine=MPI             engine using compressed operator + sse vector extensions + MPI parallel processing
 %          --engine=multithreaded   engine using compressed operator + sse vector extensions + MPI + multithreading
 %      --numThreads=<n>     Force use n threads for multithreaded engine
-%      --gpu-device=<n>     Select GPU device by index (0-based, -1 = auto-select)
-%      --list-gpu-devices   List available Vulkan GPU devices and exit
 %      --no-simulation      only run preprocessing; do not simulate
 %      --dump-statistics    dump simulation statistics to 'openEMS_run_stats.txt' and 'openEMS_stats.txt'
 %

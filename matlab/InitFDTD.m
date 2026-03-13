@@ -16,8 +16,6 @@ function FDTD = InitFDTD(varargin)
 % - TimeStepMethod: 1 or 3 chose timestep method (1=CFL, 3=Rennigs (default))
 % - CellConstantMaterial: set to 1 to assume a material is constant inside
 %                         a cell (material probing in cell center)
-% - GPUDevice:            select GPU device index (0-based) for the Vulkan
-%                         engine (-1 = auto-select, default)
 %
 % examples:
 %
@@ -29,9 +27,6 @@ function FDTD = InitFDTD(varargin)
 %
 %     %cylindrical FDTD simulation
 %     FDTD = InitFDTD('CoordSystem', 1);
-%
-%     %GPU simulation on second GPU device (index 1)
-%     FDTD = InitFDTD('GPUDevice', 1);
 %
 % See also InitCSX
 %
