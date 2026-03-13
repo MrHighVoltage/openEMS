@@ -90,7 +90,6 @@ openEMS::openEMS()
 
 	m_engine = EngineType_AVX2_Multithreaded; //default engine type
 	m_engine_numThreads = 0;
-	m_gpuDevice = -1; // auto-select GPU
 
 	m_Abort = false;
 	m_Exc = 0;
@@ -310,9 +309,9 @@ openEMS::optionDesc()
 	optdesc.addIntOption("gpu-device", -1,
 		[this](int val)
 		{
-			if (val < 0) return; // default: keep existing m_gpuDevice
 			this->SetGPUDevice(val);
-			cout << "openEMS - using GPU device index: " << val << endl;
+			if (val >= 0)
+				cout << "openEMS - using GPU device index: " << val << endl;
 		},
 		"Select GPU device by index (0-based, -1 = auto-select). "
 		"Use --list-gpu-devices to see available devices."
@@ -931,11 +930,6 @@ bool openEMS::Parse_XML_FDTDSetup(TiXmlElement* FDTD_Opts)
 	if (FDTD_Opts->QueryIntAttribute("CellConstantMaterial",&ihelp)==TIXML_SUCCESS)
 		this->SetCellConstantMaterial(ihelp==1);
 
-	// GPU device selection (from XML attribute, e.g. MATLAB's InitFDTD)
-	ihelp = -1;
-	if (FDTD_Opts->QueryIntAttribute("GPUDevice",&ihelp)==TIXML_SUCCESS)
-		this->SetGPUDevice(ihelp);
-
 	TiXmlElement* BC = FDTD_Opts->FirstChildElement("BoundaryCond");
 	if (BC==NULL)
 	{
@@ -1370,10 +1364,6 @@ int openEMS::SetupFDTD()
 	}
 
 	//create FDTD engine
-#ifdef WITH_GPU
-	if (m_engine == EngineType_GPU)
-		Engine_Vulkan::SetRequestedGPUDevice(m_gpuDevice);
-#endif
 	FDTD_Eng = FDTD_Op->CreateEngine();
 
 	if (Op_Ext_SSD)
@@ -1504,27 +1494,50 @@ void openEMS::RunFDTD()
 		gpuEng->SetupProbeCache(PA);
 	}
 
-	// Use probe-cache-assisted loop if probe gather is set up and no CPU extensions.
-	// The probe gather shader (appended to IterateTS command buffer) replaces
-	// scattered PCIe BAR reads with a compact buffer readback.
-	// Using speculative submission to overlap GPU compute with CPU processing.
+	// Use pipelined loop if probe gather is set up and no CPU extensions
 	if (gpuEng && gpuEng->HasPipelinedProcessing())
 	{
+		// ====== Pipelined GPU main loop ======
+		// Pipeline: GPU computes TS(N+1) while CPU processes TS(N).
+		//
+		// Prime: run first batch, drain, snapshot.
+		FDTD_Eng->IterateTS(step);                   // submit first batch
+		gpuEng->DrainGPU();                           // wait for first batch
+		gpuEng->SnapshotProbeCache();                 // capture probe results
+
 		while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
 		{
-			// Submit FDTD batch speculatively without waiting
-			// GPU will work on next batch while CPU processes
-			gpuEng->SubmitSpeculative(step);
-			gpuEng->EnablePipelinedReading(true);  // PA->Process reads from CPU cache
+			// Submit 1 speculative timestep (GPU starts, numTS NOT advanced)
+			gpuEng->SubmitSpeculative(1);
+
+			// Process the PREVIOUS batch's probe data (GPU concurrent)
+			gpuEng->EnablePipelinedReading(true);
 			step = PA->Process();
 			gpuEng->EnablePipelinedReading(false);
-			// Drain GPU, commit timestep count, and snapshot probe cache
+
+			// Drain+commit speculative step → advance numTS by 1
 			gpuEng->DrainGPU();
 			gpuEng->CommitSpeculative();
 			gpuEng->SnapshotProbeCache();
 
+			// If step > 1, we need (step-1) more timesteps before next Process
+			if (step > 1)
+			{
+				int remaining = step - 1;
+				currTS = FDTD_Eng->GetNumberOfTimesteps();
+				if (remaining > (int)(NrTS - currTS)) remaining = NrTS - currTS;
+				if (remaining > 0)
+				{
+					FDTD_Eng->IterateTS(remaining);
+					gpuEng->DrainGPU();
+					gpuEng->SnapshotProbeCache();
+				}
+			}
+
+			// --- Energy estimation ---
 			if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
 			{
+				// Energy computation needs full field access — disable pipelined reading
 				currE = ProcField->CalcTotalEnergyEstimate();
 				if (currE>maxE)
 					maxE=currE;
@@ -1533,6 +1546,7 @@ void openEMS::RunFDTD()
 			currTS = FDTD_Eng->GetNumberOfTimesteps();
 			if ((step<0) || (step>(int)(NrTS - currTS))) step=NrTS - currTS;
 
+			// --- Timing and status output ---
 			gettimeofday(&currTime,NULL);
 			t_diff = CalcDiffTime(currTime,prevTime);
 
@@ -1566,6 +1580,11 @@ void openEMS::RunFDTD()
 				FDTD_Eng->NextInterval(speed);
 			}
 		}
+
+		// Final process for the last snapshot
+		gpuEng->EnablePipelinedReading(true);
+		PA->Process();
+		gpuEng->EnablePipelinedReading(false);
 	}
 	else
 #endif

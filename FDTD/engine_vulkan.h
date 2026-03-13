@@ -52,14 +52,6 @@ public:
 	static Engine_Vulkan* New(const Operator* op);
 	virtual ~Engine_Vulkan();
 
-	//! Set the GPU device index to use (0-based).  -1 = auto-select (default).
-	//! Must be called before New() / Init().
-	static void SetRequestedGPUDevice(int idx) { s_requestedGPUDevice = idx; }
-	//! Get the currently configured GPU device index (-1 = auto).
-	static int  GetRequestedGPUDevice()         { return s_requestedGPUDevice; }
-	//! List all Vulkan-capable physical devices to stdout and return the count.
-	static unsigned int ListGPUDevices();
-
 	virtual void Init();
 	virtual void Reset();
 
@@ -492,9 +484,6 @@ private:
 	struct EnergyPC { uint32_t N; uint32_t numWG; };
 	void SetupGPU_EnergyReduction();     //!< Create energy reduction resources
 	void CleanupGPU_EnergyReduction();   //!< Destroy energy reduction resources
-
-	// ---- Requested GPU device index (static, set before construction) --
-	static int s_requestedGPUDevice; //!< -1 = auto-select discrete GPU
 
 	// ---- Async processing thread --------------------------------------
 	std::thread             m_asyncThread;
