@@ -45,6 +45,9 @@ cdef extern from "openEMS/openems.h":
 
         void SetLibraryArguments(vector[string] allOptions) except +
 
+        void SetGPUDevice(int val)
+        int  GetGPUDevice()
+
         void Set_BC_Type(int idx, int _type)
         int Get_BC_Type(int idx)
         void Set_BC_PML(int idx, unsigned int size)
