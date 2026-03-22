@@ -50,6 +50,13 @@ class Engine_Vulkan : public Engine
 {
 public:
 	static Engine_Vulkan* New(const Operator* op);
+	//! Prefer ReBAR HOST_VISIBLE allocations for main field buffers.
+	//! When false, volt/curr stay device-local for maximum dGPU bandwidth.
+	static void SetPreferReBARFieldBuffers(bool prefer) { s_preferReBARFieldBuffers = prefer; }
+	static bool GetPreferReBARFieldBuffers() { return s_preferReBARFieldBuffers; }
+	//! Enable per-batch GPU timestamp profiling and fence-wait accounting.
+	static void SetEnableProfiling(bool enable) { s_enableProfiling = enable; }
+	static bool GetEnableProfiling() { return s_enableProfiling; }
 	virtual ~Engine_Vulkan();
 
 	virtual void Init();
@@ -247,6 +254,21 @@ private:
 	// ---- Pipeline cache (faster shader load on restart) ---------------
 	VkPipelineCache m_pipelineCache;
 
+	// ---- Runtime configuration (static) ---------------------------------
+	static bool s_preferReBARFieldBuffers;
+	static bool s_enableProfiling;
+
+	// ---- Optional profiling ---------------------------------------------
+	bool m_profileEnabled = false;
+	VkQueryPool m_tsQueryPool = VK_NULL_HANDLE;  //!< 4 queries: 2 per command slot
+	float m_timestampPeriodNs = 0.0f;
+	bool m_profilePending[2] = {false, false};
+	unsigned int m_profileSubmittedTS[2] = {0, 0};
+	mutable uint64_t m_profileBatchCount = 0;
+	mutable uint64_t m_profileTSCount = 0;
+	mutable double m_profileGpuMs = 0.0;
+	mutable double m_profileWaitMs = 0.0;
+
 	// ---- Internal helpers ---------------------------------------------
 	void InitVulkan();
 	void CreateBuffers();
@@ -255,6 +277,9 @@ private:
 	void UploadCoefficients();
 	void SetupGPUExcitation();
 	void CleanupVulkan();
+	void SetupProfiling();
+	void CollectProfileForSlot(int slot) const;
+	void PrintProfileSummary() const;
 
 	//! Submit any pending batched GPU command buffer and wait for completion.
 	//! Used only by hybrid path and non-ReBAR fallback.
@@ -465,8 +490,11 @@ private:
 	GpuBuf m_probeIdxBuf;              //!< GPU probe index buffer
 	GpuBuf m_probeSelBuf;              //!< GPU field selector (0=volt, 1=curr)
 	GpuBuf m_probeOutBuf;              //!< GPU probe output buffer (HOST_VISIBLE)
+	GpuBuf m_probeReadbackBuf[2];      //!< Per-submit-slot host-visible probe readback ring
 	GpuBuf m_probeStagingBuf;          //!< Staging buffer for non-ReBAR probe download
 	float* m_probeOutMapped = nullptr;  //!< ReBAR-mapped probe output (or nullptr)
+	float* m_probeReadbackMapped[2] = {nullptr, nullptr}; //!< Persistently mapped readback ring
+	int m_lastProbeSubmitSlot = 0;      //!< Last submitted cmd slot carrying probe results
 	VkDescriptorSet  m_probeGatherDescSet = VK_NULL_HANDLE;
 	VkDescriptorPool m_probeDescPool     = VK_NULL_HANDLE;
 	unsigned int m_speculativeTS = 0;   //!< Timesteps in speculative batch

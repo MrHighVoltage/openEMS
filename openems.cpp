@@ -20,6 +20,7 @@
 #include <iostream>
 #include <fstream>
 #include <thread>
+#include <cstdlib>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -306,25 +307,24 @@ openEMS::optionDesc()
 	);
 
 #ifdef WITH_GPU
-	optdesc.addIntOption("gpu-device", -1,
-		[this](int val)
-		{
-			this->SetGPUDevice(val);
-			if (val >= 0)
-				cout << "openEMS - using GPU device index: " << val << endl;
-		},
-		"Select GPU device by index (0-based, -1 = auto-select). "
-		"Use --list-gpu-devices to see available devices."
-	);
-
-	optdesc.addBoolSwitch("list-gpu-devices",
+	optdesc.addBoolSwitch("gpu-no-rebar-fields",
 		[this](bool val)
 		{
 			if (!val) return;
-			Engine_Vulkan::ListGPUDevices();
-			std::exit(0);
+			Engine_Vulkan::SetPreferReBARFieldBuffers(false);
+			cout << "openEMS - GPU field buffers forced to DEVICE_LOCAL (ReBAR disabled for volt/curr)" << endl;
 		},
-		"List available Vulkan GPU devices and exit"
+		"Use DEVICE_LOCAL memory for GPU field buffers instead of ReBAR HOST_VISIBLE mappings"
+	);
+
+	optdesc.addBoolSwitch("gpu-profile",
+		[this](bool val)
+		{
+			if (!val) return;
+			Engine_Vulkan::SetEnableProfiling(true);
+			cout << "openEMS - enabled Vulkan GPU profiling (timestamp queries)" << endl;
+		},
+		"Enable Vulkan GPU batch profiling (GPU timestamp + fence wait summary)"
 	);
 #endif
 
@@ -1497,6 +1497,43 @@ void openEMS::RunFDTD()
 	// Use pipelined loop if probe gather is set up and no CPU extensions
 	if (gpuEng && gpuEng->HasPipelinedProcessing())
 	{
+		int gpuSpecDepth = 1;
+		bool gpuSpecAuto = false;
+		int gpuSpecMaxDepth = 64;
+		if (const char* envSpecDepth = std::getenv("OPENEMS_GPU_SPEC_DEPTH"))
+		{
+			string specStr(envSpecDepth);
+			if (specStr == "auto" || specStr == "AUTO" || specStr == "Auto")
+			{
+				gpuSpecAuto = true;
+			}
+			else
+			{
+				int parsedDepth = atoi(envSpecDepth);
+				if (parsedDepth > 0)
+					gpuSpecDepth = parsedDepth;
+				else if (parsedDepth == 0)
+					gpuSpecAuto = true;  // allow "0" as shorthand for auto
+				else
+					cerr << "RunFDTD: Warning: invalid OPENEMS_GPU_SPEC_DEPTH='" << envSpecDepth
+					     << "' (use >=1, 0, or auto). Using default depth=1." << endl;
+			}
+		}
+		if (const char* envSpecMaxDepth = std::getenv("OPENEMS_GPU_SPEC_MAX_DEPTH"))
+		{
+			int parsedMaxDepth = atoi(envSpecMaxDepth);
+			if (parsedMaxDepth > 0)
+				gpuSpecMaxDepth = parsedMaxDepth;
+			else
+				cerr << "RunFDTD: Warning: invalid OPENEMS_GPU_SPEC_MAX_DEPTH='" << envSpecMaxDepth
+				     << "' (must be >=1). Using default max depth=64." << endl;
+		}
+
+		if (gpuSpecAuto)
+			cout << "RunFDTD: GPU speculative depth set to AUTO (max " << gpuSpecMaxDepth << ")" << endl;
+		else if (gpuSpecDepth > 1)
+			cout << "RunFDTD: GPU speculative depth set to " << gpuSpecDepth << endl;
+
 		// ====== Pipelined GPU main loop ======
 		// Pipeline: GPU computes TS(N+1) while CPU processes TS(N).
 		//
@@ -1507,23 +1544,33 @@ void openEMS::RunFDTD()
 
 		while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
 		{
-			// Submit 1 speculative timestep (GPU starts, numTS NOT advanced)
-			gpuEng->SubmitSpeculative(1);
+			// Submit speculative timesteps (GPU starts, numTS NOT advanced).
+			// Auto mode uses PA->Process() cadence: submit up to the next processing
+			// horizon so probe gathers / dumps still happen on schedule.
+			int speculativeNow = gpuSpecAuto ? step : gpuSpecDepth;
+			if (speculativeNow > gpuSpecMaxDepth) speculativeNow = gpuSpecMaxDepth;
+			// Clamp to requested processing cadence and remaining global timesteps.
+			if (step > 0 && speculativeNow > step) speculativeNow = step;
+			currTS = FDTD_Eng->GetNumberOfTimesteps();
+			int tsLeft = (int)(NrTS - currTS);
+			if (speculativeNow > tsLeft) speculativeNow = tsLeft;
+			if (speculativeNow < 1) break;
+			gpuEng->SubmitSpeculative((unsigned int)speculativeNow);
 
 			// Process the PREVIOUS batch's probe data (GPU concurrent)
 			gpuEng->EnablePipelinedReading(true);
 			step = PA->Process();
 			gpuEng->EnablePipelinedReading(false);
 
-			// Drain+commit speculative step → advance numTS by 1
+			// Drain+commit speculative step(s) → advance numTS
 			gpuEng->DrainGPU();
 			gpuEng->CommitSpeculative();
 			gpuEng->SnapshotProbeCache();
 
-			// If step > 1, we need (step-1) more timesteps before next Process
-			if (step > 1)
+			// If step > speculativeNow, we need extra timesteps before next Process.
+			if (step > speculativeNow)
 			{
-				int remaining = step - 1;
+				int remaining = step - speculativeNow;
 				currTS = FDTD_Eng->GetNumberOfTimesteps();
 				if (remaining > (int)(NrTS - currTS)) remaining = NrTS - currTS;
 				if (remaining > 0)

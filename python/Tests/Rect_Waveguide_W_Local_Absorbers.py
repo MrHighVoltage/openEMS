@@ -6,9 +6,43 @@
 """
 
 ### Import Libraries
-import os, tempfile
-from pylab import *
+import os
 import sys
+import tempfile
+
+
+def _bootstrap_local_openems_runtime():
+    """Prefer freshly built openEMS libs from the local build directory.
+
+    This must run before importing CSXCAD/openEMS C-extension modules.
+    Set OPENEMS_USE_LOCAL_BUILD=0 to disable this behavior.
+    """
+    if os.environ.get("OPENEMS_USE_LOCAL_BUILD", "1") == "0":
+        return
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    build_dir = os.path.join(repo_root, "build")
+    libopenems = os.path.join(build_dir, "libopenEMS.so")
+
+    if not os.path.exists(libopenems):
+        return
+
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    paths = [p for p in cur.split(":") if p]
+
+    if paths and os.path.abspath(paths[0]) == os.path.abspath(build_dir):
+        return
+
+    paths = [p for p in paths if os.path.abspath(p) != os.path.abspath(build_dir)]
+    os.environ["LD_LIBRARY_PATH"] = ":".join([build_dir] + paths)
+
+    # Re-exec so the dynamic loader uses the updated library search path.
+    os.execvpe(sys.executable, [sys.executable] + sys.argv, os.environ)
+
+
+_bootstrap_local_openems_runtime()
+
+from pylab import *
 
 from CSXCAD  import ContinuousStructure
 from openEMS import openEMS
@@ -112,7 +146,7 @@ mesh.SmoothMeshLines('all', mesh_res, ratio=1.4)
 #Et.AddBox(start, stop);
 
 ### Run the simulation
-if 1:  # debugging only
+if os.environ.get("OPENEMS_SHOW_CSXCAD", "0") == "1":
     CSX_file = os.path.join(Sim_Path, 'rect_wg.xml')
     if not os.path.exists(Sim_Path):
         os.mkdir(Sim_Path)
@@ -121,7 +155,15 @@ if 1:  # debugging only
     os.system(AppCSXCAD_BIN + ' "{}"'.format(CSX_file))
 
 if not post_proc_only:
-    FDTD.Run(Sim_Path, cleanup=True, engine="gpu")
+    gpu_profile = os.environ.get("OPENEMS_GPU_PROFILE", "0") == "1"
+    print(f"GPU config: no-ReBAR fields=True, profiling={gpu_profile}")
+    FDTD.Run(
+        Sim_Path,
+        cleanup=True,
+        engine="gpu",
+        gpu_no_rebar_fields=True,
+        gpu_profile=gpu_profile,
+    )
 
 ### Postprocessing & plotting
 freq = linspace(f_start,f_stop,201)

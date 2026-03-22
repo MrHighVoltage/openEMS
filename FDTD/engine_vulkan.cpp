@@ -34,10 +34,14 @@
 #include <stdexcept>
 #include <functional>
 #include <algorithm>
+#include <chrono>
 
 using std::cerr;
 using std::cout;
 using std::endl;
+
+bool Engine_Vulkan::s_preferReBARFieldBuffers = true;
+bool Engine_Vulkan::s_enableProfiling = false;
 
 // ---------------------------------------------------------------------------
 // Vulkan error checking
@@ -192,10 +196,14 @@ void Engine_Vulkan::Init()
 		cout << "  ReBAR active — zero-copy CPU field reads from VRAM" << endl;
 	else
 		cout << "  ReBAR not available — using staging buffer for field sync" << endl;
+	if (!s_preferReBARFieldBuffers)
+		cout << "  Field-buffer ReBAR disabled by configuration (device-local volt/curr)" << endl;
 	if (m_hasCPUExtensions)
 		cout << "  WARNING: CPU extensions present — hybrid mode (slower)" << endl;
 	else
 		cout << "  Pure GPU mode — double-buffered fire-and-forget submission" << endl;
+	if (m_profileEnabled)
+		cout << "  GPU profiling enabled (timestamp queries + fence wait accounting)" << endl;
 	if (m_hasGPU_UPML)
 		cout << "  GPU UPML active (" << m_gpuUPML.size() << " region(s))" << endl;
 	if (m_hasFusedUPML)
@@ -315,6 +323,89 @@ void Engine_Vulkan::InitVulkan()
 	VkPipelineCacheCreateInfo cacheInfo{};
 	cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
 	VK_CHECK(vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &m_pipelineCache));
+
+	SetupProfiling();
+}
+
+void Engine_Vulkan::SetupProfiling()
+{
+	m_profileEnabled = false;
+	if (!s_enableProfiling)
+		return;
+
+	uint32_t qfCount = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, nullptr);
+	if (qfCount == 0 || m_computeQueueFamily >= qfCount)
+		return;
+
+	std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+	vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, qfProps.data());
+	if (qfProps[m_computeQueueFamily].timestampValidBits == 0)
+	{
+		cerr << "Engine_Vulkan: GPU profiling requested, but queue timestamps are unsupported." << endl;
+		return;
+	}
+
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(m_physDevice, &props);
+	m_timestampPeriodNs = props.limits.timestampPeriod;
+
+	VkQueryPoolCreateInfo qpi{};
+	qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+	qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+	qpi.queryCount = 4; // 2 queries per command slot
+	VK_CHECK(vkCreateQueryPool(m_device, &qpi, nullptr, &m_tsQueryPool));
+
+	m_profileEnabled = true;
+}
+
+void Engine_Vulkan::CollectProfileForSlot(int slot) const
+{
+	if (!m_profileEnabled || !m_tsQueryPool || slot < 0 || slot > 1 || !m_profilePending[slot])
+		return;
+
+	uint64_t ts[2] = {0, 0};
+	VkResult r = vkGetQueryPoolResults(
+		m_device,
+		m_tsQueryPool,
+		(uint32_t)(slot * 2),
+		2,
+		sizeof(ts),
+		ts,
+		sizeof(uint64_t),
+		VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+	if (r == VK_SUCCESS && ts[1] >= ts[0])
+	{
+		double gpuNs = (double)(ts[1] - ts[0]) * (double)m_timestampPeriodNs;
+		m_profileGpuMs += gpuNs * 1e-6;
+		m_profileBatchCount++;
+		m_profileTSCount += m_profileSubmittedTS[slot];
+	}
+
+	const_cast<Engine_Vulkan*>(this)->m_profilePending[slot] = false;
+	const_cast<Engine_Vulkan*>(this)->m_profileSubmittedTS[slot] = 0;
+}
+
+void Engine_Vulkan::PrintProfileSummary() const
+{
+	if (!m_profileEnabled || m_profileBatchCount == 0)
+		return;
+
+	double avgBatchMs = m_profileGpuMs / (double)m_profileBatchCount;
+	double avgTsUs = (m_profileTSCount > 0)
+	               ? (m_profileGpuMs * 1000.0) / (double)m_profileTSCount
+	               : 0.0;
+	double waitPerBatchMs = m_profileWaitMs / (double)m_profileBatchCount;
+
+	cout << "Engine_Vulkan profiling summary:" << endl;
+	cout << "  Batches: " << m_profileBatchCount
+	     << ", timesteps: " << m_profileTSCount << endl;
+	cout << "  GPU time: " << m_profileGpuMs << " ms total"
+	     << ", avg " << avgBatchMs << " ms/batch"
+	     << ", " << avgTsUs << " us/TS" << endl;
+	cout << "  Fence wait: " << m_profileWaitMs << " ms total"
+	     << ", avg " << waitPerBatchMs << " ms/batch" << endl;
 }
 
 // ===========================================================================
@@ -395,6 +486,7 @@ void Engine_Vulkan::CreateBuffers()
 	                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	// Probe whether a suitable memory type exists for the volt buffer
+	if (s_preferReBARFieldBuffers)
 	{
 		VkBufferCreateInfo ci{};
 		ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1802,6 +1894,21 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 	// from the cell accesses captured during the initial PA->Process().
 	m_recordingProbeAccess = false;
 
+	// Probe resources are used even when there are no other GPU extensions.
+	// In that case SetupGPUExtensions() may have skipped creating layouts.
+	if (m_probeDescLayout == VK_NULL_HANDLE)
+	{
+		VkDescriptorSetLayoutBinding bindings[5];
+		for (uint32_t i = 0; i < 5; ++i)
+			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+
+		VkDescriptorSetLayoutCreateInfo ci{};
+		ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		ci.bindingCount = 5;
+		ci.pBindings = bindings;
+		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &m_probeDescLayout));
+	}
+
 	if (m_recordedCells.empty())
 	{
 		cerr << "[Vulkan] No probe cell accesses recorded — pipelining disabled." << endl;
@@ -1874,8 +1981,38 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 	{
 		VkMemoryPropertyFlags hostVis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 		                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		CreateGpuBuf(m_probeStagingBuf, outSize,
-		             VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
+
+		// Create a small 2-slot host-visible readback ring (matching m_cmdBufs slots).
+		// This allows probe transfers to be recorded in the main command buffer,
+		// so SnapshotProbeCache() can memcpy directly without a blocking submit.
+		bool ringReady = true;
+		for (int i = 0; i < 2; ++i)
+		{
+			CreateGpuBuf(m_probeReadbackBuf[i], outSize,
+			             VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
+			VkResult mr = vkMapMemory(m_device, m_probeReadbackBuf[i].memory, 0, outSize, 0,
+			                          (void**)&m_probeReadbackMapped[i]);
+			if (mr != VK_SUCCESS)
+			{
+				ringReady = false;
+				break;
+			}
+		}
+
+		if (!ringReady)
+		{
+			for (int i = 0; i < 2; ++i)
+			{
+				if (m_probeReadbackMapped[i])
+				{
+					vkUnmapMemory(m_device, m_probeReadbackBuf[i].memory);
+					m_probeReadbackMapped[i] = nullptr;
+				}
+				DestroyGpuBuf(m_probeReadbackBuf[i]);
+			}
+			CreateGpuBuf(m_probeStagingBuf, outSize,
+			             VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
+		}
 	}
 
 	// Create probe gather pipeline (re-use existing m_probeDescLayout with 5 bindings)
@@ -1943,6 +2080,12 @@ void Engine_Vulkan::SnapshotProbeCache()
 	{
 		// ReBAR: direct copy from mapped VRAM
 		memcpy(m_probeCacheCPU.data(), m_probeOutMapped,
+		       m_probeCacheCount * sizeof(float));
+	}
+	else if (m_probeReadbackMapped[m_lastProbeSubmitSlot])
+	{
+		// Readback ring: data was copied in the main command buffer for this slot.
+		memcpy(m_probeCacheCPU.data(), m_probeReadbackMapped[m_lastProbeSubmitSlot],
 		       m_probeCacheCount * sizeof(float));
 	}
 	else
@@ -2104,7 +2247,14 @@ void Engine_Vulkan::DrainGPU() const
 	{
 		if (m_gpuInFlight[i])
 		{
+			auto t0 = std::chrono::steady_clock::now();
 			vkWaitForFences(m_device, 1, &m_fences[i], VK_TRUE, UINT64_MAX);
+			auto t1 = std::chrono::steady_clock::now();
+			if (m_profileEnabled)
+			{
+				m_profileWaitMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+				CollectProfileForSlot(i);
+			}
 			m_gpuInFlight[i] = false;
 		}
 	}
@@ -2185,7 +2335,14 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		// Wait for this slot if it is still in-flight from a previous round
 		if (m_gpuInFlight[m_cmdIdx])
 		{
+			auto t0 = std::chrono::steady_clock::now();
 			vkWaitForFences(m_device, 1, &m_fences[m_cmdIdx], VK_TRUE, UINT64_MAX);
+			auto t1 = std::chrono::steady_clock::now();
+			if (m_profileEnabled)
+			{
+				m_profileWaitMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+				CollectProfileForSlot(m_cmdIdx);
+			}
 			m_gpuInFlight[m_cmdIdx] = false;
 		}
 
@@ -2196,6 +2353,13 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkResetCommandBuffer(cmd, 0);
 		VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+		if (m_profileEnabled && m_tsQueryPool)
+		{
+			uint32_t qBase = (uint32_t)(m_cmdIdx * 2);
+			vkCmdResetQueryPool(cmd, m_tsQueryPool, qBase, 2);
+			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_tsQueryPool, qBase);
+		}
 
 		// Append all FDTD timesteps
 		for (unsigned int iter = 0; iter < iterTS; ++iter)
@@ -2625,6 +2789,30 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdPushConstants(cmd, m_probePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 			                   0, sizeof(uint32_t), &m_probeCacheCount);
 			vkCmdDispatch(cmd, probeGroups, 1, 1);
+
+			// If probe output is not directly mapped (no ReBAR), enqueue a device->host
+			// copy into the readback ring for this submission slot.
+			if (!m_probeOutMapped && m_probeReadbackMapped[m_cmdIdx])
+			{
+				VkMemoryBarrier xferBarrier{};
+				xferBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+				xferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				xferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					0, 1, &xferBarrier, 0, nullptr, 0, nullptr);
+
+				VkBufferCopy copyRegion = {0, 0, m_probeCacheCount * sizeof(float)};
+				vkCmdCopyBuffer(cmd, m_probeOutBuf.buffer,
+				                m_probeReadbackBuf[m_cmdIdx].buffer, 1, &copyRegion);
+			}
+		}
+
+		if (m_profileEnabled && m_tsQueryPool)
+		{
+			uint32_t qBase = (uint32_t)(m_cmdIdx * 2);
+			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_tsQueryPool, qBase + 1);
 		}
 
 		// --- End + submit (fire-and-forget) ---
@@ -2637,6 +2825,12 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		vkResetFences(m_device, 1, &m_fences[m_cmdIdx]);
 		VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_fences[m_cmdIdx]));
 		m_gpuInFlight[m_cmdIdx] = true;
+		m_lastProbeSubmitSlot = m_cmdIdx;
+		if (m_profileEnabled)
+		{
+			m_profilePending[m_cmdIdx] = true;
+			m_profileSubmittedTS[m_cmdIdx] = iterTS;
+		}
 		m_gpuDrained = false;  // new submission in flight
 		m_cmdIdx ^= 1;   // flip to other slot for the next call
 
@@ -2797,6 +2991,18 @@ void Engine_Vulkan::CleanupVulkan()
 	// Fused UPML
 	CleanupFusedUPML();
 
+	if (m_profileEnabled)
+	{
+		CollectProfileForSlot(0);
+		CollectProfileForSlot(1);
+		PrintProfileSummary();
+	}
+	if (m_tsQueryPool)
+	{
+		vkDestroyQueryPool(m_device, m_tsQueryPool, nullptr);
+		m_tsQueryPool = VK_NULL_HANDLE;
+	}
+
 	// Pipeline cache
 	if (m_pipelineCache) vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
 
@@ -2935,6 +3141,15 @@ void Engine_Vulkan::CleanupExtensions()
 	DestroyGpuBuf(m_probeIdxBuf);
 	DestroyGpuBuf(m_probeSelBuf);
 	DestroyGpuBuf(m_probeOutBuf);
+	for (int i = 0; i < 2; ++i)
+	{
+		if (m_probeReadbackMapped[i])
+		{
+			vkUnmapMemory(m_device, m_probeReadbackBuf[i].memory);
+			m_probeReadbackMapped[i] = nullptr;
+		}
+		DestroyGpuBuf(m_probeReadbackBuf[i]);
+	}
 	DestroyGpuBuf(m_probeStagingBuf);
 	if (m_probeDescPool) { vkDestroyDescriptorPool(m_device, m_probeDescPool, nullptr); m_probeDescPool = VK_NULL_HANDLE; }
 	m_probeGatherDescSet = VK_NULL_HANDLE; // freed with pool
