@@ -178,12 +178,17 @@ protected:
 	Engine_Vulkan(const Operator* op);
 
 private:
+	static constexpr int CMD_RING_SIZE = 16;
+
 	// ---- Vulkan core --------------------------------------------------
 	VkInstance       m_instance;
 	VkPhysicalDevice m_physDevice;
 	VkDevice         m_device;
 	VkQueue          m_computeQueue;
 	uint32_t         m_computeQueueFamily;
+	VkQueue          m_transferQueue;
+	uint32_t         m_transferQueueFamily;
+	bool             m_hasDedicatedTransferQueue;
 
 	// ---- GPU buffers --------------------------------------------------
 	VkBuffer       m_voltBuf, m_currBuf;
@@ -237,12 +242,19 @@ private:
 	// (usually a no-op, ~50 µs compute already done) then reads directly
 	// from the ReBAR-mapped VRAM pointer — zero copies, zero stalls.
 	VkCommandPool   m_cmdPool;
-	VkCommandBuffer m_cmdBufs[2];   //!< Double-buffered FDTD + copy command buffers
+	VkCommandBuffer m_cmdBufs[CMD_RING_SIZE];   //!< Ring-buffered FDTD + copy command buffers
 	VkCommandBuffer m_utilCmdBuf;   //!< Utility cmd buf (uploads, hybrid path)
-	VkFence         m_fences[2];    //!< One per m_cmdBufs slot
+	VkFence         m_fences[CMD_RING_SIZE];    //!< One per m_cmdBufs slot
 	VkFence         m_utilFence;    //!< Fence for utility (upload/download) work
-	int             m_cmdIdx;       //!< Index into m_cmdBufs/m_fences (0 or 1)
-	mutable bool    m_gpuInFlight[2]; //!< Whether m_cmdBufs[i] is submitted but not waited
+	int             m_cmdIdx;       //!< Index into m_cmdBufs/m_fences ring
+	mutable bool    m_gpuInFlight[CMD_RING_SIZE]; //!< Whether m_cmdBufs[i] is submitted but not waited
+
+	// Optional transfer-queue path for probe output copies
+	VkCommandPool   m_transferCmdPool;
+	VkCommandBuffer m_transferCmdBufs[CMD_RING_SIZE];
+	VkFence         m_transferFences[CMD_RING_SIZE];
+	VkSemaphore     m_probeCopySem[CMD_RING_SIZE];
+	mutable bool    m_probeTransferInFlight[CMD_RING_SIZE];
 
 	// ---- State --------------------------------------------------------
 	mutable bool m_hostDirty;
@@ -260,14 +272,19 @@ private:
 
 	// ---- Optional profiling ---------------------------------------------
 	bool m_profileEnabled = false;
-	VkQueryPool m_tsQueryPool = VK_NULL_HANDLE;  //!< 4 queries: 2 per command slot
+	VkQueryPool m_tsQueryPool = VK_NULL_HANDLE;  //!< 2 queries per command slot
 	float m_timestampPeriodNs = 0.0f;
-	bool m_profilePending[2] = {false, false};
-	unsigned int m_profileSubmittedTS[2] = {0, 0};
+	bool m_profilePhaseEnabled = false;
+	uint32_t m_profileQueriesPerSlot = 2;
+	bool m_profilePending[CMD_RING_SIZE] = {};
+	unsigned int m_profileSubmittedTS[CMD_RING_SIZE] = {};
 	mutable uint64_t m_profileBatchCount = 0;
 	mutable uint64_t m_profileTSCount = 0;
 	mutable double m_profileGpuMs = 0.0;
 	mutable double m_profileWaitMs = 0.0;
+	mutable double m_profileComputeMs = 0.0;
+	mutable double m_profileProbeMs = 0.0;
+	mutable double m_profileTailMs = 0.0;
 
 	// ---- Internal helpers ---------------------------------------------
 	void InitVulkan();
@@ -490,10 +507,10 @@ private:
 	GpuBuf m_probeIdxBuf;              //!< GPU probe index buffer
 	GpuBuf m_probeSelBuf;              //!< GPU field selector (0=volt, 1=curr)
 	GpuBuf m_probeOutBuf;              //!< GPU probe output buffer (HOST_VISIBLE)
-	GpuBuf m_probeReadbackBuf[2];      //!< Per-submit-slot host-visible probe readback ring
+	GpuBuf m_probeReadbackBuf[CMD_RING_SIZE];      //!< Per-submit-slot host-visible probe readback ring
 	GpuBuf m_probeStagingBuf;          //!< Staging buffer for non-ReBAR probe download
 	float* m_probeOutMapped = nullptr;  //!< ReBAR-mapped probe output (or nullptr)
-	float* m_probeReadbackMapped[2] = {nullptr, nullptr}; //!< Persistently mapped readback ring
+	float* m_probeReadbackMapped[CMD_RING_SIZE] = {}; //!< Persistently mapped readback ring
 	int m_lastProbeSubmitSlot = 0;      //!< Last submitted cmd slot carrying probe results
 	VkDescriptorSet  m_probeGatherDescSet = VK_NULL_HANDLE;
 	VkDescriptorPool m_probeDescPool     = VK_NULL_HANDLE;
