@@ -47,11 +47,39 @@ bool Engine_Vulkan::s_enableProfiling = false;
 // ---------------------------------------------------------------------------
 // Vulkan error checking
 // ---------------------------------------------------------------------------
+static const char* VkResultName(VkResult r)
+{
+	switch (r)
+	{
+		case VK_SUCCESS: return "VK_SUCCESS";
+		case VK_NOT_READY: return "VK_NOT_READY";
+		case VK_TIMEOUT: return "VK_TIMEOUT";
+		case VK_EVENT_SET: return "VK_EVENT_SET";
+		case VK_EVENT_RESET: return "VK_EVENT_RESET";
+		case VK_INCOMPLETE: return "VK_INCOMPLETE";
+		case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+		case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+		case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+		case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+		case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+		case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+		case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+		case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+		case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+		case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+		case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+		case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
+		case VK_ERROR_UNKNOWN: return "VK_ERROR_UNKNOWN";
+		case VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY";
+		default: return "VK_ERROR_UNRECOGNIZED";
+	}
+}
+
 #define VK_CHECK(call) \
 	do { \
 		VkResult _r = (call); \
 		if (_r != VK_SUCCESS) { \
-			cerr << "Vulkan error " << _r << " at " << __FILE__ << ":" << __LINE__ << endl; \
+			cerr << "Vulkan error " << VkResultName(_r) << " (" << _r << ") at " << __FILE__ << ":" << __LINE__ << endl; \
 			throw std::runtime_error("Vulkan call failed"); \
 		} \
 	} while(0)
@@ -66,6 +94,230 @@ Engine_Vulkan* Engine_Vulkan::New(const Operator* op)
 	Engine_Vulkan* e = new Engine_Vulkan(op);
 	e->Init();
 	return e;
+}
+
+bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny, unsigned int Nz,
+                                               bool strictCoeffReserve, std::string* errMsg)
+{
+	auto fail = [&](const std::string& msg) -> bool
+	{
+		if (errMsg) *errMsg = msg;
+		return false;
+	};
+
+	VkInstance instance = VK_NULL_HANDLE;
+	VkDevice device = VK_NULL_HANDLE;
+	VkPhysicalDevice phys = VK_NULL_HANDLE;
+	VkBuffer bufA = VK_NULL_HANDLE, bufB = VK_NULL_HANDLE, bufStaging = VK_NULL_HANDLE, bufCoeff = VK_NULL_HANDLE;
+	VkDeviceMemory memA = VK_NULL_HANDLE, memB = VK_NULL_HANDLE, memStaging = VK_NULL_HANDLE, memCoeff = VK_NULL_HANDLE;
+
+	auto cleanup = [&]()
+	{
+		if (bufCoeff) vkDestroyBuffer(device, bufCoeff, nullptr);
+		if (memCoeff) vkFreeMemory(device, memCoeff, nullptr);
+		if (bufStaging) vkDestroyBuffer(device, bufStaging, nullptr);
+		if (memStaging) vkFreeMemory(device, memStaging, nullptr);
+		if (bufB) vkDestroyBuffer(device, bufB, nullptr);
+		if (memB) vkFreeMemory(device, memB, nullptr);
+		if (bufA) vkDestroyBuffer(device, bufA, nullptr);
+		if (memA) vkFreeMemory(device, memA, nullptr);
+		if (device) vkDestroyDevice(device, nullptr);
+		if (instance) vkDestroyInstance(instance, nullptr);
+	};
+
+	try
+	{
+		VkApplicationInfo app{};
+		app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+		app.pApplicationName = "openEMS Vulkan preflight";
+		app.apiVersion = VK_API_VERSION_1_1;
+
+		VkInstanceCreateInfo ici{};
+		ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+		ici.pApplicationInfo = &app;
+		if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS)
+			return fail("Vulkan preflight: failed to create Vulkan instance");
+
+		uint32_t devCount = 0;
+		vkEnumeratePhysicalDevices(instance, &devCount, nullptr);
+		if (devCount == 0)
+			return fail("Vulkan preflight: no Vulkan physical devices found");
+		std::vector<VkPhysicalDevice> devs(devCount);
+		vkEnumeratePhysicalDevices(instance, &devCount, devs.data());
+
+		struct Candidate { VkPhysicalDevice dev; uint32_t qf; VkPhysicalDeviceProperties props; };
+		std::vector<Candidate> cands;
+		for (auto& d : devs)
+		{
+			uint32_t qfCount = 0;
+			vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, nullptr);
+			if (qfCount == 0) continue;
+			std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+			vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, qfProps.data());
+			for (uint32_t i = 0; i < qfCount; ++i)
+			{
+				if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+				{
+					Candidate c{};
+					c.dev = d;
+					c.qf = i;
+					vkGetPhysicalDeviceProperties(d, &c.props);
+					cands.push_back(c);
+					break;
+				}
+			}
+		}
+		if (cands.empty())
+			return fail("Vulkan preflight: no compute-capable GPU found");
+
+		int forcedIndex = -1;
+		if (const char* envGpuIndex = std::getenv("OPENEMS_GPU_INDEX"))
+		{
+			char* endPtr = nullptr;
+			long idx = std::strtol(envGpuIndex, &endPtr, 10);
+			if (endPtr && *endPtr == '\0' && idx >= 0 && idx < (long)cands.size())
+				forcedIndex = (int)idx;
+		}
+
+		uint32_t computeQf = cands[0].qf;
+		phys = cands[0].dev;
+		if (forcedIndex >= 0)
+		{
+			phys = cands[forcedIndex].dev;
+			computeQf = cands[forcedIndex].qf;
+		}
+		else
+		{
+			for (const auto& c : cands)
+			{
+				if (c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+				{
+					phys = c.dev;
+					computeQf = c.qf;
+					break;
+				}
+			}
+		}
+
+		float priority = 1.0f;
+		VkDeviceQueueCreateInfo qci{};
+		qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+		qci.queueFamilyIndex = computeQf;
+		qci.queueCount = 1;
+		qci.pQueuePriorities = &priority;
+
+		VkDeviceCreateInfo dci{};
+		dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+		dci.queueCreateInfoCount = 1;
+		dci.pQueueCreateInfos = &qci;
+		if (vkCreateDevice(phys, &dci, nullptr, &device) != VK_SUCCESS)
+			return fail("Vulkan preflight: failed to create logical device");
+
+		auto findMemType = [&](uint32_t bits, VkMemoryPropertyFlags flags) -> uint32_t
+		{
+			VkPhysicalDeviceMemoryProperties mp{};
+			vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+			for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+			{
+				if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & flags) == flags)
+					return i;
+			}
+			return UINT32_MAX;
+		};
+
+		auto allocBuffer = [&](VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags memFlags,
+		                      VkBuffer& outBuf, VkDeviceMemory& outMem) -> bool
+		{
+			VkBufferCreateInfo bci{};
+			bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+			bci.size = size;
+			bci.usage = usage;
+			bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			if (vkCreateBuffer(device, &bci, nullptr, &outBuf) != VK_SUCCESS)
+				return false;
+
+			VkMemoryRequirements req{};
+			vkGetBufferMemoryRequirements(device, outBuf, &req);
+			uint32_t memType = findMemType(req.memoryTypeBits, memFlags);
+			if (memType == UINT32_MAX)
+				return false;
+
+			VkMemoryAllocateInfo mai{};
+			mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+			mai.allocationSize = req.size;
+			mai.memoryTypeIndex = memType;
+			if (vkAllocateMemory(device, &mai, nullptr, &outMem) != VK_SUCCESS)
+				return false;
+
+			if (vkBindBufferMemory(device, outBuf, outMem, 0) != VK_SUCCESS)
+				return false;
+
+			return true;
+		};
+
+		const uint64_t N = (uint64_t)Nx * (uint64_t)Ny * (uint64_t)Nz;
+		const VkDeviceSize fieldSize = (VkDeviceSize)(3ull * N * sizeof(FDTD_FLOAT));
+		const VkBufferUsageFlags fieldUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+		                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+		                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		const VkBufferUsageFlags stagingUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+		                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		const VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		const VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+		bool fieldsOk = false;
+		if (s_preferReBARFieldBuffers)
+		{
+			VkBuffer tmpA = VK_NULL_HANDLE, tmpB = VK_NULL_HANDLE;
+			VkDeviceMemory tmpAM = VK_NULL_HANDLE, tmpBM = VK_NULL_HANDLE;
+			if (allocBuffer(fieldSize, fieldUsage, rebar, tmpA, tmpAM) &&
+			    allocBuffer(fieldSize, fieldUsage, rebar, tmpB, tmpBM))
+			{
+				bufA = tmpA; memA = tmpAM;
+				bufB = tmpB; memB = tmpBM;
+				fieldsOk = true;
+			}
+			else
+			{
+				if (tmpB) vkDestroyBuffer(device, tmpB, nullptr);
+				if (tmpBM) vkFreeMemory(device, tmpBM, nullptr);
+				if (tmpA) vkDestroyBuffer(device, tmpA, nullptr);
+				if (tmpAM) vkFreeMemory(device, tmpAM, nullptr);
+			}
+		}
+
+		if (!fieldsOk)
+		{
+			if (!allocBuffer(fieldSize, fieldUsage, dLoc, bufA, memA) ||
+			    !allocBuffer(fieldSize, fieldUsage, dLoc, bufB, memB))
+				return fail("Vulkan preflight: unable to allocate field buffers on selected GPU");
+		}
+
+		if (!allocBuffer(fieldSize, stagingUsage, host, bufStaging, memStaging))
+			return fail("Vulkan preflight: unable to allocate staging buffer on selected GPU/host memory");
+
+		if (strictCoeffReserve)
+		{
+			const VkDeviceSize coeffUpper = (VkDeviceSize)(N * (uint64_t)sizeof(uint32_t) +
+			                                               4ull * 3ull * N * (uint64_t)sizeof(float));
+			const VkBufferUsageFlags coeffUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+			                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			if (!allocBuffer(coeffUpper, coeffUsage, dLoc, bufCoeff, memCoeff))
+				return fail("Vulkan preflight: strict coefficient reserve failed (GPU memory likely insufficient)");
+		}
+
+		cleanup();
+		return true;
+	}
+	catch (...)
+	{
+		cleanup();
+		return fail("Vulkan preflight: unexpected error while probing GPU allocations");
+	}
 }
 
 Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
@@ -1182,23 +1434,18 @@ void Engine_Vulkan::SetupGPUExtensions()
 	VK_CHECK(vkCreateDescriptorPool(m_device, &pi, nullptr, &m_extDescPool));
 
 	// Setup each extension type
-	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
-	{
-		Operator_Extension* ext = Op->GetExtension(eIdx);
-		if (dynamic_cast<Operator_Ext_UPML*>(ext))
-			SetupGPU_UPML();
-		else if (dynamic_cast<Operator_Ext_LorentzMaterial*>(ext))
-			SetupGPU_Dispersive();
-		else if (dynamic_cast<Operator_Ext_TFSF*>(ext))
-			SetupGPU_TFSF();
-		else if (dynamic_cast<Operator_Ext_Mur_ABC*>(ext))
-			SetupGPU_Mur();
-		else if (auto* rlc = dynamic_cast<Operator_Ext_LumpedRLC*>(ext))
-		{
-			if (rlc->RLC_count > 0)
-				SetupGPU_RLC();
-		}
-	}
+	// Each SetupGPU_* routine already iterates all matching extensions.
+	// Calling them once per extension would duplicate allocations.
+	if (numUPML > 0)
+		SetupGPU_UPML();
+	if (numDispOrders > 0)
+		SetupGPU_Dispersive();
+	if (numTFSF > 0)
+		SetupGPU_TFSF();
+	if (numMur > 0)
+		SetupGPU_Mur();
+	if (numRLC > 0)
+		SetupGPU_RLC();
 
 	// Create extension compute pipelines
 	CreateExtensionPipelines();
