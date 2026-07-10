@@ -20,7 +20,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
-#include <unordered_map>
+#include <algorithm>
+#include <string>
+#include <chrono>
 
 class Operator_Ext_Excitation;
 class Operator_Ext_UPML;
@@ -57,6 +59,11 @@ public:
 	//! Enable per-batch GPU timestamp profiling and fence-wait accounting.
 	static void SetEnableProfiling(bool enable) { s_enableProfiling = enable; }
 	static bool GetEnableProfiling() { return s_enableProfiling; }
+	//! Fast-fail probe that allocates and frees representative GPU buffers
+	//! for the given grid size before costly operator preparation begins.
+	//! strictCoeffReserve=true also reserves a conservative coefficient/index budget.
+	static bool PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny, unsigned int Nz,
+	                                      bool strictCoeffReserve, std::string* errMsg = nullptr);
 	virtual ~Engine_Vulkan();
 
 	virtual void Init();
@@ -121,9 +128,14 @@ public:
 		}
 		if (m_pipelinedReading)
 		{
-			auto it = m_probeCacheMap.find((uint64_t)0 << 48 | linIdx);
-			if (it != m_probeCacheMap.end())
-				return m_probeCacheCPU[it->second];
+			const uint64_t key = (uint64_t)0 << 48 | linIdx;
+			auto it = std::lower_bound(m_probeCacheKeys.begin(), m_probeCacheKeys.end(), key);
+			if (it != m_probeCacheKeys.end() && *it == key)
+			{
+				m_probeCacheHits++;
+				return m_probeCacheCPU[(size_t)(it - m_probeCacheKeys.begin())];
+			}
+			m_probeCacheMisses++;
 			// Fallback: not in cache — must drain GPU
 		}
 		if (!m_gpuDrained) DrainGPU();
@@ -147,9 +159,14 @@ public:
 		}
 		if (m_pipelinedReading)
 		{
-			auto it = m_probeCacheMap.find((uint64_t)1 << 48 | linIdx);
-			if (it != m_probeCacheMap.end())
-				return m_probeCacheCPU[it->second];
+			const uint64_t key = (uint64_t)1 << 48 | linIdx;
+			auto it = std::lower_bound(m_probeCacheKeys.begin(), m_probeCacheKeys.end(), key);
+			if (it != m_probeCacheKeys.end() && *it == key)
+			{
+				m_probeCacheHits++;
+				return m_probeCacheCPU[(size_t)(it - m_probeCacheKeys.begin())];
+			}
+			m_probeCacheMisses++;
 		}
 		if (!m_gpuDrained) DrainGPU();
 		if (m_currMapped)
@@ -262,6 +279,10 @@ private:
 	bool         m_hasCPUExtensions;
 	bool         m_hasGPUExcitation;
 	mutable bool m_gpuDrained;       //!< true after DrainGPU(), cleared on submit
+	unsigned int m_maxTSPerSubmit;   //!< Max timesteps per pure-GPU vkQueueSubmit
+	double       m_chunkProgressIntervalSec; //!< Minimum interval between chunk-progress prints
+	mutable bool m_chunkProgressHasLastPrint;
+	mutable std::chrono::steady_clock::time_point m_chunkProgressLastPrint;
 
 	// ---- Pipeline cache (faster shader load on restart) ---------------
 	VkPipelineCache m_pipelineCache;
@@ -311,6 +332,10 @@ private:
 	void CreateBufferWithMemory(VkDeviceSize size, VkBufferUsageFlags usage,
 	                            VkMemoryPropertyFlags memProps,
 	                            VkBuffer& buf, VkDeviceMemory& mem);
+	//! Allocation probe used for optional memory classes such as ReBAR.
+	bool TryCreateBufferWithMemory(VkDeviceSize size, VkBufferUsageFlags usage,
+	                               VkMemoryPropertyFlags memProps,
+	                               VkBuffer& buf, VkDeviceMemory& mem);
 
 	VkShaderModule CreateShaderModule(const unsigned char* code, size_t codeSize);
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
@@ -462,11 +487,13 @@ private:
 	VkDescriptorSetLayout m_probeDescLayout        = VK_NULL_HANDLE;
 
 	// ---- Extension pipeline layouts -----------------------------------
-	VkPipelineLayout m_upmlPipeLayout    = VK_NULL_HANDLE;
+	VkPipelineLayout m_upmlPrePipeLayout = VK_NULL_HANDLE;
+	VkPipelineLayout m_upmlPostPipeLayout= VK_NULL_HANDLE;
 	VkPipelineLayout m_dispPrePipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_dispApplyPipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_tfsfPipeLayout    = VK_NULL_HANDLE;
-	VkPipelineLayout m_murPipeLayout     = VK_NULL_HANDLE;
+	VkPipelineLayout m_murUpdatePipeLayout = VK_NULL_HANDLE;
+	VkPipelineLayout m_murApplyPipeLayout  = VK_NULL_HANDLE;
 	VkPipelineLayout m_rlcPrePipeLayout  = VK_NULL_HANDLE;
 	VkPipelineLayout m_rlcApplyPipeLayout= VK_NULL_HANDLE;
 	VkPipelineLayout m_probePipeLayout   = VK_NULL_HANDLE;
@@ -502,14 +529,16 @@ private:
 	mutable bool m_recordingProbeAccess = false; //!< When true, GetVolt/GetCurr record cell indices
 	mutable std::vector<uint64_t> m_recordedCells; //!< Recorded (fieldSel<<48 | linearIdx) during dry run
 	std::vector<float> m_probeCacheCPU;  //!< CPU-side snapshot of gathered probes
-	std::unordered_map<uint64_t, uint32_t> m_probeCacheMap; //!< field_linear_idx → cache index
+	std::vector<uint64_t> m_probeCacheKeys; //!< Sorted keys for binary search (fieldSel<<48 | linearIdx)
 	uint32_t m_probeCacheCount = 0;     //!< Number of probe points
+	mutable uint64_t m_probeCacheHits = 0;
+	mutable uint64_t m_probeCacheMisses = 0;
 	GpuBuf m_probeIdxBuf;              //!< GPU probe index buffer
 	GpuBuf m_probeSelBuf;              //!< GPU field selector (0=volt, 1=curr)
-	GpuBuf m_probeOutBuf;              //!< GPU probe output buffer (HOST_VISIBLE)
+	GpuBuf m_probeOutBuf;              //!< Coherent host-visible GPU probe output
 	GpuBuf m_probeReadbackBuf[CMD_RING_SIZE];      //!< Per-submit-slot host-visible probe readback ring
 	GpuBuf m_probeStagingBuf;          //!< Staging buffer for non-ReBAR probe download
-	float* m_probeOutMapped = nullptr;  //!< ReBAR-mapped probe output (or nullptr)
+	float* m_probeOutMapped = nullptr;  //!< Persistently mapped probe output
 	float* m_probeReadbackMapped[CMD_RING_SIZE] = {}; //!< Persistently mapped readback ring
 	int m_lastProbeSubmitSlot = 0;      //!< Last submitted cmd slot carrying probe results
 	VkDescriptorSet  m_probeGatherDescSet = VK_NULL_HANDLE;

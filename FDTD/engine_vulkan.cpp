@@ -47,9 +47,9 @@ bool Engine_Vulkan::s_enableProfiling = false;
 // ---------------------------------------------------------------------------
 // Vulkan error checking
 // ---------------------------------------------------------------------------
-static const char* VkResultName(VkResult r)
+static const char* VkResultName(VkResult result)
 {
-	switch (r)
+	switch (result)
 	{
 		case VK_SUCCESS: return "VK_SUCCESS";
 		case VK_NOT_READY: return "VK_NOT_READY";
@@ -99,12 +99,6 @@ Engine_Vulkan* Engine_Vulkan::New(const Operator* op)
 bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny, unsigned int Nz,
                                                bool strictCoeffReserve, std::string* errMsg)
 {
-	auto fail = [&](const std::string& msg) -> bool
-	{
-		if (errMsg) *errMsg = msg;
-		return false;
-	};
-
 	VkInstance instance = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 	VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -123,6 +117,12 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 		if (memA) vkFreeMemory(device, memA, nullptr);
 		if (device) vkDestroyDevice(device, nullptr);
 		if (instance) vkDestroyInstance(instance, nullptr);
+	};
+	auto fail = [&](const std::string& msg) -> bool
+	{
+		cleanup();
+		if (errMsg) *errMsg = msg;
+		return false;
 	};
 
 	try
@@ -315,7 +315,6 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 	}
 	catch (...)
 	{
-		cleanup();
 		return fail("Vulkan preflight: unexpected error while probing GPU allocations");
 	}
 }
@@ -395,6 +394,9 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 	m_hasGPUExcitation  = false;
 	m_gpuDrained  = true;
 	m_pipelineCache = VK_NULL_HANDLE;
+	m_maxTSPerSubmit = 64;
+	m_chunkProgressIntervalSec = 4.0;
+	m_chunkProgressHasLastPrint = false;
 }
 
 Engine_Vulkan::~Engine_Vulkan()
@@ -419,32 +421,81 @@ Engine_Vulkan::~Engine_Vulkan()
 
 void Engine_Vulkan::Init()
 {
+	bool startupTrace = (g_settings.GetVerboseLevel() > 0);
+	if (const char* env = std::getenv("OPENEMS_GPU_STARTUP_TRACE"))
+	{
+		char* endPtr = nullptr;
+		long v = std::strtol(env, &endPtr, 10);
+		if (endPtr && *endPtr == '\0')
+			startupTrace = (v != 0);
+	}
+
+	auto startupBegin = std::chrono::steady_clock::now();
+	unsigned int startupStep = 0;
+	auto runStartupStep = [&](const char* label, const std::function<void()>& fn)
+	{
+		auto t0 = std::chrono::steady_clock::now();
+		if (startupTrace)
+			cout << "[Vulkan startup] step " << (++startupStep) << ": " << label << "..." << endl;
+		fn();
+		auto t1 = std::chrono::steady_clock::now();
+		if (startupTrace)
+		{
+			double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+			cout << "[Vulkan startup] done " << label << " in " << ms << " ms" << endl;
+		}
+	};
+
 	// Base class allocates CPU arrays (volt_ptr, curr_ptr) and extensions
-	Engine::Init();
+	runStartupStep("Engine::Init", [&]() { Engine::Init(); });
+
+	// Read once: pure-GPU submit chunk size to avoid overly long command buffers.
+	if (const char* env = std::getenv("OPENEMS_GPU_MAX_TS_PER_SUBMIT"))
+	{
+		char* endPtr = nullptr;
+		long v = std::strtol(env, &endPtr, 10);
+		if (endPtr && *endPtr == '\0' && v > 0)
+			m_maxTSPerSubmit = (unsigned int)v;
+	}
+	if (const char* env = std::getenv("OPENEMS_GPU_CHUNK_PROGRESS_SEC"))
+	{
+		char* endPtr = nullptr;
+		double v = std::strtod(env, &endPtr);
+		if (endPtr && *endPtr == '\0' && v > 0.0)
+			m_chunkProgressIntervalSec = v;
+	}
+
+	if (startupTrace)
+	{
+		cout << "[Vulkan startup] config: max_ts_per_submit=" << m_maxTSPerSubmit
+		     << ", chunk_progress_sec=" << m_chunkProgressIntervalSec << endl;
+	}
 
 	// Vulkan resources
-	InitVulkan();
-	CreateBuffers();
-	CreateDescriptors();
-	CreatePipelines();
-	UploadCoefficients();
-	SetupGPUExcitation();
-	SetupGPUExtensions();
-	SetupFusedUPML();
-	SetupGPU_EnergyReduction();
+	runStartupStep("InitVulkan", [&]() { InitVulkan(); });
+	runStartupStep("CreateBuffers", [&]() { CreateBuffers(); });
+	runStartupStep("CreateDescriptors", [&]() { CreateDescriptors(); });
+	runStartupStep("CreatePipelines", [&]() { CreatePipelines(); });
+	runStartupStep("UploadCoefficients", [&]() { UploadCoefficients(); });
+	runStartupStep("SetupGPUExcitation", [&]() { SetupGPUExcitation(); });
+	runStartupStep("SetupGPUExtensions", [&]() { SetupGPUExtensions(); });
+	runStartupStep("SetupFusedUPML", [&]() { SetupFusedUPML(); });
+	runStartupStep("SetupGPU_EnergyReduction", [&]() { SetupGPU_EnergyReduction(); });
 
 	// Upload initial (zero) field data to GPU
-	if (m_voltMapped)
-	{
-		// ReBAR: direct memcpy through the persistently mapped pointer
-		memcpy(m_voltMapped, volt_ptr->data(), m_fieldBufSize);
-		memcpy(m_currMapped, curr_ptr->data(), m_fieldBufSize);
-	}
-	else
-	{
-		UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-		UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
-	}
+	runStartupStep("UploadInitialFields", [&]() {
+		if (m_voltMapped)
+		{
+			// ReBAR: direct memcpy through the persistently mapped pointer
+			memcpy(m_voltMapped, volt_ptr->data(), m_fieldBufSize);
+			memcpy(m_currMapped, curr_ptr->data(), m_fieldBufSize);
+		}
+		else
+		{
+			UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+			UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
+		}
+	});
 
 	m_hostDirty  = false;
 	m_deviceDirty = false;
@@ -485,10 +536,27 @@ void Engine_Vulkan::Init()
 	if (m_hasGPU_RLC)
 		cout << "  GPU lumped RLC active (" << m_gpuRLC.count << " elements)" << endl;
 	cout << "  GPU energy reduction active (" << ENERGY_NUM_WG << " workgroups)" << endl;
+
+	if (startupTrace)
+	{
+		auto startupEnd = std::chrono::steady_clock::now();
+		double totalMs = std::chrono::duration<double, std::milli>(startupEnd - startupBegin).count();
+		cout << "[Vulkan startup] total init time: " << totalMs << " ms" << endl;
+	}
 }
 
 void Engine_Vulkan::Reset()
 {
+	if (m_hasGPU_Probes && (m_probeCacheHits > 0 || m_probeCacheMisses > 0))
+	{
+		uint64_t total = m_probeCacheHits + m_probeCacheMisses;
+		double missPct = total ? (100.0 * (double)m_probeCacheMisses / (double)total) : 0.0;
+		cout << "Engine_Vulkan probe cache stats: hits=" << m_probeCacheHits
+		     << ", misses=" << m_probeCacheMisses
+		     << " (" << missPct << "% miss)" << endl;
+		if (m_probeCacheMisses > 0)
+			cout << "  Note: probe cache misses trigger fallback field reads (can be slow with ReBAR on dGPU)." << endl;
+	}
 	CleanupVulkan();
 	Engine::Reset();
 }
@@ -604,26 +672,11 @@ void Engine_Vulkan::InitVulkan()
 	if (m_physDevice == VK_NULL_HANDLE)
 		throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
 
-	// Discover transfer queue family on the selected device (prefer dedicated transfer queue).
-	{
-		uint32_t qfCount = 0;
-		vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, nullptr);
-		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-		vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, qfProps.data());
-
-		m_transferQueueFamily = m_computeQueueFamily;
-		m_hasDedicatedTransferQueue = false;
-		for (uint32_t i = 0; i < qfCount; ++i)
-		{
-			if ((qfProps[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
-			    !(qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
-			{
-				m_transferQueueFamily = i;
-				m_hasDedicatedTransferQueue = true;
-				break;
-			}
-		}
-	}
+	// Probe and energy outputs are tiny coherent host-visible buffers. Keeping
+	// their work on the compute queue avoids cross-family ownership transfers
+	// and semaphore submissions, which cost more than these readbacks.
+	m_transferQueueFamily = m_computeQueueFamily;
+	m_hasDedicatedTransferQueue = false;
 
 	// --- Logical device ---
 	float priority = 1.0f;
@@ -860,23 +913,57 @@ void Engine_Vulkan::CreateBufferWithMemory(VkDeviceSize size, VkBufferUsageFlags
                                            VkBuffer& buf, VkDeviceMemory& mem)
 {
 	if (size == 0) { buf = VK_NULL_HANDLE; mem = VK_NULL_HANDLE; return; }
+	if (!TryCreateBufferWithMemory(size, usage, memProps, buf, mem))
+		throw std::runtime_error("Engine_Vulkan: buffer memory allocation failed");
+}
+
+bool Engine_Vulkan::TryCreateBufferWithMemory(VkDeviceSize size, VkBufferUsageFlags usage,
+                                              VkMemoryPropertyFlags memProps,
+                                              VkBuffer& buf, VkDeviceMemory& mem)
+{
+	buf = VK_NULL_HANDLE;
+	mem = VK_NULL_HANDLE;
+	if (size == 0)
+		return true;
 
 	VkBufferCreateInfo ci{};
 	ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 	ci.size  = size;
 	ci.usage = usage;
 	ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	VK_CHECK(vkCreateBuffer(m_device, &ci, nullptr, &buf));
+	if (vkCreateBuffer(m_device, &ci, nullptr, &buf) != VK_SUCCESS)
+		return false;
 
 	VkMemoryRequirements memReq;
 	vkGetBufferMemoryRequirements(m_device, buf, &memReq);
 
+	uint32_t memoryType = FindMemoryTypeSoft(memReq.memoryTypeBits, memProps);
+	if (memoryType == UINT32_MAX)
+	{
+		vkDestroyBuffer(m_device, buf, nullptr);
+		buf = VK_NULL_HANDLE;
+		return false;
+	}
+
 	VkMemoryAllocateInfo ai{};
 	ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 	ai.allocationSize  = memReq.size;
-	ai.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits, memProps);
-	VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &mem));
-	VK_CHECK(vkBindBufferMemory(m_device, buf, mem, 0));
+	ai.memoryTypeIndex = memoryType;
+	if (vkAllocateMemory(m_device, &ai, nullptr, &mem) != VK_SUCCESS)
+	{
+		vkDestroyBuffer(m_device, buf, nullptr);
+		buf = VK_NULL_HANDLE;
+		return false;
+	}
+	if (vkBindBufferMemory(m_device, buf, mem, 0) != VK_SUCCESS)
+	{
+		vkFreeMemory(m_device, mem, nullptr);
+		vkDestroyBuffer(m_device, buf, nullptr);
+		mem = VK_NULL_HANDLE;
+		buf = VK_NULL_HANDLE;
+		return false;
+	}
+	return true;
 }
 
 void Engine_Vulkan::CreateBuffers()
@@ -917,39 +1004,30 @@ void Engine_Vulkan::CreateBuffers()
 		uint32_t rebarIdx = FindMemoryTypeSoft(memReq.memoryTypeBits, rebar);
 		vkDestroyBuffer(m_device, probeBuf, nullptr);
 
-		if (rebarIdx != UINT32_MAX)
-		{
-			// Try to allocate both field buffers with ReBAR.
-			// Allocate volt first; if it succeeds, try curr.
-			CreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_voltBuf, m_voltMem);
-			VkResult r = vkMapMemory(m_device, m_voltMem, 0, m_fieldBufSize, 0, (void**)&m_voltMapped);
-			if (r == VK_SUCCESS)
+			if (rebarIdx != UINT32_MAX)
 			{
-				CreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_currBuf, m_currMem);
-				r = vkMapMemory(m_device, m_currMem, 0, m_fieldBufSize, 0, (void**)&m_currMapped);
-				if (r != VK_SUCCESS)
+				// A compatible memory type does not guarantee that the aperture is
+				// large enough for both fields. Keep every step recoverable.
+				if (TryCreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_voltBuf, m_voltMem) &&
+				    vkMapMemory(m_device, m_voltMem, 0, m_fieldBufSize, 0, (void**)&m_voltMapped) == VK_SUCCESS &&
+				    TryCreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_currBuf, m_currMem) &&
+				    vkMapMemory(m_device, m_currMem, 0, m_fieldBufSize, 0, (void**)&m_currMapped) == VK_SUCCESS)
 				{
-					// Curr map failed; tear down and fall back
+					// Both mappings are ready.
+				}
+				else
+				{
+					if (m_currMapped) vkUnmapMemory(m_device, m_currMem);
+					if (m_voltMapped) vkUnmapMemory(m_device, m_voltMem);
 					m_currMapped = nullptr;
-					vkUnmapMemory(m_device, m_voltMem);
 					m_voltMapped = nullptr;
-					vkDestroyBuffer(m_device, m_voltBuf, nullptr);
-					vkFreeMemory(m_device, m_voltMem, nullptr);
-					vkDestroyBuffer(m_device, m_currBuf, nullptr);
-					vkFreeMemory(m_device, m_currMem, nullptr);
+					if (m_currBuf) vkDestroyBuffer(m_device, m_currBuf, nullptr);
+					if (m_currMem) vkFreeMemory(m_device, m_currMem, nullptr);
+					if (m_voltBuf) vkDestroyBuffer(m_device, m_voltBuf, nullptr);
+					if (m_voltMem) vkFreeMemory(m_device, m_voltMem, nullptr);
 					m_voltBuf = m_currBuf = VK_NULL_HANDLE;
 					m_voltMem = m_currMem = VK_NULL_HANDLE;
 				}
-			}
-			else
-			{
-				// Volt map failed; tear down and fall back
-				m_voltMapped = nullptr;
-				vkDestroyBuffer(m_device, m_voltBuf, nullptr);
-				vkFreeMemory(m_device, m_voltMem, nullptr);
-				m_voltBuf = VK_NULL_HANDLE;
-				m_voltMem = VK_NULL_HANDLE;
-			}
 		}
 	}
 
@@ -1368,6 +1446,17 @@ void Engine_Vulkan::SetupGPUExcitation()
 
 void Engine_Vulkan::SetupGPUExtensions()
 {
+	bool startupTrace = (g_settings.GetVerboseLevel() > 0);
+	if (const char* env = std::getenv("OPENEMS_GPU_STARTUP_TRACE"))
+	{
+		char* endPtr = nullptr;
+		long v = std::strtol(env, &endPtr, 10);
+		if (endPtr && *endPtr == '\0')
+			startupTrace = (v != 0);
+	}
+
+	auto extBegin = std::chrono::steady_clock::now();
+
 	// Scan operator extensions and setup GPU resources for each
 	// Iterate operator extensions
 	size_t nExts = Op->GetNumberOfExtentions();
@@ -1418,7 +1507,25 @@ void Engine_Vulkan::SetupGPUExtensions()
 	// totalDescSets += 1;
 	// totalStorageBindings += 5;
 
-	if (totalDescSets == 0) return;  // No GPU extensions to setup
+	if (startupTrace)
+	{
+		cout << "[Vulkan startup] extension scan: op_ext=" << nExts
+		     << ", upml=" << numUPML
+		     << ", dispersive_orders=" << numDispOrders
+		     << ", tfsf=" << numTFSF
+		     << ", mur=" << numMur
+		     << ", rlc=" << numRLC
+		     << ", desc_sets=" << totalDescSets
+		     << ", storage_bindings=" << totalStorageBindings
+		     << endl;
+	}
+
+	if (totalDescSets == 0)
+	{
+		if (startupTrace)
+			cout << "[Vulkan startup] no GPU extension resources required" << endl;
+		return;  // No GPU extensions to setup
+	}
 
 	// Create extension descriptor set layouts
 	CreateExtensionDescriptorLayouts();
@@ -1433,22 +1540,48 @@ void Engine_Vulkan::SetupGPUExtensions()
 	pi.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 	VK_CHECK(vkCreateDescriptorPool(m_device, &pi, nullptr, &m_extDescPool));
 
-	// Setup each extension type
-	// Each SetupGPU_* routine already iterates all matching extensions.
-	// Calling them once per extension would duplicate allocations.
+	// Setup each extension family exactly once.
+	// Each SetupGPU_* function scans all operator extensions internally.
 	if (numUPML > 0)
+	{
+		if (startupTrace)
+			cout << "[Vulkan startup] setup extension family: UPML" << endl;
 		SetupGPU_UPML();
+	}
 	if (numDispOrders > 0)
+	{
+		if (startupTrace)
+			cout << "[Vulkan startup] setup extension family: Dispersive" << endl;
 		SetupGPU_Dispersive();
+	}
 	if (numTFSF > 0)
+	{
+		if (startupTrace)
+			cout << "[Vulkan startup] setup extension family: TFSF" << endl;
 		SetupGPU_TFSF();
+	}
 	if (numMur > 0)
+	{
+		if (startupTrace)
+			cout << "[Vulkan startup] setup extension family: Mur" << endl;
 		SetupGPU_Mur();
+	}
 	if (numRLC > 0)
+	{
+		if (startupTrace)
+			cout << "[Vulkan startup] setup extension family: RLC" << endl;
 		SetupGPU_RLC();
+	}
 
 	// Create extension compute pipelines
 	CreateExtensionPipelines();
+
+	if (startupTrace)
+	{
+		auto extEnd = std::chrono::steady_clock::now();
+		double extMs = std::chrono::duration<double, std::milli>(extEnd - extBegin).count();
+		cout << "[Vulkan startup] SetupGPUExtensions total: " << extMs << " ms" << endl;
+	}
 }
 
 void Engine_Vulkan::CreateExtensionDescriptorLayouts()
@@ -1528,23 +1661,24 @@ void Engine_Vulkan::CreateExtensionPipelines()
 	// --- UPML pipelines ---
 	if (m_hasGPU_UPML)
 	{
-		m_upmlPipeLayout = makePipeLayout(m_upmlPreVoltDescLayout, sizeof(PmlPC));
+		m_upmlPrePipeLayout  = makePipeLayout(m_upmlPreVoltDescLayout, sizeof(PmlPC));
+		m_upmlPostPipeLayout = makePipeLayout(m_upmlPostVoltDescLayout, sizeof(PmlPC));
 
 		VkShaderModule mod;
 		mod = CreateShaderModule(gpu_spirv::upml_pre_voltage_data, gpu_spirv::upml_pre_voltage_size);
-		m_upmlPreVoltPipeline = makePipeline(mod, m_upmlPipeLayout);
+		m_upmlPreVoltPipeline = makePipeline(mod, m_upmlPrePipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
 
 		mod = CreateShaderModule(gpu_spirv::upml_post_voltage_data, gpu_spirv::upml_post_voltage_size);
-		m_upmlPostVoltPipeline = makePipeline(mod, m_upmlPipeLayout);
+		m_upmlPostVoltPipeline = makePipeline(mod, m_upmlPostPipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
 
 		mod = CreateShaderModule(gpu_spirv::upml_pre_current_data, gpu_spirv::upml_pre_current_size);
-		m_upmlPreCurrPipeline = makePipeline(mod, m_upmlPipeLayout);
+		m_upmlPreCurrPipeline = makePipeline(mod, m_upmlPrePipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
 
 		mod = CreateShaderModule(gpu_spirv::upml_post_current_data, gpu_spirv::upml_post_current_size);
-		m_upmlPostCurrPipeline = makePipeline(mod, m_upmlPipeLayout);
+		m_upmlPostCurrPipeline = makePipeline(mod, m_upmlPostPipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
 	}
 
@@ -1590,19 +1724,20 @@ void Engine_Vulkan::CreateExtensionPipelines()
 	// --- Mur ABC pipelines ---
 	if (m_hasGPU_Mur)
 	{
-		m_murPipeLayout = makePipeLayout(m_murPreDescLayout, sizeof(MurPC));
+		m_murUpdatePipeLayout = makePipeLayout(m_murPreDescLayout, sizeof(MurPC));
+		m_murApplyPipeLayout  = makePipeLayout(m_murApplyDescLayout, sizeof(MurPC));
 
 		VkShaderModule mod;
 		mod = CreateShaderModule(gpu_spirv::mur_pre_voltage_data, gpu_spirv::mur_pre_voltage_size);
-		m_murPreVoltPipeline = makePipeline(mod, m_murPipeLayout);
+		m_murPreVoltPipeline = makePipeline(mod, m_murUpdatePipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
 
 		mod = CreateShaderModule(gpu_spirv::mur_post_voltage_data, gpu_spirv::mur_post_voltage_size);
-		m_murPostVoltPipeline = makePipeline(mod, m_murPipeLayout);
+		m_murPostVoltPipeline = makePipeline(mod, m_murUpdatePipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
 
 		mod = CreateShaderModule(gpu_spirv::mur_apply_voltage_data, gpu_spirv::mur_apply_voltage_size);
-		m_murApplyVoltPipeline = makePipeline(mod, m_murPipeLayout);
+		m_murApplyVoltPipeline = makePipeline(mod, m_murApplyPipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
 	}
 
@@ -2336,18 +2471,20 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 	m_probeCacheCount = (uint32_t)m_recordedCells.size();
 	cerr << "[Vulkan] Probe cache: " << m_probeCacheCount << " unique cells recorded." << endl;
 
-	// Build CPU-side cache map: key → index
-	m_probeCacheMap.clear();
-	m_probeCacheMap.reserve(m_probeCacheCount);
+	// Build CPU-side cache keys: sorted vector (already sorted by dedup step above)
+	// Index into m_probeCacheCPU is simply the position in the sorted vector.
+	m_probeCacheKeys.resize(m_probeCacheCount);
+	m_probeCacheHits = 0;
+	m_probeCacheMisses = 0;
 	std::vector<uint32_t> probeIndices(m_probeCacheCount);
 	std::vector<uint32_t> probeFieldSel(m_probeCacheCount);
 
 	for (uint32_t i = 0; i < m_probeCacheCount; ++i)
 	{
 		uint64_t cell = m_recordedCells[i];
+		m_probeCacheKeys[i] = cell;
 		uint32_t fieldSel = (uint32_t)(cell >> 48);
 		uint32_t linearIdx = (uint32_t)(cell & 0x0000FFFFFFFFFFFF);
-		m_probeCacheMap[cell] = i;
 		probeIndices[i]  = linearIdx;
 		probeFieldSel[i] = fieldSel;
 	}
@@ -2360,10 +2497,9 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 
 	// Create GPU buffers for the gather shader
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-	VkMemoryPropertyFlags dLoc  = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-	                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-	                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	VkDeviceSize idxSize = m_probeCacheCount * sizeof(uint32_t);
 	VkDeviceSize outSize = m_probeCacheCount * sizeof(float);
@@ -2376,56 +2512,11 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 	CreateGpuBuf(m_probeSelBuf, idxSize, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, dLoc);
 	UploadGpuBuf(m_probeSelBuf, probeFieldSel.data(), idxSize);
 
-	// Probe output buffer: try ReBAR for zero-copy CPU readback
-	CreateGpuBuf(m_probeOutBuf, outSize, usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-	             m_voltMapped ? rebar : dLoc);
-
-	if (m_voltMapped) // ReBAR available
-	{
-		VkResult r = vkMapMemory(m_device, m_probeOutBuf.memory, 0, outSize, 0,
-		                         (void**)&m_probeOutMapped);
-		if (r != VK_SUCCESS)
-			m_probeOutMapped = nullptr;
-	}
-
-	// If no ReBAR, create a staging buffer for download
-	if (!m_probeOutMapped)
-	{
-		VkMemoryPropertyFlags hostVis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-		                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-
-		// Create a host-visible readback ring matching command slots.
-		// This allows probe transfers to be recorded in the main command buffer,
-		// so SnapshotProbeCache() can memcpy directly without a blocking submit.
-		bool ringReady = true;
-		for (int i = 0; i < CMD_RING_SIZE; ++i)
-		{
-			CreateGpuBuf(m_probeReadbackBuf[i], outSize,
-			             VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
-			VkResult mr = vkMapMemory(m_device, m_probeReadbackBuf[i].memory, 0, outSize, 0,
-			                          (void**)&m_probeReadbackMapped[i]);
-			if (mr != VK_SUCCESS)
-			{
-				ringReady = false;
-				break;
-			}
-		}
-
-		if (!ringReady)
-		{
-			for (int i = 0; i < CMD_RING_SIZE; ++i)
-			{
-				if (m_probeReadbackMapped[i])
-				{
-					vkUnmapMemory(m_device, m_probeReadbackBuf[i].memory);
-					m_probeReadbackMapped[i] = nullptr;
-				}
-				DestroyGpuBuf(m_probeReadbackBuf[i]);
-			}
-			CreateGpuBuf(m_probeStagingBuf, outSize,
-			             VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
-		}
-	}
+	// Probe results are compact. Let the GPU write them directly to coherent
+	// host-visible memory instead of coupling readback to the field allocation.
+	CreateGpuBuf(m_probeOutBuf, outSize, usage, hostVisible);
+	VK_CHECK(vkMapMemory(m_device, m_probeOutBuf.memory, 0, outSize, 0,
+	                     (void**)&m_probeOutMapped));
 
 	// Create probe gather pipeline (re-use existing m_probeDescLayout with 5 bindings)
 	// Descriptor pool for 1 set, 5 storage buffer descriptors
@@ -2481,7 +2572,7 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 
 	m_hasGPU_Probes = true;
 	cerr << "[Vulkan] Probe gather pipeline created (" << m_probeCacheCount
-	     << " cells, " << (m_probeOutMapped ? "ReBAR direct" : "staging") << " readback)." << endl;
+	     << " cells, host-visible direct readback)." << endl;
 }
 
 void Engine_Vulkan::SnapshotProbeCache()
@@ -2561,8 +2652,8 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	{
 		uint32_t groups = (u.totalCells + 255) / 256;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-		                        m_upmlPipeLayout, 0, 1, &u.preVoltDesc, 0, nullptr);
-		vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+			                        m_upmlPrePipeLayout, 0, 1, &u.preVoltDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_upmlPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreVolt = true;
 	}
@@ -2575,8 +2666,8 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		if (ts < m.startTS) continue;  // Mur not yet active
 		uint32_t groups = (m.totalCells + 255) / 256;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-		                        m_murPipeLayout, 0, 1, &m.preDesc, 0, nullptr);
-		vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+			                        m_murUpdatePipeLayout, 0, 1, &m.preDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreVolt = true;
 	}
@@ -2633,8 +2724,8 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	{
 		uint32_t groups = (u.totalCells + 255) / 256;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-		                        m_upmlPipeLayout, 0, 1, &u.preCurrDesc, 0, nullptr);
-		vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+			                        m_upmlPrePipeLayout, 0, 1, &u.preCurrDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_upmlPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreCurr = true;
 	}
@@ -2720,6 +2811,56 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 {
 	if (iterTS == 0) return true;
 
+	// On some drivers (notably RADV/AMDGPU), very long command buffers can
+	// trigger GPU watchdog resets. Split pure-GPU batches into smaller submits.
+	if (!m_hasCPUExtensions)
+	{
+		if (iterTS > m_maxTSPerSubmit)
+		{
+			if (g_settings.GetVerboseLevel() > 1)
+				cout << "Engine_Vulkan: splitting " << iterTS
+				     << " timesteps into chunks of " << m_maxTSPerSubmit
+				     << " (progress every ~" << m_chunkProgressIntervalSec << " s)"
+				     << endl;
+
+			unsigned int submitted = 0;
+			unsigned int remaining = iterTS;
+			while (remaining > 0)
+			{
+				unsigned int chunk = std::min(remaining, m_maxTSPerSubmit);
+				if (!IterateTS(chunk))
+					return false;
+				remaining -= chunk;
+				submitted += chunk;
+
+				if (g_settings.GetVerboseLevel() > 0)
+				{
+					auto now = std::chrono::steady_clock::now();
+					bool printNow = !m_chunkProgressHasLastPrint;
+					if (!printNow)
+					{
+						double dt = std::chrono::duration<double>(now - m_chunkProgressLastPrint).count();
+						printNow = (dt >= m_chunkProgressIntervalSec);
+					}
+					if (printNow)
+					{
+						unsigned int pct = (iterTS > 0)
+						                 ? (unsigned int)((100ULL * submitted + (iterTS / 2)) / iterTS)
+						                 : 100U;
+						cout << "Engine_Vulkan: chunk progress " << submitted << "/" << iterTS
+						     << " TS (" << pct << "%)";
+						if (m_speculativeTS > 0)
+							cout << " [speculative]";
+						cout << endl;
+						m_chunkProgressLastPrint = now;
+						m_chunkProgressHasLastPrint = true;
+					}
+				}
+			}
+			return true;
+		}
+	}
+
 	uint32_t N  = numLines[0] * numLines[1] * numLines[2];
 	uint32_t cN = (numLines[0]-1) * (numLines[1]-1) * (numLines[2]-1);
 	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
@@ -2759,6 +2900,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		bool needPostCurrBarrierFused = (m_hasGPU_TFSF || hasDispCurrADE);
 		bool needPostVoltBarrier = (m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC);
 		bool needPostCurrBarrier = (m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE);
+		bool hasVoltLateWritesFused = hasExcVolt || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
+		bool hasCurrLateWritesFused = hasExcCurr || m_hasGPU_TFSF || hasDispCurrADE;
+		bool hasVoltLateWrites = hasExcVolt || m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
+		bool hasCurrLateWrites = hasExcCurr || m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE;
 		bool useAsyncProbeCopy = m_hasDedicatedTransferQueue && m_hasGPU_Probes &&
 		                         (m_probeCacheCount > 0) && !m_probeOutMapped &&
 		                         (m_probeReadbackMapped[m_cmdIdx] != nullptr);
@@ -2852,8 +2997,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 						if (ts < m.startTS) continue;
 						uint32_t groups = (m.totalCells + 255) / 256;
 						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_murPipeLayout, 0, 1, &m.preDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+						                        m_murUpdatePipeLayout, 0, 1, &m.preDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
 					// RLC pre-voltage
@@ -2927,8 +3072,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 						if (ts < m.startTS) continue;
 						uint32_t groups = (m.totalCells + 255) / 256;
 						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_murPipeLayout, 0, 1, &m.postDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+						                        m_murUpdatePipeLayout, 0, 1, &m.postDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
 					// TF/SF voltage injection
@@ -2950,25 +3095,28 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				// --- Apply2Voltages (dispersive, Mur, RLC — same as non-fused path) ---
 				if (!m_gpuDisp.empty())
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
-				for (const auto& d : m_gpuDisp)
+				for (const auto &d : m_gpuDisp)
 				{
-					if (!d.voltADEOn) continue;
+					if (!d.voltADEOn)
+						continue;
 					DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
 					uint32_t groups = (d.count + 255) / 256;
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_dispApplyPipeLayout, 0, 1, &d.applyVoltDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
+											&d.applyVoltDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
+									   &dpc);
 					vkCmdDispatch(cmd, groups, 1, 1);
 				}
 				if (!m_gpuMur.empty())
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
-				for (const auto& m : m_gpuMur)
+				for (const auto &m : m_gpuMur)
 				{
-					if (ts < m.startTS) continue;
+					if (ts < m.startTS)
+						continue;
 					uint32_t groups = (m.totalCells + 255) / 256;
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_murPipeLayout, 0, 1, &m.applyDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyPipeLayout, 0, 1,
+											&m.applyDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_murApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 					vkCmdDispatch(cmd, groups, 1, 1);
 				}
 				if (m_hasGPU_RLC)
@@ -2976,10 +3124,18 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					RlcPC pc = {m_gpuRLC.count};
 					uint32_t groups = (m_gpuRLC.count + 255) / 256;
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyVoltPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_rlcApplyPipeLayout, 0, 1, &m_gpuRLC.applyDesc, 0, nullptr);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyPipeLayout, 0, 1,
+											&m_gpuRLC.applyDesc, 0, nullptr);
 					vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
 					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+
+				// Late voltage writes must be visible to pre-current extensions
+				// and to the fused Yee current update.
+				if (hasVoltLateWritesFused)
+				{
+					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 				}
 
 				// --- Fused current update (Yee + UPML pre + UPML post) ---
@@ -2988,48 +3144,46 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				{
 					if (!m_gpuDisp.empty())
 						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreCurrPipeline);
-					for (const auto& d : m_gpuDisp)
+					for (const auto &d : m_gpuDisp)
 					{
-						if (!d.currADEOn) continue;
+						if (!d.currADEOn)
+							continue;
 						uint32_t groups = (d.count + 255) / 256;
-						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_dispPrePipeLayout, 0, 1, &d.preCurrDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPrePipeLayout, 0, 1,
+												&d.preCurrDesc, 0, nullptr);
+						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
+										   &d.pc);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
-					vkCmdPipelineBarrier(cmd,
-						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-						0, 1, &barrier, 0, nullptr, 0, nullptr);
+					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 				}
 
 				// Fused current dispatch (Yee + UPML pre/post)
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedCurrPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_fusedPipeLayout, 0, 1, &m_fusedCurrDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-				                   0, sizeof(FusedPC), &fusedPC);
-				vkCmdDispatch(cmd, voltGroups, 1, 1);  // dispatch N threads (same as voltage)
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedPipeLayout, 0, 1,
+										&m_fusedCurrDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FusedPC), &fusedPC);
+				vkCmdDispatch(cmd, voltGroups, 1, 1); // dispatch N threads (same as voltage)
 
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					0, 1, &barrier, 0, nullptr, 0, nullptr);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+									 1, &barrier, 0, nullptr, 0, nullptr);
 
 				// --- Current excitation ---
 				if (hasExcCurr)
 				{
-					ExcPC epc = {m_excCurrCount, (int32_t)(ts+1), m_excSignalLen, m_excSignalPeriod};
+					ExcPC epc = {m_excCurrCount, (int32_t)(ts + 1), m_excSignalLen, m_excSignalPeriod};
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_excPipeLayout, 0, 1, &m_excCurrDescSet, 0, nullptr);
-					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-					                   0, sizeof(ExcPC), &epc);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeLayout, 0, 1,
+											&m_excCurrDescSet, 0, nullptr);
+					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExcPC), &epc);
 					vkCmdDispatch(cmd, excCurrGroups, 1, 1);
 
 					if (needPostCurrBarrierFused)
 					{
-						vkCmdPipelineBarrier(cmd,
-							VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-							0, 1, &barrier, 0, nullptr, 0, nullptr);
+						vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+											 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0,
+											 nullptr);
 					}
 				}
 
@@ -3039,23 +3193,35 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					TfsfPC tpc = {m_gpuTFSF.currCount, (int32_t)(ts), tfsfSigLen, tfsfSigPeriod};
 					uint32_t groups = (m_gpuTFSF.currCount + 255) / 256;
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfCurrPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.currDesc, 0, nullptr);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfPipeLayout, 0, 1,
+											&m_gpuTFSF.currDesc, 0, nullptr);
 					vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
 					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+				if (m_hasGPU_TFSF && hasDispCurrADE)
+				{
+					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 				}
 				// Dispersive apply current
 				if (!m_gpuDisp.empty())
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyCurrPipeline);
-				for (const auto& d : m_gpuDisp)
+				for (const auto &d : m_gpuDisp)
 				{
-					if (!d.currADEOn) continue;
+					if (!d.currADEOn)
+						continue;
 					DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
 					uint32_t groups = (d.count + 255) / 256;
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_dispApplyPipeLayout, 0, 1, &d.applyCurrDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
+											&d.applyCurrDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
+									   &dpc);
 					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+				if (hasCurrLateWritesFused)
+				{
+					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 				}
 			}
 			else
@@ -3103,8 +3269,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			{
 				uint32_t groups = (u.totalCells + 255) / 256;
 				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_upmlPipeLayout, 0, 1, &u.postVoltDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+				                        m_upmlPostPipeLayout, 0, 1, &u.postVoltDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
 
@@ -3116,8 +3282,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				if (ts < m.startTS) continue;
 				uint32_t groups = (m.totalCells + 255) / 256;
 				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_murPipeLayout, 0, 1, &m.postDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+				                        m_murUpdatePipeLayout, 0, 1, &m.postDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
 
@@ -3145,13 +3311,14 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			// Dispersive apply
 			if (!m_gpuDisp.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
-			for (const auto& d : m_gpuDisp)
+			for (const auto &d : m_gpuDisp)
 			{
-				if (!d.voltADEOn) continue;
+				if (!d.voltADEOn)
+					continue;
 				DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
 				uint32_t groups = (d.count + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_dispApplyPipeLayout, 0, 1, &d.applyVoltDesc, 0, nullptr);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
+										&d.applyVoltDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
@@ -3159,13 +3326,14 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			// Mur apply (overwrites boundary voltages)
 			if (!m_gpuMur.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
-			for (const auto& m : m_gpuMur)
+			for (const auto &m : m_gpuMur)
 			{
-				if (ts < m.startTS) continue;
+				if (ts < m.startTS)
+					continue;
 				uint32_t groups = (m.totalCells + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_murPipeLayout, 0, 1, &m.applyDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_murPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyPipeLayout, 0, 1, &m.applyDesc,
+										0, nullptr);
+				vkCmdPushConstants(cmd, m_murApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
 
@@ -3175,10 +3343,16 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				RlcPC pc = {m_gpuRLC.count};
 				uint32_t groups = (m_gpuRLC.count + 255) / 256;
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyVoltPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_rlcApplyPipeLayout, 0, 1, &m_gpuRLC.applyDesc, 0, nullptr);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyPipeLayout, 0, 1,
+										&m_gpuRLC.applyDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			if (hasVoltLateWrites)
+			{
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+									 1, &barrier, 0, nullptr, 0, nullptr);
 			}
 
 			// === Pre-current extensions (GPU) ===
@@ -3186,32 +3360,28 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 
 			// --- Current update ---
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-			                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
-			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(GridPC), &gridPC);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet,
+									0, nullptr);
+			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC), &gridPC);
 			vkCmdDispatch(cmd, currGroups, 1, 1);
 
-			vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0, 1, &barrier, 0, nullptr, 0, nullptr);
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+								 &barrier, 0, nullptr, 0, nullptr);
 
 			// --- Current excitation ---
 			if (hasExcCurr)
 			{
-				ExcPC epc = {m_excCurrCount, (int32_t)(ts+1), m_excSignalLen, m_excSignalPeriod};
+				ExcPC epc = {m_excCurrCount, (int32_t)(ts + 1), m_excSignalLen, m_excSignalPeriod};
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_excPipeLayout, 0, 1, &m_excCurrDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-				                   0, sizeof(ExcPC), &epc);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeLayout, 0, 1, &m_excCurrDescSet,
+										0, nullptr);
+				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExcPC), &epc);
 				vkCmdDispatch(cmd, excCurrGroups, 1, 1);
 
 				if (needPostCurrBarrier)
 				{
-					vkCmdPipelineBarrier(cmd,
-						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-						0, 1, &barrier, 0, nullptr, 0, nullptr);
+					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 				}
 			}
 
@@ -3219,12 +3389,12 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			// UPML post-current
 			if (!m_gpuUPML.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostCurrPipeline);
-			for (const auto& u : m_gpuUPML)
+			for (const auto &u : m_gpuUPML)
 			{
 				uint32_t groups = (u.totalCells + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_upmlPipeLayout, 0, 1, &u.postCurrDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_upmlPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostPipeLayout, 0, 1,
+										&u.postCurrDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
 
@@ -3234,24 +3404,37 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				TfsfPC tpc = {m_gpuTFSF.currCount, (int32_t)(ts), tfsfSigLen, tfsfSigPeriod};
 				uint32_t groups = (m_gpuTFSF.currCount + 255) / 256;
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfCurrPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.currDesc, 0, nullptr);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfPipeLayout, 0, 1,
+										&m_gpuTFSF.currDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			if ((m_hasGPU_UPML || m_hasGPU_TFSF) && hasDispCurrADE)
+			{
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+									 1, &barrier, 0, nullptr, 0, nullptr);
 			}
 
 			// Dispersive apply current
 			if (!m_gpuDisp.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyCurrPipeline);
-			for (const auto& d : m_gpuDisp)
+			for (const auto &d : m_gpuDisp)
 			{
-				if (!d.currADEOn) continue;
+				if (!d.currADEOn)
+					continue;
 				DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
 				uint32_t groups = (d.count + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_dispApplyPipeLayout, 0, 1, &d.applyCurrDesc, 0, nullptr);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
+										&d.applyCurrDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
+			}
+
+			if (hasCurrLateWrites)
+			{
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+									 1, &barrier, 0, nullptr, 0, nullptr);
 			}
 			} // end else (original separate-dispatch path)
 		}
@@ -3278,7 +3461,18 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			                   0, sizeof(uint32_t), &m_probeCacheCount);
 			vkCmdDispatch(cmd, probeGroups, 1, 1);
 
-			// If probe output is not directly mapped (no ReBAR), enqueue a device->host
+			if (m_probeOutMapped)
+			{
+				VkMemoryBarrier hostBarrier{};
+				hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+				hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+				vkCmdPipelineBarrier(cmd,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+					0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
+			}
+
+			// If probe output is not directly mapped, enqueue a device->host
 			// copy into the readback ring for this submission slot.
 			if (useAsyncProbeCopy)
 			{
@@ -3631,11 +3825,13 @@ void Engine_Vulkan::CleanupExtensions()
 	destroyPipeline(m_rlcApplyVoltPipeline);
 	destroyPipeline(m_probePipeline);
 
-	destroyPipeLayout(m_upmlPipeLayout);
+	destroyPipeLayout(m_upmlPrePipeLayout);
+	destroyPipeLayout(m_upmlPostPipeLayout);
 	destroyPipeLayout(m_dispPrePipeLayout);
 	destroyPipeLayout(m_dispApplyPipeLayout);
 	destroyPipeLayout(m_tfsfPipeLayout);
-	destroyPipeLayout(m_murPipeLayout);
+	destroyPipeLayout(m_murUpdatePipeLayout);
+	destroyPipeLayout(m_murApplyPipeLayout);
 	destroyPipeLayout(m_rlcPrePipeLayout);
 	destroyPipeLayout(m_rlcApplyPipeLayout);
 	destroyPipeLayout(m_probePipeLayout);
@@ -3732,7 +3928,7 @@ void Engine_Vulkan::CleanupExtensions()
 	DestroyGpuBuf(m_probeStagingBuf);
 	if (m_probeDescPool) { vkDestroyDescriptorPool(m_device, m_probeDescPool, nullptr); m_probeDescPool = VK_NULL_HANDLE; }
 	m_probeGatherDescSet = VK_NULL_HANDLE; // freed with pool
-	m_probeCacheMap.clear();
+	m_probeCacheKeys.clear();
 	m_probeCacheCPU.clear();
 	m_probeCacheCount = 0;
 
@@ -3967,27 +4163,16 @@ void Engine_Vulkan::CleanupFusedUPML()
 
 void Engine_Vulkan::SetupGPU_EnergyReduction()
 {
-	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-	                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-
 	VkDeviceSize partialSize = 2 * ENERGY_NUM_WG * sizeof(float);
+	VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-	// Try ReBAR allocation for zero-copy readback of the tiny partials buffer
-	VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-	                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-	                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	VkMemoryPropertyFlags dLoc  = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	// Create the buffer — try ReBAR first, fall back to device-local
-	CreateGpuBuf(m_energyPartialBuf, partialSize, usage, m_voltMapped ? rebar : dLoc);
-
-	if (m_voltMapped) // we have ReBAR — map the partials buffer too
-	{
-		VkResult r = vkMapMemory(m_device, m_energyPartialBuf.memory, 0, partialSize, 0,
-		                         (void**)&m_energyMapped);
-		if (r != VK_SUCCESS)
-			m_energyMapped = nullptr;
-	}
+	// The reduction writes only 2 KiB. Keep that output directly CPU-visible
+	// even when the large field buffers stay in device-local memory on a dGPU.
+	CreateGpuBuf(m_energyPartialBuf, partialSize,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostVisible);
+	VK_CHECK(vkMapMemory(m_device, m_energyPartialBuf.memory, 0, partialSize, 0,
+	                     (void**)&m_energyMapped));
 
 	// Descriptor layout: 3 bindings (volt, curr, partials)
 	auto makeLayout = [&](uint32_t nBindings) -> VkDescriptorSetLayout
@@ -4051,6 +4236,7 @@ void Engine_Vulkan::SetupGPU_EnergyReduction()
 	ci.layout = m_energyPipeLayout;
 	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_energyPipeline));
 	vkDestroyShaderModule(m_device, mod, nullptr);
+
 }
 
 void Engine_Vulkan::CleanupGPU_EnergyReduction()
@@ -4062,6 +4248,7 @@ void Engine_Vulkan::CleanupGPU_EnergyReduction()
 		m_energyMapped = nullptr;
 	}
 	DestroyGpuBuf(m_energyPartialBuf);
+
 	if (m_energyPipeline)   { vkDestroyPipeline(m_device, m_energyPipeline, nullptr); m_energyPipeline = VK_NULL_HANDLE; }
 	if (m_energyPipeLayout) { vkDestroyPipelineLayout(m_device, m_energyPipeLayout, nullptr); m_energyPipeLayout = VK_NULL_HANDLE; }
 	if (m_energyDescLayout) { vkDestroyDescriptorSetLayout(m_device, m_energyDescLayout, nullptr); m_energyDescLayout = VK_NULL_HANDLE; }
@@ -4085,23 +4272,21 @@ double Engine_Vulkan::CalcFastEnergyGPU() const
 		vkCmdPushConstants(cmd, m_energyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 		                   0, sizeof(EnergyPC), &pc);
 		vkCmdDispatch(cmd, ENERGY_NUM_WG, 1, 1);
+
+		VkMemoryBarrier hostBarrier{};
+		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+			0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
 	});
 
 	// Read back the partial sums
 	VkDeviceSize partialSize = 2 * ENERGY_NUM_WG * sizeof(float);
 	float partials[2 * ENERGY_NUM_WG];
 
-	if (m_energyMapped)
-	{
-		// ReBAR: direct read
-		memcpy(partials, m_energyMapped, partialSize);
-	}
-	else
-	{
-		// Staging buffer download
-		DownloadFromDeviceBuffer(
-			m_energyPartialBuf.buffer, partials, partialSize);
-	}
+	memcpy(partials, m_energyMapped, partialSize);
 
 	// CPU-side reduction of the partial sums (256 E + 256 H floats)
 	double E_energy = 0.0, H_energy = 0.0;

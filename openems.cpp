@@ -21,6 +21,7 @@
 #include <fstream>
 #include <thread>
 #include <cstdlib>
+#include <chrono>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -1297,6 +1298,36 @@ int openEMS::SetupFDTD()
 	//check all properties to request material storage during operator creation...
 	SetupMaterialStorages();
 
+#ifdef WITH_GPU
+	if (dynamic_cast<Operator_Vulkan*>(FDTD_Op))
+	{
+		bool strictCoeffReserve = false;
+		if (const char* envStrict = std::getenv("OPENEMS_GPU_PREFLIGHT_STRICT"))
+			strictCoeffReserve = (std::atoi(envStrict) != 0);
+
+		std::string preflightErr;
+		if (!Engine_Vulkan::PreflightAllocationForGrid(
+				FDTD_Op->GetNumberOfLines(0),
+				FDTD_Op->GetNumberOfLines(1),
+				FDTD_Op->GetNumberOfLines(2),
+				strictCoeffReserve,
+				&preflightErr))
+		{
+			cerr << "openEMS::SetupFDTD: GPU memory preflight failed before operator generation: "
+			     << preflightErr << endl;
+			cerr << "  Hint: reduce mesh size, disable strict reserve (OPENEMS_GPU_PREFLIGHT_STRICT=0), "
+			     << "or use a different GPU via OPENEMS_GPU_INDEX." << endl;
+			Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+			return 2;
+		}
+
+		if (strictCoeffReserve)
+			cout << "openEMS::SetupFDTD: GPU preflight passed (strict coefficient reserve enabled)." << endl;
+		else
+			cout << "openEMS::SetupFDTD: GPU preflight passed (core field/staging allocations)." << endl;
+	}
+#endif
+
 	/*******************   create the EC-FDTD operator *****************************/
 	Operator::DebugFlags debugFlags = Operator::None;
 	if (DebugMat)
@@ -1306,7 +1337,28 @@ int openEMS::SetupFDTD()
 	if (m_debugPEC)
 		debugFlags |= Operator::debugPEC;
 
+	bool gpuStartupTrace = false;
+#ifdef WITH_GPU
+	gpuStartupTrace = (dynamic_cast<Operator_Vulkan*>(FDTD_Op) != NULL);
+#endif
+	if (const char* envTrace = std::getenv("OPENEMS_GPU_STARTUP_TRACE"))
+	{
+		char* endPtr = nullptr;
+		long v = std::strtol(envTrace, &endPtr, 10);
+		if (endPtr && *endPtr == '\0')
+			gpuStartupTrace = (v != 0);
+	}
+
+	auto opBuildStart = std::chrono::steady_clock::now();
+	if (gpuStartupTrace)
+		cout << "openEMS::SetupFDTD: starting operator generation (CalcECOperator)..." << endl;
 	FDTD_Op->CalcECOperator( debugFlags );
+	if (gpuStartupTrace)
+	{
+		auto opBuildEnd = std::chrono::steady_clock::now();
+		double opBuildMs = std::chrono::duration<double, std::milli>(opBuildEnd - opBuildStart).count();
+		cout << "openEMS::SetupFDTD: finished CalcECOperator in " << opBuildMs << " ms" << endl;
+	}
 	/*******************************************************************************/
 
 	//reset flags for material storage, if no dump-box resets it to true, it will be cleaned up...
@@ -1364,7 +1416,16 @@ int openEMS::SetupFDTD()
 	}
 
 	//create FDTD engine
+	auto engCreateStart = std::chrono::steady_clock::now();
+	if (gpuStartupTrace)
+		cout << "openEMS::SetupFDTD: creating engine..." << endl;
 	FDTD_Eng = FDTD_Op->CreateEngine();
+	if (gpuStartupTrace)
+	{
+		auto engCreateEnd = std::chrono::steady_clock::now();
+		double engCreateMs = std::chrono::duration<double, std::milli>(engCreateEnd - engCreateStart).count();
+		cout << "openEMS::SetupFDTD: engine created in " << engCreateMs << " ms" << endl;
+	}
 
 	if (Op_Ext_SSD)
 	{
