@@ -165,6 +165,14 @@ bool Operator_Ext_LumpedRLC::BuildExtension()
 		dir = cs_RLC_props->GetDirection();
 		lumpedType = cs_RLC_props->GetLEtype();
 
+		if ((lumpedType != CSPropLumpedElement::PARALLEL) &&
+		    (lumpedType != CSPropLumpedElement::SERIES))
+		{
+			cerr << "Operator_Ext_LumpedRLC::BuildExtension(): Warning: RLCtype is invalid! considering as parallel. "
+					<< " ID: " << cs_RLC_props->GetID() << " @ Property: " << cs_RLC_props->GetName() << endl;
+			lumpedType = CSPropLumpedElement::PARALLEL;
+		}
+
 		// Extract R, L and C from property class
 		C = cs_RLC_props->GetCapacity();
 		R = cs_RLC_props->GetResistance();
@@ -311,6 +319,10 @@ bool Operator_Ext_LumpedRLC::BuildExtension()
 
 							switch (lumpedType)
 							{
+								default:
+									// The value is normalized to PARALLEL above.
+									break;
+
 								case CSPropLumpedElement::PARALLEL:
 								{
 									// Use the explicit capacitor if set; otherwise fall back to the
@@ -525,4 +537,3 @@ bool Operator_Ext_LumpedRLC::IsLElumpedRLC(const CSPropLumpedElement* const p_pr
 	// This needs to be something that isn't a parallel RC circuit to add data to this extension.
 	return isParallelRLC || isSeriesRLC;
 }
-
