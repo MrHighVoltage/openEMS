@@ -1,0 +1,21 @@
+/* Sparse steady-state probe history sampling. */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) readonly buffer VoltBuf { float volt[]; };
+layout(set=0, binding=1) readonly buffer IdxBuf { uint probeIdx[]; };
+layout(set=0, binding=2) buffer HistoryBuf { float history[]; };
+
+layout(push_constant) uniform PC {
+    uint count;
+    uint ringSize;
+    uint timestep;
+};
+
+void main()
+{
+    uint probe = gl_GlobalInvocationID.x;
+    if (probe >= count) return;
+    history[probe * ringSize + timestep % ringSize] = volt[probeIdx[probe]];
+}

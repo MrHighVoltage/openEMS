@@ -22,6 +22,8 @@
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 
+#include <functional>
+
 class Operator_Ext_SteadyState;
 class Engine_Interface_FDTD;
 
@@ -35,7 +37,10 @@ public:
 	virtual void Apply2Current();
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
-	double GetLastDiff() {return m_last_max_diff;}
+	double GetLastDiff();
+	void SetGpuUpdater(std::function<void()> updater) {m_gpuUpdater = std::move(updater);}
+	void UpdateGpuSamples(const float* samples, unsigned int ringPeriods,
+	                      unsigned int completedTS, double totalEnergy);
 
 protected:
 	Operator_Ext_SteadyState* m_Op_SS;
@@ -45,6 +50,7 @@ protected:
 
 	double last_total_energy;
 	Engine_Interface_FDTD* m_Eng_Interface;
+	std::function<void()> m_gpuUpdater;
 };
 
 

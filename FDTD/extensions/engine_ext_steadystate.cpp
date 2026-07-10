@@ -47,6 +47,62 @@ Engine_Ext_SteadyState::~Engine_Ext_SteadyState()
 	m_Eng_Interface = NULL;
 }
 
+double Engine_Ext_SteadyState::GetLastDiff()
+{
+	if (m_gpuUpdater)
+		m_gpuUpdater();
+	return m_last_max_diff;
+}
+
+void Engine_Ext_SteadyState::UpdateGpuSamples(const float* samples, unsigned int ringPeriods,
+	                                           unsigned int completedTS, double totalEnergy)
+{
+	const unsigned int p = m_Op_SS->m_TS_period;
+	const unsigned int completedPeriods = completedTS / p;
+	if (!samples || p == 0 || ringPeriods < 3 || completedPeriods < 2)
+		return;
+
+	bool noValid = true;
+	m_last_max_diff = 0;
+	if (last_total_energy > 0)
+	{
+		m_last_max_diff = std::abs(totalEnergy - last_total_energy) / last_total_energy;
+		noValid = false;
+	}
+	last_total_energy = totalEnergy;
+
+	const unsigned int ringSize = ringPeriods * p;
+	const unsigned int oldPeriod = completedPeriods - 2;
+	const unsigned int newPeriod = completedPeriods - 1;
+	std::vector<double> currPow(m_E_records.size(), 0.0);
+	std::vector<double> diffPow(m_E_records.size(), 0.0);
+	double maxPow = 0;
+	for (size_t probe = 0; probe < m_E_records.size(); ++probe)
+	{
+		const float* history = samples + probe * ringSize;
+		for (unsigned int nt = 0; nt < p; ++nt)
+		{
+			const double oldValue = history[(oldPeriod * p + nt) % ringSize];
+			const double newValue = history[(newPeriod * p + nt) % ringSize];
+			currPow[probe] += newValue * newValue;
+			const double delta = oldValue - newValue;
+			diffPow[probe] += delta * delta;
+		}
+		maxPow = std::max(maxPow, currPow[probe]);
+	}
+
+	for (size_t probe = 0; probe < m_E_records.size(); ++probe)
+	{
+		if (currPow[probe] > maxPow * 1e-2)
+		{
+			m_last_max_diff = std::max(m_last_max_diff, diffPow[probe] / currPow[probe]);
+			noValid = false;
+		}
+	}
+	if (noValid || m_last_max_diff > 1)
+		m_last_max_diff = 1;
+}
+
 void Engine_Ext_SteadyState::Apply2Voltages()
 {
 	unsigned int p = m_Op_SS->m_TS_period;
@@ -102,6 +158,7 @@ void Engine_Ext_SteadyState::Apply2Voltages()
 		if ((no_valid) || (m_last_max_diff>1))
 			m_last_max_diff = 1;
 		delete[] curr_pow; curr_pow = NULL;
+		delete[] diff_pow; diff_pow = NULL;
 		//cerr << m_last_max_diff << endl;
 	}
 }

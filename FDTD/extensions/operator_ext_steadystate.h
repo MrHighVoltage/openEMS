@@ -22,10 +22,12 @@
 #include "FDTD/operator.h"
 
 class Engine_Ext_SteadyState;
+class Engine_Vulkan;
 
 class Operator_Ext_SteadyState : public Operator_Extension
 {
 	friend class Engine_Ext_SteadyState;
+	friend class Engine_Vulkan;
 public:
 	Operator_Ext_SteadyState(Operator* op, double period);
 	virtual ~Operator_Ext_SteadyState();

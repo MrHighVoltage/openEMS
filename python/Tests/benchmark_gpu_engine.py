@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--timesteps", type=int, default=2000)
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--boundary", choices=("pec", "pml"), default="pec")
+    parser.add_argument("--excitation", choices=("gaussian", "sinusoidal"), default="gaussian")
     parser.add_argument("--field-memory", choices=("auto", "device-local"), default="auto")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--probe", action="store_true")
@@ -67,7 +68,10 @@ def main():
         boundary = ["PML_8"] * 6
 
     fdtd = openEMS(NrTS=args.timesteps, EndCriteria=1.0e-300)
-    fdtd.SetGaussExcite(1.0e9, 0.5e9)
+    if args.excitation == "sinusoidal":
+        fdtd.SetSinusExcite(1.0e9)
+    else:
+        fdtd.SetGaussExcite(1.0e9, 0.5e9)
     fdtd.SetBoundaryCond(boundary)
 
     csx = ContinuousStructure()
@@ -99,6 +103,7 @@ def main():
         f" timesteps={args.timesteps}"
         f" gpu_index={args.gpu_index}"
         f" boundary={args.boundary}"
+        f" excitation={args.excitation}"
         f" field_memory={args.field_memory}"
         f" profile={int(args.profile)}"
         f" probe={int(args.probe)}",

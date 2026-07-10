@@ -27,6 +27,7 @@
 class Operator_Ext_Excitation;
 class Operator_Ext_UPML;
 class Operator_Ext_LorentzMaterial;
+class Engine_Ext_SteadyState;
 class Operator_Ext_TFSF;
 class Operator_Ext_Mur_ABC;
 class Operator_Ext_LumpedRLC;
@@ -314,6 +315,9 @@ private:
 	void CreatePipelines();
 	void UploadCoefficients();
 	void SetupGPUExcitation();
+	void SetupGPU_SteadyState();
+	void RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts) const;
+	void UpdateSteadyStateResult();
 	void CleanupVulkan();
 	void SetupProfiling();
 	void CollectProfileForSlot(int slot) const;
@@ -362,6 +366,7 @@ private:
 	struct RlcPC    { uint32_t count; };
 	//! Push constant struct for probe gather shader.
 	struct ProbePC  { uint32_t count; };
+	struct SteadyPC { uint32_t count, ringSize, timestep; };
 
 	//! Helper pairing a VkBuffer with its VkDeviceMemory.
 	struct GpuBuf {
@@ -470,6 +475,20 @@ private:
 	std::vector<GpuMurData>   m_gpuMur;
 	GpuRLCData                m_gpuRLC;
 	GpuProbeData              m_gpuProbes;
+
+	// ---- GPU steady-state observer -----------------------------------
+	Engine_Ext_SteadyState* m_gpuSteadyStateExt = nullptr; // owned by Engine::m_Eng_exts
+	GpuBuf m_steadyProbeIdx, m_steadyHistory;
+	float* m_steadyHistoryMapped = nullptr;
+	uint32_t m_steadyProbeCount = 0;
+	uint32_t m_steadyPeriod = 0;
+	uint32_t m_steadyRingSize = 0;
+	uint32_t m_steadyLastCompletedPeriods = 0;
+	VkDescriptorSetLayout m_steadyDescLayout = VK_NULL_HANDLE;
+	VkPipelineLayout m_steadyPipeLayout = VK_NULL_HANDLE;
+	VkPipeline m_steadyPipeline = VK_NULL_HANDLE;
+	VkDescriptorPool m_steadyDescPool = VK_NULL_HANDLE;
+	VkDescriptorSet m_steadyDescSet = VK_NULL_HANDLE;
 
 	// ---- Extension descriptor set layouts -----------------------------
 	VkDescriptorSetLayout m_upmlPreVoltDescLayout  = VK_NULL_HANDLE;

@@ -25,6 +25,8 @@
 #include "extensions/operator_ext_mur_abc.h"
 #include "extensions/engine_ext_lumpedRLC.h"
 #include "extensions/operator_ext_lumpedRLC.h"
+#include "extensions/engine_ext_steadystate.h"
+#include "extensions/operator_ext_steadystate.h"
 #include "Common/processing.h"
 #include "gpu_shader_spirv.h"
 #include "tools/constants.h"
@@ -535,6 +537,8 @@ void Engine_Vulkan::Init()
 		cout << "  GPU Mur ABC active (" << m_gpuMur.size() << " face(s))" << endl;
 	if (m_hasGPU_RLC)
 		cout << "  GPU lumped RLC active (" << m_gpuRLC.count << " elements)" << endl;
+	if (m_steadyPipeline)
+		cout << "  GPU steady-state sampling active (" << m_steadyProbeCount << " probes)" << endl;
 	cout << "  GPU energy reduction active (" << ENERGY_NUM_WG << " workgroups)" << endl;
 
 	if (startupTrace)
@@ -1325,7 +1329,8 @@ void Engine_Vulkan::SetupGPUExcitation()
 		       dynamic_cast<Engine_Ext_LorentzMaterial*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_TFSF*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_Mur_ABC*>(ext) != nullptr ||
-		       dynamic_cast<Engine_Ext_LumpedRLC*>(ext) != nullptr;
+		       dynamic_cast<Engine_Ext_LumpedRLC*>(ext) != nullptr ||
+		       dynamic_cast<Engine_Ext_SteadyState*>(ext) != nullptr;
 	};
 
 	// The hybrid loop executes extensions on the CPU. Keep every extension
@@ -1337,6 +1342,13 @@ void Engine_Vulkan::SetupGPUExcitation()
 	{
 		for (auto it = m_Eng_exts.begin(); it != m_Eng_exts.end(); )
 		{
+			// openEMS keeps a non-owning pointer to this observer. Leave it in
+			// the engine-owned list, but do not execute it on the pure GPU path.
+			if (dynamic_cast<Engine_Ext_SteadyState*>(*it))
+			{
+				++it;
+				continue;
+			}
 			if (!isGpuNative(*it))
 			{
 				++it;
@@ -1536,7 +1548,8 @@ void Engine_Vulkan::SetupGPUExtensions()
 	{
 		if (startupTrace)
 			cout << "[Vulkan startup] no GPU extension resources required" << endl;
-		return;  // No GPU extensions to setup
+		SetupGPU_SteadyState();
+		return;
 	}
 
 	// Create extension descriptor set layouts
@@ -1587,6 +1600,7 @@ void Engine_Vulkan::SetupGPUExtensions()
 
 	// Create extension compute pipelines
 	CreateExtensionPipelines();
+	SetupGPU_SteadyState();
 
 	if (startupTrace)
 	{
@@ -2453,6 +2467,137 @@ void Engine_Vulkan::SetupGPU_RLC()
 	}
 }
 
+void Engine_Vulkan::SetupGPU_SteadyState()
+{
+	Operator_Ext_SteadyState* opSteady = nullptr;
+	for (size_t i = 0; i < Op->GetNumberOfExtentions(); ++i)
+	{
+		opSteady = dynamic_cast<Operator_Ext_SteadyState*>(Op->GetExtension(i));
+		if (opSteady) break;
+	}
+	for (Engine_Extension* ext : m_Eng_exts)
+	{
+		m_gpuSteadyStateExt = dynamic_cast<Engine_Ext_SteadyState*>(ext);
+		if (m_gpuSteadyStateExt) break;
+	}
+	if (!opSteady || !m_gpuSteadyStateExt || opSteady->m_TS_period == 0 ||
+	    opSteady->m_E_probe_dir.empty())
+		return;
+
+	m_steadyProbeCount = (uint32_t)opSteady->m_E_probe_dir.size();
+	m_steadyPeriod = opSteady->m_TS_period;
+	m_steadyRingSize = 3 * m_steadyPeriod;
+	const uint64_t historyValues = (uint64_t)m_steadyProbeCount * m_steadyRingSize;
+	if (historyValues > UINT32_MAX)
+		throw std::runtime_error("Vulkan steady-state history exceeds 32-bit shader indexing");
+
+	std::vector<uint32_t> indices(m_steadyProbeCount);
+	for (uint32_t i = 0; i < m_steadyProbeCount; ++i)
+	{
+		indices[i] = opSteady->m_E_probe_dir[i] * m_fieldN +
+		             opSteady->m_E_probe_pos[0][i] * m_strideYZ +
+		             opSteady->m_E_probe_pos[1][i] * numLines[2] +
+		             opSteady->m_E_probe_pos[2][i];
+	}
+
+	const VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	const VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	const VkDeviceSize indexSize = indices.size() * sizeof(uint32_t);
+	const VkDeviceSize historySize = historyValues * sizeof(float);
+	CreateGpuBuf(m_steadyProbeIdx, indexSize, storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, deviceLocal);
+	UploadGpuBuf(m_steadyProbeIdx, indices.data(), indexSize);
+	CreateGpuBuf(m_steadyHistory, historySize, storage, hostVisible);
+	VK_CHECK(vkMapMemory(m_device, m_steadyHistory.memory, 0, historySize, 0,
+	                     (void**)&m_steadyHistoryMapped));
+	std::memset(m_steadyHistoryMapped, 0, historySize);
+
+	VkDescriptorSetLayoutBinding bindings[3];
+	for (uint32_t i = 0; i < 3; ++i)
+		bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+	VkDescriptorSetLayoutCreateInfo dli{};
+	dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	dli.bindingCount = 3;
+	dli.pBindings = bindings;
+	VK_CHECK(vkCreateDescriptorSetLayout(m_device, &dli, nullptr, &m_steadyDescLayout));
+
+	VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SteadyPC)};
+	VkPipelineLayoutCreateInfo pli{};
+	pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pli.setLayoutCount = 1;
+	pli.pSetLayouts = &m_steadyDescLayout;
+	pli.pushConstantRangeCount = 1;
+	pli.pPushConstantRanges = &pcRange;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_steadyPipeLayout));
+
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+	VkDescriptorPoolCreateInfo dpi{};
+	dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	dpi.maxSets = 1;
+	dpi.poolSizeCount = 1;
+	dpi.pPoolSizes = &poolSize;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_steadyDescPool));
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool = m_steadyDescPool;
+	ai.descriptorSetCount = 1;
+	ai.pSetLayouts = &m_steadyDescLayout;
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_steadyDescSet));
+	VkBuffer bufs[3] = {m_voltBuf, m_steadyProbeIdx.buffer, m_steadyHistory.buffer};
+	VkDeviceSize sizes[3] = {m_fieldBufSize, indexSize, historySize};
+	WriteDescriptorBuffers(m_device, m_steadyDescSet, bufs, sizes, 3);
+
+	VkShaderModule mod = CreateShaderModule(gpu_spirv::steady_state_sample_data,
+	                                        gpu_spirv::steady_state_sample_size);
+	VkPipelineShaderStageCreateInfo stage{};
+	stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	stage.module = mod;
+	stage.pName = "main";
+	VkComputePipelineCreateInfo ci{};
+	ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	ci.stage = stage;
+	ci.layout = m_steadyPipeLayout;
+	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_steadyPipeline));
+	vkDestroyShaderModule(m_device, mod, nullptr);
+
+	m_gpuSteadyStateExt->SetGpuUpdater([this]() { UpdateSteadyStateResult(); });
+}
+
+void Engine_Vulkan::RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts) const
+{
+	if (!m_steadyPipeline) return;
+	const SteadyPC pc = {m_steadyProbeCount, m_steadyRingSize, ts};
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_steadyPipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+	                        m_steadyPipeLayout, 0, 1, &m_steadyDescSet, 0, nullptr);
+	vkCmdPushConstants(cmd, m_steadyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   0, sizeof(SteadyPC), &pc);
+	vkCmdDispatch(cmd, (m_steadyProbeCount + 255) / 256, 1, 1);
+
+	VkMemoryBarrier barrier{};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+	                     1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+void Engine_Vulkan::UpdateSteadyStateResult()
+{
+	if (!m_gpuSteadyStateExt || !m_steadyHistoryMapped || m_steadyPeriod == 0)
+		return;
+	const uint32_t completedPeriods = numTS / m_steadyPeriod;
+	if (completedPeriods < 2 || completedPeriods == m_steadyLastCompletedPeriods)
+		return;
+	DrainGPU();
+	const double energy = CalcFastEnergyGPU();
+	m_gpuSteadyStateExt->UpdateGpuSamples(m_steadyHistoryMapped, 3, numTS, energy);
+	m_steadyLastCompletedPeriods = completedPeriods;
+}
+
 void Engine_Vulkan::SetupGPU_Probes()
 {
 	// Placeholder — actual probe setup happens in SetupProbeCache()
@@ -3164,6 +3309,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 				}
+				RecordSteadyStateSample(cmd, ts);
 
 				// --- Fused current update (Yee + UPML pre + UPML post) ---
 				// Pre-current non-UPML extensions (dispersive)
@@ -3387,6 +3533,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
 									 1, &barrier, 0, nullptr, 0, nullptr);
 			}
+			RecordSteadyStateSample(cmd, ts);
 
 			// === Pre-current extensions (GPU) ===
 			RecordCurrentExtensions(cmd, ts);
@@ -3473,6 +3620,17 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 									 1, &barrier, 0, nullptr, 0, nullptr);
 			}
 			} // end else (original separate-dispatch path)
+		}
+
+		if (m_steadyPipeline)
+		{
+			VkMemoryBarrier hostBarrier{};
+			hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+			hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_HOST_BIT, 0,
+			                     1, &hostBarrier, 0, nullptr, 0, nullptr);
 		}
 
 		if (m_profileEnabled && m_tsQueryPool && m_profilePhaseEnabled)
@@ -3843,6 +4001,28 @@ void Engine_Vulkan::CleanupExtensions()
 	{
 		if (dl) { vkDestroyDescriptorSetLayout(m_device, dl, nullptr); dl = VK_NULL_HANDLE; }
 	};
+
+	if (m_gpuSteadyStateExt)
+		m_gpuSteadyStateExt->SetGpuUpdater({});
+	if (m_steadyHistoryMapped)
+	{
+		vkUnmapMemory(m_device, m_steadyHistory.memory);
+		m_steadyHistoryMapped = nullptr;
+	}
+	destroyPipeline(m_steadyPipeline);
+	destroyPipeLayout(m_steadyPipeLayout);
+	if (m_steadyDescPool)
+	{
+		vkDestroyDescriptorPool(m_device, m_steadyDescPool, nullptr);
+		m_steadyDescPool = VK_NULL_HANDLE;
+	}
+	destroyDescLayout(m_steadyDescLayout);
+	DestroyGpuBuf(m_steadyProbeIdx);
+	DestroyGpuBuf(m_steadyHistory);
+	m_steadyDescSet = VK_NULL_HANDLE;
+	m_gpuSteadyStateExt = nullptr;
+	m_steadyProbeCount = m_steadyPeriod = m_steadyRingSize = 0;
+	m_steadyLastCompletedPeriods = 0;
 
 	destroyPipeline(m_upmlPreVoltPipeline);
 	destroyPipeline(m_upmlPostVoltPipeline);
