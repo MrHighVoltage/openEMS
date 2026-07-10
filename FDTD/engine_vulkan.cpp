@@ -1304,10 +1304,7 @@ void Engine_Vulkan::SetupGPUExcitation()
 	Operator_Ext_Excitation* opExc = const_cast<Operator*>(Op)->GetExcitationExtension();
 	Excitation* exc = const_cast<Operator*>(Op)->GetExcitationSignal();
 
-	// Check for non-excitation CPU extensions
-	// Extensions that have GPU implementations are also removed from the CPU
-	// extension list and handled entirely on the GPU.
-	m_hasCPUExtensions = false;
+	// Remove CPU excitation first; excitation is always handled on the GPU.
 	for (auto it = m_Eng_exts.begin(); it != m_Eng_exts.end(); )
 	{
 		Engine_Ext_Excitation* eext = dynamic_cast<Engine_Ext_Excitation*>(*it);
@@ -1319,24 +1316,34 @@ void Engine_Vulkan::SetupGPUExcitation()
 			continue;
 		}
 
-		// Check if this extension has a GPU implementation
-		bool gpuNative = false;
-		if (dynamic_cast<Engine_Ext_UPML*>(*it))             gpuNative = true;
-		else if (dynamic_cast<Engine_Ext_LorentzMaterial*>(*it)) gpuNative = true;
-		else if (dynamic_cast<Engine_Ext_TFSF*>(*it))        gpuNative = true;
-		else if (dynamic_cast<Engine_Ext_Mur_ABC*>(*it))     gpuNative = true;
-		else if (dynamic_cast<Engine_Ext_LumpedRLC*>(*it))   gpuNative = true;
+		++it;
+	}
 
-		if (gpuNative)
+	auto isGpuNative = [](Engine_Extension* ext)
+	{
+		return dynamic_cast<Engine_Ext_UPML*>(ext) != nullptr ||
+		       dynamic_cast<Engine_Ext_LorentzMaterial*>(ext) != nullptr ||
+		       dynamic_cast<Engine_Ext_TFSF*>(ext) != nullptr ||
+		       dynamic_cast<Engine_Ext_Mur_ABC*>(ext) != nullptr ||
+		       dynamic_cast<Engine_Ext_LumpedRLC*>(ext) != nullptr;
+	};
+
+	// The hybrid loop executes extensions on the CPU. Keep every extension
+	// CPU-owned when even one extension lacks a GPU implementation, otherwise
+	// mixed configurations would silently omit the GPU-native phases.
+	m_hasCPUExtensions = std::any_of(m_Eng_exts.begin(), m_Eng_exts.end(),
+		[&](Engine_Extension* ext) { return !isGpuNative(ext); });
+	if (!m_hasCPUExtensions)
+	{
+		for (auto it = m_Eng_exts.begin(); it != m_Eng_exts.end(); )
 		{
-			// Remove from CPU extension list; GPU will handle it
+			if (!isGpuNative(*it))
+			{
+				++it;
+				continue;
+			}
 			delete *it;
 			it = m_Eng_exts.erase(it);
-		}
-		else
-		{
-			m_hasCPUExtensions = true;
-			++it;
 		}
 	}
 
@@ -1446,6 +1453,11 @@ void Engine_Vulkan::SetupGPUExcitation()
 
 void Engine_Vulkan::SetupGPUExtensions()
 {
+	// Hybrid execution retains all extensions on the CPU so their priority and
+	// phase ordering remain identical to the reference engine.
+	if (m_hasCPUExtensions)
+		return;
+
 	bool startupTrace = (g_settings.GetVerboseLevel() > 0);
 	if (const char* env = std::getenv("OPENEMS_GPU_STARTUP_TRACE"))
 	{
@@ -1892,11 +1904,11 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 			data.count     = cnt;
 			data.voltADEOn = lor->m_volt_ADE_On[order];
 			data.currADEOn = lor->m_curr_ADE_On[order];
-			data.hasLorADE = lor->m_volt_Lor_ADE_On ? lor->m_volt_Lor_ADE_On[order] : false;
+			data.voltLorADEOn = data.voltADEOn && lor->m_volt_Lor_ADE_On && lor->m_volt_Lor_ADE_On[order];
+			data.currLorADEOn = data.currADEOn && lor->m_curr_Lor_ADE_On && lor->m_curr_Lor_ADE_On[order];
 
-			data.pc.count     = cnt;
-			data.pc.Nx = numLines[0]; data.pc.Ny = numLines[1]; data.pc.Nz = numLines[2];
-			data.pc.hasLorADE = data.hasLorADE ? 1 : 0;
+			data.voltPC = {cnt, numLines[0], numLines[1], numLines[2], data.voltLorADEOn ? 1u : 0u};
+			data.currPC = {cnt, numLines[0], numLines[1], numLines[2], data.currLorADEOn ? 1u : 0u};
 
 			VkDeviceSize adeSize = 3 * cnt * sizeof(FDTD_FLOAT);
 			VkDeviceSize idxSize = 3 * cnt * sizeof(uint32_t);
@@ -1919,10 +1931,13 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 			CreateGpuBuf(data.currADE, adeSize, rwUsage, dLoc);
 			UploadGpuBuf(data.currADE, zeros.data(), adeSize);
 
-			if (data.hasLorADE)
+			if (data.voltLorADEOn)
 			{
 				CreateGpuBuf(data.voltLorADE, adeSize, rwUsage, dLoc);
 				UploadGpuBuf(data.voltLorADE, zeros.data(), adeSize);
+			}
+			if (data.currLorADEOn)
+			{
 				CreateGpuBuf(data.currLorADE, adeSize, rwUsage, dLoc);
 				UploadGpuBuf(data.currLorADE, zeros.data(), adeSize);
 			}
@@ -1944,15 +1959,20 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 				UploadGpuBuf(gb, flat.data(), adeSize);
 			};
 
-			uploadCoef(data.vIntADE, lor->v_int_ADE);
-			uploadCoef(data.vExtADE, lor->v_ext_ADE);
-			uploadCoef(data.iIntADE, lor->i_int_ADE);
-			uploadCoef(data.iExtADE, lor->i_ext_ADE);
-			if (data.hasLorADE)
+			if (data.voltADEOn)
 			{
-				uploadCoef(data.vLorADE, lor->v_Lor_ADE);
-				uploadCoef(data.iLorADE, lor->i_Lor_ADE);
+				uploadCoef(data.vIntADE, lor->v_int_ADE);
+				uploadCoef(data.vExtADE, lor->v_ext_ADE);
 			}
+			if (data.currADEOn)
+			{
+				uploadCoef(data.iIntADE, lor->i_int_ADE);
+				uploadCoef(data.iExtADE, lor->i_ext_ADE);
+			}
+			if (data.voltLorADEOn)
+				uploadCoef(data.vLorADE, lor->v_Lor_ADE);
+			if (data.currLorADEOn)
+				uploadCoef(data.iLorADE, lor->i_Lor_ADE);
 
 			// Allocate descriptor sets
 			auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
@@ -1968,16 +1988,21 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 			};
 
 			// Use dummy buffer for unused Lorentz slots when hasLorADE=false
-			VkBuffer lorVoltBuf = data.hasLorADE ? data.voltLorADE.buffer : data.voltADE.buffer;
-			VkBuffer lorCurrBuf = data.hasLorADE ? data.currLorADE.buffer : data.currADE.buffer;
-			VkBuffer vLorBuf    = data.hasLorADE ? data.vLorADE.buffer    : data.vIntADE.buffer;
-			VkBuffer iLorBuf    = data.hasLorADE ? data.iLorADE.buffer    : data.iIntADE.buffer;
+			VkBuffer voltDummy = data.voltADE.buffer;
+			VkBuffer currDummy = data.currADE.buffer;
+			VkBuffer lorVoltBuf = data.voltLorADEOn ? data.voltLorADE.buffer : voltDummy;
+			VkBuffer lorCurrBuf = data.currLorADEOn ? data.currLorADE.buffer : currDummy;
+			VkBuffer vIntBuf = data.voltADEOn ? data.vIntADE.buffer : voltDummy;
+			VkBuffer vExtBuf = data.voltADEOn ? data.vExtADE.buffer : voltDummy;
+			VkBuffer iIntBuf = data.currADEOn ? data.iIntADE.buffer : currDummy;
+			VkBuffer iExtBuf = data.currADEOn ? data.iExtADE.buffer : currDummy;
+			VkBuffer vLorBuf = data.voltLorADEOn ? data.vLorADE.buffer : voltDummy;
+			VkBuffer iLorBuf = data.currLorADEOn ? data.iLorADE.buffer : currDummy;
 
 			data.preVoltDesc = allocDescSet(m_dispPreDescLayout);
 			{
 				VkBuffer bufs[7]      = {m_voltBuf, data.voltADE.buffer, lorVoltBuf,
-				                          data.posIdx.buffer, data.vIntADE.buffer,
-				                          data.vExtADE.buffer, vLorBuf};
+				                          data.posIdx.buffer, vIntBuf, vExtBuf, vLorBuf};
 				VkDeviceSize sizes[7] = {m_fieldBufSize, adeSize, adeSize, idxSize, adeSize, adeSize, adeSize};
 				WriteDescriptorBuffers(m_device, data.preVoltDesc, bufs, sizes, 7);
 			}
@@ -1985,8 +2010,7 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 			data.preCurrDesc = allocDescSet(m_dispPreDescLayout);
 			{
 				VkBuffer bufs[7]      = {m_currBuf, data.currADE.buffer, lorCurrBuf,
-				                          data.posIdx.buffer, data.iIntADE.buffer,
-				                          data.iExtADE.buffer, iLorBuf};
+				                          data.posIdx.buffer, iIntBuf, iExtBuf, iLorBuf};
 				VkDeviceSize sizes[7] = {m_fieldBufSize, adeSize, adeSize, idxSize, adeSize, adeSize, adeSize};
 				WriteDescriptorBuffers(m_device, data.preCurrDesc, bufs, sizes, 7);
 			}
@@ -2694,7 +2718,7 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		uint32_t groups = (d.count + 255) / 256;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 		                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
-		vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+		vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.voltPC);
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreVolt = true;
 	}
@@ -2739,7 +2763,7 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		uint32_t groups = (d.count + 255) / 256;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 		                        m_dispPrePipeLayout, 0, 1, &d.preCurrDesc, 0, nullptr);
-		vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+		vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.currPC);
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreCurr = true;
 	}
@@ -3021,7 +3045,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 						uint32_t groups = (d.count + 255) / 256;
 						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 						                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.pc);
+						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.voltPC);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
 					vkCmdPipelineBarrier(cmd,
@@ -3106,6 +3130,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
 									   &dpc);
 					vkCmdDispatch(cmd, groups, 1, 1);
+					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+					                     1, &barrier, 0, nullptr, 0, nullptr);
 				}
 				if (!m_gpuMur.empty())
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
@@ -3152,7 +3179,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPrePipeLayout, 0, 1,
 												&d.preCurrDesc, 0, nullptr);
 						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
-										   &d.pc);
+										   &d.currPC);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
 					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -3217,6 +3244,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
 									   &dpc);
 					vkCmdDispatch(cmd, groups, 1, 1);
+					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+					                     1, &barrier, 0, nullptr, 0, nullptr);
 				}
 				if (hasCurrLateWritesFused)
 				{
@@ -3321,6 +3351,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 										&d.applyVoltDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+				                     1, &barrier, 0, nullptr, 0, nullptr);
 			}
 
 			// Mur apply (overwrites boundary voltages)
@@ -3429,6 +3462,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 										&d.applyCurrDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+				                     1, &barrier, 0, nullptr, 0, nullptr);
 			}
 
 			if (hasCurrLateWrites)

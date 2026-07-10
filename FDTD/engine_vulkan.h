@@ -399,9 +399,9 @@ private:
 		VkDescriptorSet preCurrDesc   = VK_NULL_HANDLE;
 		VkDescriptorSet applyVoltDesc = VK_NULL_HANDLE;
 		VkDescriptorSet applyCurrDesc = VK_NULL_HANDLE;
-		DispPC pc{};
+		DispPC voltPC{}, currPC{};
 		uint32_t count = 0;
-		bool hasLorADE = false;
+		bool voltLorADEOn = false, currLorADEOn = false;
 		bool voltADEOn = false, currADEOn = false;
 	};
 
