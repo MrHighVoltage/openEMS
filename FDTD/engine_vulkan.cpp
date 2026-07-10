@@ -3123,10 +3123,18 @@ void Engine_Vulkan::SyncFieldsToHost() const
 {
 	DrainGPU();  // ensure all pending GPU work is complete
 	if (!m_hostDirty) return;
-	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
-		m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
-		m_currBuf, curr_ptr->data(), m_fieldBufSize);
+	if (m_voltMapped && m_currMapped)
+	{
+		std::memcpy(volt_ptr->data(), m_voltMapped, m_fieldBufSize);
+		std::memcpy(curr_ptr->data(), m_currMapped, m_fieldBufSize);
+	}
+	else
+	{
+		const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
+			m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+		const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
+			m_currBuf, curr_ptr->data(), m_fieldBufSize);
+	}
 	m_hostDirty = false;
 }
 
@@ -3134,8 +3142,16 @@ void Engine_Vulkan::SyncFieldsToDevice()
 {
 	DrainGPU();  // must complete any pending GPU work before overwriting
 	if (!m_deviceDirty) return;
-	UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-	UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
+	if (m_voltMapped && m_currMapped)
+	{
+		std::memcpy(m_voltMapped, volt_ptr->data(), m_fieldBufSize);
+		std::memcpy(m_currMapped, curr_ptr->data(), m_fieldBufSize);
+	}
+	else
+	{
+		UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+		UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
+	}
 	m_deviceDirty = false;
 }
 
@@ -4415,16 +4431,15 @@ void Engine_Vulkan::SetupFusedUPML()
 		UploadGpuBuf(m_fusedCurrFlux, zeros.data(), fluxBufSize);
 	}
 
-	// Copy per-region coefficient data into concatenated buffers
-	for (size_t ri = 0; ri < m_gpuUPML.size(); ++ri)
+	// Copy every region in one submission; startup latency otherwise scales
+	// with the number of PML faces.
+	RunSingleCommand([&](VkCommandBuffer cmd)
 	{
-		const auto& u = m_gpuUPML[ri];
-		VkDeviceSize regionFluxSize = 3 * (VkDeviceSize)u.totalCells * sizeof(float);
-		VkDeviceSize dstOffset = 3 * (VkDeviceSize)regions[ri].fluxOffset * sizeof(float);
-
-		// GPU-to-GPU copy: region buffer → concatenated buffer at correct offset
-		RunSingleCommand([&](VkCommandBuffer cmd)
+		for (size_t ri = 0; ri < m_gpuUPML.size(); ++ri)
 		{
+			const auto& u = m_gpuUPML[ri];
+			VkDeviceSize regionFluxSize = 3 * (VkDeviceSize)u.totalCells * sizeof(float);
+			VkDeviceSize dstOffset = 3 * (VkDeviceSize)regions[ri].fluxOffset * sizeof(float);
 			VkBufferCopy copyRegion = {0, dstOffset, regionFluxSize};
 			vkCmdCopyBuffer(cmd, u.pmlVv.buffer,   m_fusedPmlVv.buffer,   1, &copyRegion);
 			vkCmdCopyBuffer(cmd, u.pmlVvfo.buffer, m_fusedPmlVvfo.buffer, 1, &copyRegion);
@@ -4432,8 +4447,8 @@ void Engine_Vulkan::SetupFusedUPML()
 			vkCmdCopyBuffer(cmd, u.pmlIi.buffer,   m_fusedPmlIi.buffer,   1, &copyRegion);
 			vkCmdCopyBuffer(cmd, u.pmlIifo.buffer, m_fusedPmlIifo.buffer, 1, &copyRegion);
 			vkCmdCopyBuffer(cmd, u.pmlIifn.buffer, m_fusedPmlIifn.buffer, 1, &copyRegion);
-		});
-	}
+		}
+	});
 
 	// --- PML region metadata SSBO ---
 	VkDeviceSize regionInfoSize = regions.size() * sizeof(PMLRegionGPU);
@@ -4544,6 +4559,14 @@ void Engine_Vulkan::SetupFusedUPML()
 	vkDestroyShaderModule(m_device, mod, nullptr);
 
 	m_hasFusedUPML = true;
+	// The fused path owns its concatenated state from this point onward.
+	// Release the equivalent per-region allocations retained for fallback.
+	for (auto& u : m_gpuUPML)
+	{
+		DestroyGpuBuf(u.voltFlux); DestroyGpuBuf(u.currFlux);
+		DestroyGpuBuf(u.pmlVv);   DestroyGpuBuf(u.pmlVvfo); DestroyGpuBuf(u.pmlVvfn);
+		DestroyGpuBuf(u.pmlIi);   DestroyGpuBuf(u.pmlIifo); DestroyGpuBuf(u.pmlIifn);
+	}
 	cout << "Engine_Vulkan: fused Yee+UPML kernels created ("
 	     << regions.size() << " regions, " << totalPmlCells << " PML cells)" << endl;
 }
