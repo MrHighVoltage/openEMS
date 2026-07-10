@@ -53,6 +53,8 @@ Operator_Multithread::Operator_Multithread() : OPERATOR_MULTITHREAD_BASE()
 {
 	m_CalcEC_Start=NULL;
 	m_CalcEC_Stop=NULL;
+	m_CalcECOp_Start=NULL;
+	m_CalcECOp_Stop=NULL;
 
 	m_CalcPEC_Start=NULL;
 	m_CalcPEC_Stop=NULL;
@@ -64,6 +66,8 @@ void Operator_Multithread::Init()
 
 	m_CalcEC_Start=NULL;
 	m_CalcEC_Stop=NULL;
+	m_CalcECOp_Start=NULL;
+	m_CalcECOp_Stop=NULL;
 
 	m_CalcPEC_Start=NULL;
 	m_CalcPEC_Stop=NULL;
@@ -78,6 +82,10 @@ void Operator_Multithread::Delete()
 	m_CalcEC_Start=NULL;
 	delete m_CalcEC_Stop;
 	m_CalcEC_Stop=NULL;
+	delete m_CalcECOp_Start;
+	m_CalcECOp_Start=NULL;
+	delete m_CalcECOp_Stop;
+	m_CalcECOp_Stop=NULL;
 
 	delete m_CalcPEC_Start;
 	m_CalcPEC_Start=NULL;
@@ -132,6 +140,10 @@ int Operator_Multithread::CalcECOperator( DebugFlags debugFlags )
 	m_CalcEC_Start = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 	delete m_CalcEC_Stop;
 	m_CalcEC_Stop = new Barrier(m_numThreads+1); // numThread workers + 1 controller
+	delete m_CalcECOp_Start;
+	m_CalcECOp_Start = new Barrier(m_numThreads+1); // numThread workers + 1 controller
+	delete m_CalcECOp_Stop;
+	m_CalcECOp_Stop = new Barrier(m_numThreads+1); // numThread workers + 1 controller
 
 	delete m_CalcPEC_Start;
 	m_CalcPEC_Start = new Barrier(m_numThreads+1); // numThread workers + 1 controller
@@ -161,6 +173,19 @@ bool Operator_Multithread::Calc_EC()
 	m_CalcEC_Stop->wait();
 
 	return true;
+}
+
+void Operator_Multithread::Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop)
+{
+	UNUSED(xStart);
+	UNUSED(xStop);
+	m_CalcECOp_Start->wait();
+	m_CalcECOp_Stop->wait();
+}
+
+void Operator_Multithread::Calc_ECOperator_Range_Worker(unsigned int xStart, unsigned int xStop)
+{
+	OPERATOR_MULTITHREAD_BASE::Calc_ECOperator_Range(xStart, xStop);
 }
 
 bool Operator_Multithread::CalcPEC()
@@ -201,6 +226,11 @@ void Operator_Thread::operator()()
 	m_OpPtr->m_CalcEC_Start->wait();
 	m_OpPtr->Calc_EC_Range(m_start,m_stop);
 	m_OpPtr->m_CalcEC_Stop->wait();
+
+	//************** calculate EC operator coefficients ************//
+	m_OpPtr->m_CalcECOp_Start->wait();
+	m_OpPtr->Calc_ECOperator_Range_Worker(m_start,m_stop);
+	m_OpPtr->m_CalcECOp_Stop->wait();
 
 	//************** calculate EC (Calc_EC) ***********************//
 	m_OpPtr->m_CalcPEC_Start->wait();

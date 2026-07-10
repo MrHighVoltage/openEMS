@@ -323,6 +323,8 @@ protected:
 
 	//! Calc operator at certain \a pos
 	virtual void Calc_ECOperatorPos(int n, unsigned int* pos);
+	//! Calc operator coefficients for a range in x-direction.
+	virtual void Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop);
 
 	//! Calculate and setup lumped elements
 	virtual bool Calc_LumpedElements();

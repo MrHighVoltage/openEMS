@@ -46,6 +46,7 @@ public:
 protected:
 	Operator_Vulkan();
 	virtual int CalcECOperator(DebugFlags debugFlags = None);
+	virtual void Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop);
 
 private:
 	void CompressOperator();

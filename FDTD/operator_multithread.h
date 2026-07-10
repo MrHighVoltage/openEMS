@@ -51,6 +51,8 @@ protected:
 	virtual void Reset();
 
 	virtual bool Calc_EC(); //this method is using multi-threading
+	virtual void Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop);
+	void Calc_ECOperator_Range_Worker(unsigned int xStart, unsigned int xStop);
 
 	unsigned int (*m_Nr_PEC_thread)[3]; //count PEC edges per thread
 	virtual bool CalcPEC(); //this method is using multi-threading
@@ -63,6 +65,9 @@ protected:
 	//CalcPEC barrier
 	Barrier* m_CalcPEC_Start;
 	Barrier* m_CalcPEC_Stop;
+	//Calc_ECOperator_Range barrier
+	Barrier* m_CalcECOp_Start;
+	Barrier* m_CalcECOp_Stop;
 
 	std::vector<std::thread> m_threads;
 	unsigned int m_numThreads; // number of worker threads

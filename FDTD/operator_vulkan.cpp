@@ -13,24 +13,52 @@
 #include "engine_vulkan.h"
 
 #include <iostream>
-#include <map>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <cstdlib>
 
 using std::cout;
 using std::endl;
 
 // ---------------------------------------------------------------------------
 // Compression key: 12 floats (vv[3], vi[3], ii[3], iv[3]) per cell.
-// Using a struct with operator< for std::map ordering.
 // ---------------------------------------------------------------------------
 struct VulkanCoeffKey
 {
 	float vv[3], vi[3], ii[3], iv[3];
+};
 
-	bool operator<(const VulkanCoeffKey& o) const
+struct VulkanCoeffKeyHash
+{
+	size_t operator()(const VulkanCoeffKey& k) const
 	{
-		return memcmp(this, &o, sizeof(VulkanCoeffKey)) < 0;
+		// FNV-1a over the raw bytes preserves exact float-bit identity.
+		const unsigned char* p = reinterpret_cast<const unsigned char*>(&k);
+		size_t h = sizeof(size_t) == 8
+			? (size_t)1469598103934665603ull
+			: (size_t)2166136261u;
+		const size_t prime = sizeof(size_t) == 8
+			? (size_t)1099511628211ull
+			: (size_t)16777619u;
+		for (size_t i = 0; i < sizeof(VulkanCoeffKey); ++i)
+		{
+			h ^= (size_t)p[i];
+			h *= prime;
+		}
+		return h;
+	}
+};
+
+struct VulkanCoeffKeyEq
+{
+	bool operator()(const VulkanCoeffKey& a, const VulkanCoeffKey& b) const
+	{
+		return memcmp(&a, &b, sizeof(VulkanCoeffKey)) == 0;
 	}
 };
 
@@ -66,8 +94,57 @@ int Operator_Vulkan::CalcECOperator(DebugFlags debugFlags)
 	return errCode;
 }
 
+void Operator_Vulkan::Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop)
+{
+	if (xStop < xStart)
+		return;
+
+	unsigned int numThreads = std::thread::hardware_concurrency();
+	if (numThreads == 0)
+		numThreads = 1;
+
+	if (const char* env = std::getenv("OPENEMS_GPU_OPERATOR_THREADS"))
+	{
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if ((end != env) && (*end == '\0') && (parsed > 0))
+			numThreads = (unsigned int)parsed;
+	}
+
+	const unsigned int numX = xStop - xStart + 1;
+	numThreads = std::max(1u, std::min(numThreads, numX));
+
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "  GPU operator coefficient threads: " << numThreads << endl;
+
+	std::vector<std::thread> threads;
+	threads.reserve(numThreads - 1);
+	for (unsigned int t = 1; t < numThreads; ++t)
+	{
+		unsigned int begin = xStart + (numX * t) / numThreads;
+		unsigned int end = xStart + (numX * (t + 1)) / numThreads - 1;
+		threads.emplace_back([this, begin, end]() {
+			Operator::Calc_ECOperator_Range(begin, end);
+		});
+	}
+
+	Operator::Calc_ECOperator_Range(xStart, xStart + numX / numThreads - 1);
+	for (auto& thread : threads)
+		thread.join();
+}
+
 void Operator_Vulkan::CompressOperator()
 {
+	auto tCompressStart = std::chrono::steady_clock::now();
+	bool logDetails = (g_settings.GetVerboseLevel() > 0);
+	if (const char* env = std::getenv("OPENEMS_GPU_STARTUP_TRACE"))
+	{
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if ((end != env) && (*end == '\0'))
+			logDetails = (parsed != 0);
+	}
+
 	if (g_settings.GetVerboseLevel() > 0)
 		cout << "Compressing the FDTD operator (GPU)... this may take a while..." << endl;
 
@@ -81,41 +158,110 @@ void Operator_Vulkan::CompressOperator()
 	const float* ii_data = (const float*)ii_ptr->data();
 	const float* iv_data = (const float*)iv_ptr->data();
 
-	std::map<VulkanCoeffKey, uint32_t> lookUpMap;
-	std::vector<float> tmp_vv, tmp_vi, tmp_ii, tmp_iv;  // flat, 3 components interleaved
+	using ShardMap = std::unordered_map<VulkanCoeffKey, uint32_t, VulkanCoeffKeyHash, VulkanCoeffKeyEq>;
+	unsigned int hwThreads = std::thread::hardware_concurrency();
+	if (hwThreads == 0)
+		hwThreads = 1;
 
-	for (size_t cell = 0; cell < N; ++cell)
+	bool forcedThreads = false;
+	unsigned int numThreads = hwThreads;
+	if (const char* env = std::getenv("OPENEMS_GPU_COMPRESS_THREADS"))
 	{
-		VulkanCoeffKey key;
-		for (int n = 0; n < 3; ++n)
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if ((end != env) && (*end == '\0') && (parsed > 0))
 		{
-			key.vv[n] = vv_data[n * N + cell];
-			key.vi[n] = vi_data[n * N + cell];
-			key.ii[n] = ii_data[n * N + cell];
-			key.iv[n] = iv_data[n * N + cell];
-		}
-
-		auto it = lookUpMap.find(key);
-		if (it == lookUpMap.end())
-		{
-			uint32_t idx = (uint32_t)(tmp_vv.size() / 3);
-			for (int n = 0; n < 3; ++n)
-			{
-				tmp_vv.push_back(key.vv[n]);
-				tmp_vi.push_back(key.vi[n]);
-				tmp_ii.push_back(key.ii[n]);
-				tmp_iv.push_back(key.iv[n]);
-			}
-			lookUpMap[key] = idx;
-			m_OpIndex[cell] = idx;
-		}
-		else
-		{
-			m_OpIndex[cell] = it->second;
+			numThreads = (unsigned int)parsed;
+			forcedThreads = true;
 		}
 	}
 
-	m_numCompressed = (unsigned int)(tmp_vv.size() / 3);
+	if (numThreads > hwThreads)
+		numThreads = hwThreads;
+
+	if (!forcedThreads && (N < (size_t)numThreads * 4096))
+		numThreads = std::max(1u, (unsigned int)(N / 4096));
+
+	if ((N > 0) && (numThreads > N))
+		numThreads = (unsigned int)N;
+
+	if (numThreads == 0)
+		numThreads = 1;
+
+	if (logDetails)
+		cout << "  Compression cells: " << N << " (" << numLines[0] << "x" << numLines[1] << "x" << numLines[2] << ")" << endl;
+
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "  Compression threads: " << numThreads
+		     << (forcedThreads ? " (forced by OPENEMS_GPU_COMPRESS_THREADS)" : " (auto)")
+		     << endl;
+
+	size_t numShards = 1;
+	while (numShards < (size_t)numThreads * 4)
+		numShards <<= 1;
+	if (logDetails)
+		cout << "  Compression shards: " << numShards << endl;
+
+	std::vector<ShardMap> shards(numShards);
+	std::vector<std::mutex> shardLocks(numShards);
+	std::mutex uniqueLock;
+	std::vector<VulkanCoeffKey> uniqueKeys;
+	uniqueKeys.reserve(1024);
+
+	auto worker = [&](size_t startCell, size_t endCell)
+	{
+		VulkanCoeffKeyHash hasher;
+		for (size_t cell = startCell; cell < endCell; ++cell)
+		{
+			VulkanCoeffKey key;
+			for (int n = 0; n < 3; ++n)
+			{
+				key.vv[n] = vv_data[n * N + cell];
+				key.vi[n] = vi_data[n * N + cell];
+				key.ii[n] = ii_data[n * N + cell];
+				key.iv[n] = iv_data[n * N + cell];
+			}
+
+			size_t h = hasher(key);
+			size_t shardIdx = h & (numShards - 1);
+			uint32_t idx;
+
+			{
+				std::lock_guard<std::mutex> lg(shardLocks[shardIdx]);
+				auto& shard = shards[shardIdx];
+				auto it = shard.find(key);
+				if (it != shard.end())
+				{
+					idx = it->second;
+				}
+				else
+				{
+					std::lock_guard<std::mutex> ug(uniqueLock);
+					idx = (uint32_t)uniqueKeys.size();
+					uniqueKeys.push_back(key);
+					shard.emplace(key, idx);
+				}
+			}
+
+			m_OpIndex[cell] = idx;
+		}
+	};
+
+	std::vector<std::thread> threads;
+	auto tBuildStart = std::chrono::steady_clock::now();
+	threads.reserve(numThreads > 0 ? numThreads - 1 : 0);
+	for (unsigned int t = 1; t < numThreads; ++t)
+	{
+		size_t start = (N * t) / numThreads;
+		size_t stop  = (N * (t + 1)) / numThreads;
+		threads.emplace_back(worker, start, stop);
+	}
+	worker(0, N / numThreads);
+	for (auto& th : threads)
+		th.join();
+	auto tBuildEnd = std::chrono::steady_clock::now();
+
+	m_numCompressed = (unsigned int)uniqueKeys.size();
 
 	// Rearrange to N-major layout: comp[n * numCompressed + idx]
 	// Currently tmp_vv is packed as [vv0_0, vv1_0, vv2_0, vv0_1, vv1_1, vv2_1, ...]
@@ -125,15 +271,51 @@ void Operator_Vulkan::CompressOperator()
 	m_iiComp.resize(3 * m_numCompressed);
 	m_ivComp.resize(3 * m_numCompressed);
 
-	for (unsigned int idx = 0; idx < m_numCompressed; ++idx)
+	auto writeCompRange = [&](size_t idxStart, size_t idxEnd)
 	{
-		for (int n = 0; n < 3; ++n)
+		for (size_t idx = idxStart; idx < idxEnd; ++idx)
 		{
-			m_vvComp[n * m_numCompressed + idx] = tmp_vv[idx * 3 + n];
-			m_viComp[n * m_numCompressed + idx] = tmp_vi[idx * 3 + n];
-			m_iiComp[n * m_numCompressed + idx] = tmp_ii[idx * 3 + n];
-			m_ivComp[n * m_numCompressed + idx] = tmp_iv[idx * 3 + n];
+			const VulkanCoeffKey& key = uniqueKeys[idx];
+			for (int n = 0; n < 3; ++n)
+			{
+				m_vvComp[n * m_numCompressed + idx] = key.vv[n];
+				m_viComp[n * m_numCompressed + idx] = key.vi[n];
+				m_iiComp[n * m_numCompressed + idx] = key.ii[n];
+				m_ivComp[n * m_numCompressed + idx] = key.iv[n];
+			}
 		}
+	};
+
+	auto tPackStart = std::chrono::steady_clock::now();
+	if (numThreads > 1 && m_numCompressed > 4096)
+	{
+		std::vector<std::thread> outThreads;
+		outThreads.reserve(numThreads - 1);
+		for (unsigned int t = 1; t < numThreads; ++t)
+		{
+			size_t start = ((size_t)m_numCompressed * t) / numThreads;
+			size_t stop  = ((size_t)m_numCompressed * (t + 1)) / numThreads;
+			outThreads.emplace_back(writeCompRange, start, stop);
+		}
+		writeCompRange(0, (size_t)m_numCompressed / numThreads);
+		for (auto& th : outThreads)
+			th.join();
+	}
+	else
+	{
+		writeCompRange(0, m_numCompressed);
+	}
+	auto tPackEnd = std::chrono::steady_clock::now();
+	auto tCompressEnd = std::chrono::steady_clock::now();
+
+	if (logDetails)
+	{
+		double buildMs = std::chrono::duration<double, std::milli>(tBuildEnd - tBuildStart).count();
+		double packMs = std::chrono::duration<double, std::milli>(tPackEnd - tPackStart).count();
+		double totalMs = std::chrono::duration<double, std::milli>(tCompressEnd - tCompressStart).count();
+		cout << "  Compression timing: build-index=" << buildMs
+		     << " ms, pack-tables=" << packMs
+		     << " ms, total=" << totalMs << " ms" << endl;
 	}
 
 	if (g_settings.GetVerboseLevel() > 0)

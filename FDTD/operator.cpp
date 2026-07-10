@@ -956,7 +956,9 @@ void Operator::SetExcitationSignal(Excitation* exc)
 
 void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 {
-	unsigned int i = MainOp->SetPos(pos[0],pos[1],pos[2]);
+	// Range-based coefficient generation runs concurrently. Compute the flat
+	// index directly instead of mutating the shared address operator.
+	unsigned int i = (pos[0] * numLines[1] + pos[1]) * numLines[2] + pos[2];
 	double C = EC_C[n][i];
 	double G = EC_G[n][i];
 	if (C>0)
@@ -1023,22 +1025,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	m_Exc->Reset(dT);
 
 	InitOperator();
-
-	unsigned int pos[3];
-
-	for (int n=0; n<3; ++n)
-	{
-		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
-		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
-			{
-				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
-				{
-					Calc_ECOperatorPos(n,pos);
-				}
-			}
-		}
-	}
+	Calc_ECOperator_Range(0, numLines[0]-1);
 
 	//Apply PEC to all boundary's
 	bool PEC[6]={1,1,1,1,1,1};
@@ -1849,6 +1836,24 @@ void Operator::Calc_EC_Range(unsigned int xStart, unsigned int xStop)
 					EC_G[n][ipos]=inEC[1];
 					EC_L[n][ipos]=inEC[2];
 					EC_R[n][ipos]=inEC[3];
+				}
+			}
+		}
+	}
+}
+
+void Operator::Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop)
+{
+	unsigned int pos[3];
+	for (int n=0; n<3; ++n)
+	{
+		for (pos[0]=xStart; pos[0]<=xStop; ++pos[0])
+		{
+			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+			{
+				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+				{
+					Calc_ECOperatorPos(n,pos);
 				}
 			}
 		}
