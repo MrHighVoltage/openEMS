@@ -98,6 +98,7 @@ if (WITH_GPU)
 		rlc_pre_voltage rlc_apply_voltage
 		gather_probes reduce_energy
 		steady_state_sample
+		local_absorbing_bc
 		fused_update_voltages fused_update_currents
 	)
 	set(GPU_SPV_FILES)

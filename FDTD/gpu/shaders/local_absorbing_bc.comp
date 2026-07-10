@@ -1,0 +1,59 @@
+/* Local first-order Mur and super-absorption surface phases. */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer FieldBuf { float field[]; };
+layout(set=0, binding=1) buffer StateBuf { float state[]; };
+layout(set=0, binding=2) readonly buffer K1Buf { float k1[]; };
+layout(set=0, binding=3) readonly buffer K2Buf { float k2[]; };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz, ny, nyP, nyPP;
+    uint startX, startY, startZ;
+    uint voltBoundary, voltShift, currBoundary, currShift;
+    uint sizeP, sizePP, countVolt, countCurr, phase;
+};
+
+uint fieldIndex(uint component, uint normal, uint i, uint j)
+{
+    uvec3 pos = uvec3(startX, startY, startZ);
+    pos[ny] = normal;
+    pos[nyP] += i;
+    pos[nyPP] += j;
+    return component * (Nx * Ny * Nz) + pos.x * (Ny * Nz) + pos.y * Nz + pos.z;
+}
+
+void main()
+{
+    bool currentPhase = phase >= 3u;
+    uint count = currentPhase ? countCurr : countVolt;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= count) return;
+
+    uint width = currentPhase ? sizePP - 1u : sizePP;
+    uint i = gid / width;
+    uint j = gid % width;
+    uint coeffIndex = i * sizePP + j;
+    uint boundary = currentPhase ? currBoundary : voltBoundary;
+    uint shifted = currentPhase ? currShift : voltShift;
+
+    uint components[2] = uint[2](nyP, nyPP);
+    for (uint c = 0u; c < 2u; ++c)
+    {
+        uint stateIndex = c * count + gid;
+        uint coefficient = c * countVolt + coeffIndex;
+        uint boundaryIndex = fieldIndex(components[c], boundary, i, j);
+        uint shiftedIndex = fieldIndex(components[c], shifted, i, j);
+
+        if (phase == 0u || phase == 3u)
+            state[stateIndex] = field[shiftedIndex] - k1[coefficient] * field[boundaryIndex];
+        else if (phase == 1u || phase == 4u)
+            state[stateIndex] += k1[coefficient] * field[shiftedIndex];
+        else if (phase == 2u)
+            field[boundaryIndex] = state[stateIndex];
+        else
+            field[boundaryIndex] = (state[stateIndex] * k2[coefficient] + field[boundaryIndex]) /
+                                   (k2[coefficient] + 1.0);
+    }
+}

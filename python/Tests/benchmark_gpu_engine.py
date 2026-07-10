@@ -35,6 +35,7 @@ def _bootstrap_local_openems_runtime():
 _bootstrap_local_openems_runtime()
 
 from CSXCAD import ContinuousStructure
+from CSXCAD.CSProperties import ABCtype
 from openEMS import openEMS
 
 
@@ -44,11 +45,14 @@ def parse_args():
                         default=(160, 128, 192))
     parser.add_argument("--timesteps", type=int, default=2000)
     parser.add_argument("--gpu-index", type=int, default=0)
+    parser.add_argument("--engine", choices=("gpu", "multithreaded"), default="gpu")
     parser.add_argument("--boundary", choices=("pec", "pml"), default="pec")
     parser.add_argument("--excitation", choices=("gaussian", "sinusoidal"), default="gaussian")
+    parser.add_argument("--local-abc", choices=("none", "mur", "mur-sa"), default="none")
     parser.add_argument("--field-memory", choices=("auto", "device-local"), default="auto")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--probe-z", type=int, default=-1)
     parser.add_argument("--keep-output", action="store_true")
     return parser.parse_args()
 
@@ -89,11 +93,22 @@ def main():
         priority=10,
     )
 
+    if args.local_abc != "none":
+        abc_type = ABCtype.MUR_1ST if args.local_abc == "mur" else ABCtype.MUR_1ST_SA
+        absorber = csx.AddAbsorbingBC(
+            "benchmark_local_absorber",
+            NormalSignPositive=False,
+            AbsorbingBoundaryType=abc_type,
+            PhaseVelocity=299792458.0,
+        )
+        absorber.AddBox([5, 5, nz - 10], [nx - 6, ny - 6, nz - 10], priority=20)
+
     if args.probe:
+        probe_z = args.probe_z if args.probe_z >= 0 else nz // 2
         probe = csx.AddProbe("benchmark_voltage", p_type=0)
         probe.AddBox(
-            [nx // 2, ny // 2, nz // 2],
-            [nx // 2 + 1, ny // 2, nz // 2],
+            [nx // 2, ny // 2, probe_z],
+            [nx // 2 + 1, ny // 2, probe_z],
         )
 
     sim_path = os.path.join(tempfile.gettempdir(), "openems_gpu_benchmark")
@@ -101,22 +116,24 @@ def main():
         "BENCHMARK_CONFIG"
         f" cells={nx}x{ny}x{nz}"
         f" timesteps={args.timesteps}"
+        f" engine={args.engine}"
         f" gpu_index={args.gpu_index}"
         f" boundary={args.boundary}"
         f" excitation={args.excitation}"
+        f" local_abc={args.local_abc}"
         f" field_memory={args.field_memory}"
         f" profile={int(args.profile)}"
         f" probe={int(args.probe)}",
         flush=True,
     )
 
-    fdtd.Run(
-        sim_path,
-        cleanup=True,
-        engine="gpu",
-        gpu_no_rebar_fields=(args.field_memory == "device-local"),
-        gpu_profile=args.profile,
-    )
+    run_options = {"cleanup": True, "engine": args.engine}
+    if args.engine == "gpu":
+        run_options.update(
+            gpu_no_rebar_fields=(args.field_memory == "device-local"),
+            gpu_profile=args.profile,
+        )
+    fdtd.Run(sim_path, **run_options)
 
     if not args.keep_output:
         shutil.rmtree(sim_path, ignore_errors=True)

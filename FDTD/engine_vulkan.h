@@ -318,6 +318,8 @@ private:
 	void SetupGPU_SteadyState();
 	void RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts) const;
 	void UpdateSteadyStateResult();
+	void SetupGPU_LocalABC();
+	void RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) const;
 	void CleanupVulkan();
 	void SetupProfiling();
 	void CollectProfileForSlot(int slot) const;
@@ -367,6 +369,12 @@ private:
 	//! Push constant struct for probe gather shader.
 	struct ProbePC  { uint32_t count; };
 	struct SteadyPC { uint32_t count, ringSize, timestep; };
+	struct LocalAbcPC {
+		uint32_t Nx, Ny, Nz, ny, nyP, nyPP;
+		uint32_t startX, startY, startZ;
+		uint32_t voltBoundary, voltShift, currBoundary, currShift;
+		uint32_t sizeP, sizePP, countVolt, countCurr, phase;
+	};
 
 	//! Helper pairing a VkBuffer with its VkDeviceMemory.
 	struct GpuBuf {
@@ -489,6 +497,19 @@ private:
 	VkPipeline m_steadyPipeline = VK_NULL_HANDLE;
 	VkDescriptorPool m_steadyDescPool = VK_NULL_HANDLE;
 	VkDescriptorSet m_steadyDescSet = VK_NULL_HANDLE;
+
+	struct GpuLocalABCData {
+		GpuBuf voltState, currState, k1, k2;
+		VkDescriptorSet voltDesc = VK_NULL_HANDLE;
+		VkDescriptorSet currDesc = VK_NULL_HANDLE;
+		LocalAbcPC pc{};
+		bool superAbsorption = false;
+	};
+	std::vector<GpuLocalABCData> m_gpuLocalABC;
+	VkDescriptorSetLayout m_localAbcDescLayout = VK_NULL_HANDLE;
+	VkPipelineLayout m_localAbcPipeLayout = VK_NULL_HANDLE;
+	VkPipeline m_localAbcPipeline = VK_NULL_HANDLE;
+	VkDescriptorPool m_localAbcDescPool = VK_NULL_HANDLE;
 
 	// ---- Extension descriptor set layouts -----------------------------
 	VkDescriptorSetLayout m_upmlPreVoltDescLayout  = VK_NULL_HANDLE;
