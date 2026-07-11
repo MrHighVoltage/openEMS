@@ -40,7 +40,7 @@ layout(set=0, binding=4) buffer VIBuf     { float vi_comp[]; };
 struct PMLRegion {
     uint startX, startY, startZ;
     uint sizeX,  sizeY,  sizeZ;
-    uint fluxOffset;  // element offset into concatenated arrays (per-component)
+    uint fluxOffset;  // element offset to this region's component-0 block
 };
 layout(set=0, binding=5) buffer PMLInfoBuf {
     PMLRegion pmlRegions[MAX_PML_REGIONS];

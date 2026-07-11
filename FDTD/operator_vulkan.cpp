@@ -21,6 +21,8 @@
 #include <thread>
 #include <mutex>
 #include <cstdlib>
+#include <cmath>
+#include <stdexcept>
 
 using std::cout;
 using std::endl;
@@ -305,6 +307,20 @@ void Operator_Vulkan::CompressOperator()
 	{
 		writeCompRange(0, m_numCompressed);
 	}
+
+	auto validateFinite = [](const std::vector<float>& values, const char* name)
+	{
+		for (size_t i = 0; i < values.size(); ++i)
+		{
+			if (!std::isfinite(values[i]))
+				throw std::runtime_error(std::string("Operator_Vulkan: non-finite ") +
+				                         name + " coefficient at index " + std::to_string(i));
+		}
+	};
+	validateFinite(m_vvComp, "VV");
+	validateFinite(m_viComp, "VI");
+	validateFinite(m_iiComp, "II");
+	validateFinite(m_ivComp, "IV");
 	auto tPackEnd = std::chrono::steady_clock::now();
 	auto tCompressEnd = std::chrono::steady_clock::now();
 

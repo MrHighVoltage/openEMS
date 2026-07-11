@@ -31,7 +31,7 @@ layout(set=0, binding=4) buffer IVBuf     { float iv_comp[]; };
 struct PMLRegion {
     uint startX, startY, startZ;
     uint sizeX,  sizeY,  sizeZ;
-    uint fluxOffset;
+    uint fluxOffset;  // element offset to this region's component-0 block
 };
 layout(set=0, binding=5) buffer PMLInfoBuf {
     PMLRegion pmlRegions[MAX_PML_REGIONS];

@@ -1087,7 +1087,7 @@ bool openEMS::Write2XML(TiXmlNode* rootNode)
 	fdtd.SetAttribute("TimeStepMethod", m_TS_method);
 	if (m_TS>0)
 		fdtd.SetDoubleAttribute("TimeStep", m_TS);
-	if (m_TS_fac>1)
+	if (m_TS_fac>0 && m_TS_fac!=1)
 		fdtd.SetDoubleAttribute("TimeStepFactor", m_TS_fac);
 	fdtd.InsertEndChild(exc);
 

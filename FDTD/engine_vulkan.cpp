@@ -39,6 +39,7 @@
 #include <functional>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 
 using std::cerr;
@@ -1380,6 +1381,12 @@ void Engine_Vulkan::SetupGPUExcitation()
 	m_excSignalPeriod = (exc->GetSignalPeriod() > 0)
 	                    ? (int)(exc->GetSignalPeriod() / exc->GetTimestep())
 	                    : 0;
+	for (unsigned int i = 0; i < m_excSignalLen; ++i)
+	{
+		if (!std::isfinite(exc->GetVoltageSignal()[i]) ||
+		    !std::isfinite(exc->GetCurrentSignal()[i]))
+			throw std::runtime_error("Engine_Vulkan: non-finite excitation signal sample");
+	}
 
 	size_t N = (size_t)numLines[0] * numLines[1] * numLines[2];
 	uint32_t sYZ = numLines[1] * numLines[2];
@@ -1400,7 +1407,10 @@ void Engine_Vulkan::SetupGPUExcitation()
 			uint32_t x   = opExc->GetVoltIndex(0)[n];
 			uint32_t y   = opExc->GetVoltIndex(1)[n];
 			uint32_t z   = opExc->GetVoltIndex(2)[n];
-			linIdx[n]    = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
+			if (dir >= 3 || x >= numLines[0] || y >= numLines[1] || z >= numLines[2] ||
+			    !std::isfinite(opExc->GetVoltAmp()[n]))
+				throw std::runtime_error("Engine_Vulkan: invalid voltage excitation entry");
+			linIdx[n] = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
 		}
 
 		VkDeviceSize idxSize = m_excVoltCount * sizeof(uint32_t);
@@ -1424,7 +1434,10 @@ void Engine_Vulkan::SetupGPUExcitation()
 			uint32_t x   = opExc->GetCurrIndex(0)[n];
 			uint32_t y   = opExc->GetCurrIndex(1)[n];
 			uint32_t z   = opExc->GetCurrIndex(2)[n];
-			linIdx[n]    = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
+			if (dir >= 3 || x >= numLines[0] || y >= numLines[1] || z >= numLines[2] ||
+			    !std::isfinite(opExc->GetCurrAmp()[n]))
+				throw std::runtime_error("Engine_Vulkan: invalid current excitation entry");
+			linIdx[n] = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
 		}
 
 		VkDeviceSize idxSize = m_excCurrCount * sizeof(uint32_t);
@@ -1831,6 +1844,23 @@ void Engine_Vulkan::SetupGPU_UPML()
 		data.pc.pStartY = upml->m_StartPos[1];
 		data.pc.pStartZ = upml->m_StartPos[2];
 		data.totalCells  = pN;
+
+		auto validatePml = [pN](const ArrayLib::ArrayNIJK<FDTD_FLOAT>& values,
+		                             const char* name)
+		{
+			for (uint32_t i = 0; i < 3u * pN; ++i)
+			{
+				if (!std::isfinite(values.data(i)))
+					throw std::runtime_error(std::string("Engine_Vulkan: non-finite UPML ") +
+					                         name + " coefficient at index " + std::to_string(i));
+			}
+		};
+		validatePml(upml->vv, "VV");
+		validatePml(upml->vvfo, "VVFO");
+		validatePml(upml->vvfn, "VVFN");
+		validatePml(upml->ii, "II");
+		validatePml(upml->iifo, "IIFO");
+		validatePml(upml->iifn, "IIFN");
 
 		// Create and upload auxiliary flux buffers (initialized to zero)
 		VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -4392,7 +4422,9 @@ void Engine_Vulkan::SetupFusedUPML()
 		r.sizeX  = u.pc.pNx;
 		r.sizeY  = u.pc.pNy;
 		r.sizeZ  = u.pc.pNz;
-		r.fluxOffset = totalPmlCells;  // per-component offset
+		// Each region is packed as [component 0][component 1][component 2].
+		// Store an element offset, not a per-component cell offset.
+		r.fluxOffset = 3u * totalPmlCells;
 		regions.push_back(r);
 		totalPmlCells += u.totalCells;
 	}
@@ -4412,6 +4444,13 @@ void Engine_Vulkan::SetupFusedUPML()
 
 	VkDeviceSize fluxBufSize = 3 * (VkDeviceSize)totalPmlCells * sizeof(float);
 	if (fluxBufSize == 0) return;
+	for (size_t ri = 0; ri < regions.size(); ++ri)
+	{
+		VkDeviceSize regionEnd = ((VkDeviceSize)regions[ri].fluxOffset +
+		                              3 * (VkDeviceSize)m_gpuUPML[ri].totalCells) * sizeof(float);
+		if (regionEnd > fluxBufSize)
+			throw std::runtime_error("Engine_Vulkan::SetupFusedUPML: packed region exceeds buffer");
+	}
 
 	// --- Create concatenated buffers ---
 	CreateGpuBuf(m_fusedVoltFlux, fluxBufSize, rwUsage, dLoc);
@@ -4439,7 +4478,7 @@ void Engine_Vulkan::SetupFusedUPML()
 		{
 			const auto& u = m_gpuUPML[ri];
 			VkDeviceSize regionFluxSize = 3 * (VkDeviceSize)u.totalCells * sizeof(float);
-			VkDeviceSize dstOffset = 3 * (VkDeviceSize)regions[ri].fluxOffset * sizeof(float);
+			VkDeviceSize dstOffset = (VkDeviceSize)regions[ri].fluxOffset * sizeof(float);
 			VkBufferCopy copyRegion = {0, dstOffset, regionFluxSize};
 			vkCmdCopyBuffer(cmd, u.pmlVv.buffer,   m_fusedPmlVv.buffer,   1, &copyRegion);
 			vkCmdCopyBuffer(cmd, u.pmlVvfo.buffer, m_fusedPmlVvfo.buffer, 1, &copyRegion);
