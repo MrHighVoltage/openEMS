@@ -5,6 +5,11 @@ project(nf2ff CXX)
 
 find_package(Threads REQUIRED)
 
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard used to build nf2ff")
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # define build type
 IF( DEFINED CMAKE_BUILD_TYPE )
   SET( CMAKE_BUILD_TYPE ${CMAKE_BUILD_TYPE} CACHE STRING "Set to either \"Release\" or \"Debug\"" )
@@ -36,7 +41,7 @@ set(HEADERS
 
 add_library( nf2ff SHARED ${SOURCES})
 set_target_properties(nf2ff PROPERTIES VERSION ${LIB_VERSION_STRING} SOVERSION ${LIB_VERSION_MAJOR})
-set_target_properties(nf2ff PROPERTIES CXX_STANDARD 17)
+set_target_properties(nf2ff PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD})
 if (WIN32)
     target_compile_definitions(nf2ff PRIVATE -DBUILD_NF2FF_LIB )
 endif (WIN32)

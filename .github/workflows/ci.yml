@@ -322,6 +322,18 @@ jobs:
         run: |
           cat /etc/os-release
 
+          # GCC 4.8, used by the ancient CentOS 7 and Ubuntu 14.04 jobs, does
+          # not support C++17. Keep the modern default elsewhere, but build
+          # the complete legacy dependency chain in C++11 mode.
+          if [ "${{ matrix.os.ancient }}" = "true" ]; then
+            echo 'LEGACY_CMAKE_ARGS=-DCMAKE_CXX_STANDARD=11' >> "$GITHUB_ENV"
+            echo 'CSXCAD_POLICY_ARGS=' >> "$GITHUB_ENV"
+            echo 'CXXFLAGS=-Wall -Wextra -Wno-error -std=c++11' >> "$GITHUB_ENV"
+          else
+            echo 'LEGACY_CMAKE_ARGS=' >> "$GITHUB_ENV"
+            echo 'CSXCAD_POLICY_ARGS=-DCMAKE_POLICY_VERSION_MINIMUM=3.5' >> "$GITHUB_ENV"
+          fi
+
           if grep -q "ID=fedora" /etc/os-release; then
             dnf install -y git
             dnf install -y gcc gcc-c++ cmake git boost-devel tinyxml-devel vtk-devel hdf5-devel \
@@ -483,7 +495,7 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/fparser
           mkdir build && cd build
-          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt
+          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt ${LEGACY_CMAKE_ARGS}
           make -j`nproc` && make install
 
       - name: Build and install CSXCAD
@@ -497,7 +509,8 @@ jobs:
           # the error above! There's no need to install MPI.
           cd $GITHUB_WORKSPACE/CSXCAD
           mkdir build && cd build
-          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt \
+                    ${CSXCAD_POLICY_ARGS} ${LEGACY_CMAKE_ARGS}
           make -j`nproc` && make install
 
       - name: Build and install CSXCAD Python module with --no-build-isolation
@@ -532,7 +545,8 @@ jobs:
 
           cd $GITHUB_WORKSPACE/openEMS
           mkdir build && cd build
-          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DFPARSER_ROOT_DIR=$HOME/opt
+          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt \
+                    -DFPARSER_ROOT_DIR=$HOME/opt ${LEGACY_CMAKE_ARGS}
           make -j`nproc` && make install
 
           echo "addpath('~/opt/share/openEMS/matlab')" >> ~/.octaverc

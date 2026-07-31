@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.5...3.10)
 
 project(openEMS CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard used to build openEMS")
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # define build type
 IF( DEFINED CMAKE_BUILD_TYPE )
