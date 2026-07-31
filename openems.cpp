@@ -42,11 +42,13 @@
 #include "FDTD/extensions/engine_ext_steadystate.h"
 #include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/engine_interface_cylindrical_fdtd.h"
+#if OPENEMS_ENABLE_AVX2
 #include "FDTD/operator_avx2.h"
 #include "FDTD/operator_avx2_multithread.h"
 #include "FDTD/engine_avx2.h"
 #include "FDTD/engine_avx2_multithread.h"
 #include "FDTD/engine_interface_avx2_fdtd.h"
+#endif
 #ifdef WITH_GPU
 #include "FDTD/operator_vulkan.h"
 #include "FDTD/engine_vulkan.h"
@@ -92,7 +94,11 @@ openEMS::openEMS()
 	m_debugBox = m_debugPEC = m_no_simulation = false;
 	m_DumpStats = false;
 
+#if OPENEMS_ENABLE_AVX2
 	m_engine = EngineType_AVX2_Multithreaded; //default engine type
+#else
+	m_engine = EngineType_Multithreaded; // default portable engine type
+#endif
 	m_engine_numThreads = 0;
 
 	m_Abort = false;
@@ -236,8 +242,10 @@ openEMS::optionDesc()
 				// default, don't show console output
 #ifdef WITH_GPU
 				m_engine = EngineType_GPU;
-#else
+#elif OPENEMS_ENABLE_AVX2
 				m_engine = EngineType_AVX2_Multithreaded;
+#else
+				m_engine = EngineType_Multithreaded;
 #endif
 			}
 			else if (val == "basic")
@@ -269,13 +277,23 @@ openEMS::optionDesc()
 #endif
 			else if (val == "avx2")
 			{
+#if OPENEMS_ENABLE_AVX2
 				cout << "openEMS - enabled AVX2+FMA engine" << endl;
 				m_engine = EngineType_AVX2;
+#else
+				cerr << "openEMS - AVX2+FMA engine is unavailable on this platform; using multithreaded engine" << endl;
+				m_engine = EngineType_Multithreaded;
+#endif
 			}
 			else if (val == "avx2-multithreaded")
 			{
+#if OPENEMS_ENABLE_AVX2
 				cout << "openEMS - enabled AVX2+FMA multithreaded engine" << endl;
 				m_engine = EngineType_AVX2_Multithreaded;
+#else
+				cerr << "openEMS - AVX2+FMA multithreaded engine is unavailable on this platform; using multithreaded engine" << endl;
+				m_engine = EngineType_Multithreaded;
+#endif
 			}
 		},
 		"Choose engine type \n\n"
@@ -511,9 +529,11 @@ Engine_Interface_FDTD* openEMS::NewEngineInterface(int multigridlevel)
 	Operator_Cylinder* op_cyl = dynamic_cast<Operator_Cylinder*>(FDTD_Op);
 	if (op_cyl)
 		return new Engine_Interface_Cylindrical_FDTD(op_cyl);
+#if OPENEMS_ENABLE_AVX2
 	Operator_AVX2* op_avx2 = dynamic_cast<Operator_AVX2*>(FDTD_Op);
 	if (op_avx2)
 		return new Engine_Interface_AVX2_FDTD(op_avx2);
+#endif
 	Operator_sse* op_sse = dynamic_cast<Operator_sse*>(FDTD_Op);
 	if (op_sse)
 		return new Engine_Interface_SSE_FDTD(op_sse);
@@ -794,11 +814,19 @@ bool openEMS::SetupOperator()
 	}
 	else if (m_engine == EngineType_AVX2)
 	{
+#if OPENEMS_ENABLE_AVX2
 		FDTD_Op = Operator_AVX2::New();
+#else
+		FDTD_Op = Operator_Multithread::New(m_engine_numThreads);
+#endif
 	}
 	else if (m_engine == EngineType_AVX2_Multithreaded)
 	{
+#if OPENEMS_ENABLE_AVX2
 		FDTD_Op = Operator_AVX2_Multithread::New(m_engine_numThreads);
+#else
+		FDTD_Op = Operator_Multithread::New(m_engine_numThreads);
+#endif
 	}
 #ifdef WITH_GPU
 	else if (m_engine == EngineType_GPU)

@@ -21,7 +21,9 @@
 
 #include "FDTD/engine.h"
 #include "FDTD/engine_sse.h"
+#if OPENEMS_ENABLE_AVX2
 #include "FDTD/engine_avx2.h"
+#endif
 
 // In openEMS, all extensions are subclasses from the abstract Engine_Extension
 // to implement features like Engine_Extension::Apply2Voltages(). When an
@@ -68,12 +70,24 @@
 #define GPU_ENG_DISPATCH_ARGS_CASE(impl, ...)
 #endif
 
+#if OPENEMS_ENABLE_AVX2
+#define AVX2_ENG_DISPATCH_CASE(impl) \
+	case Engine::AVX2: \
+		(this)->template impl<Engine_AVX2>((Engine_AVX2*) m_Eng); \
+		break;
+#define AVX2_ENG_DISPATCH_ARGS_CASE(impl, ...) \
+	case Engine::AVX2: \
+		(this)->template impl<Engine_AVX2>((Engine_AVX2*) m_Eng, __VA_ARGS__); \
+		break;
+#else
+#define AVX2_ENG_DISPATCH_CASE(impl)
+#define AVX2_ENG_DISPATCH_ARGS_CASE(impl, ...)
+#endif
+
 #define ENG_DISPATCH(impl) \
 	switch (m_Eng->GetType()) \
 	{ \
-	case Engine::AVX2: \
-		(this)->template impl<Engine_AVX2>((Engine_AVX2*) m_Eng); \
-		break; \
+	AVX2_ENG_DISPATCH_CASE(impl) \
 	case Engine::SSE: \
 		(this)->template impl<Engine_sse>((Engine_sse*) m_Eng); \
 		break; \
@@ -91,9 +105,7 @@
 #define ENG_DISPATCH_ARGS(impl, ...) \
 	switch (m_Eng->GetType()) \
 	{ \
-	case Engine::AVX2: \
-		(this)->template impl<Engine_AVX2>((Engine_AVX2*) m_Eng, __VA_ARGS__); \
-		break; \
+	AVX2_ENG_DISPATCH_ARGS_CASE(impl, __VA_ARGS__) \
 	case Engine::SSE: \
 		(this)->template impl<Engine_sse>((Engine_sse*) m_Eng, __VA_ARGS__); \
 		break; \
