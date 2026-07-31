@@ -49,9 +49,14 @@ def parse_args():
     parser.add_argument("--boundary", choices=("pec", "pml"), default="pec")
     parser.add_argument("--excitation", choices=("gaussian", "sinusoidal"), default="gaussian")
     parser.add_argument("--local-abc", choices=("none", "mur", "mur-sa"), default="none")
+    parser.add_argument("--material", choices=("none", "conducting-sheet"), default="none")
+    parser.add_argument("--source-z", type=int, default=-1,
+                        help="place the benchmark excitation on one z plane")
     parser.add_argument("--field-memory", choices=("auto", "device-local"), default="auto")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--probe-x", type=int, default=-1)
+    parser.add_argument("--probe-y", type=int, default=-1)
     parser.add_argument("--probe-z", type=int, default=-1)
     parser.add_argument("--keep-output", action="store_true")
     return parser.parse_args()
@@ -87,9 +92,12 @@ def main():
     mesh.SetLines("z", list(range(nz)))
 
     excitation = csx.AddExcitation("benchmark_excitation", exc_type=0, exc_val=[1, 0, 0])
+    source_z = args.source_z
+    if source_z >= nz:
+        raise ValueError("--source-z must be inside the z grid")
     excitation.AddBox(
-        [nx // 2, 9, 9],
-        [nx // 2 + 1, ny - 10, nz - 10],
+        [nx // 2, 9, source_z if source_z >= 0 else 9],
+        [nx // 2 + 1, ny - 10, source_z if source_z >= 0 else nz - 10],
         priority=10,
     )
 
@@ -103,13 +111,24 @@ def main():
         )
         absorber.AddBox([5, 5, nz - 10], [nx - 6, ny - 6, nz - 10], priority=20)
 
+    if args.material == "conducting-sheet":
+        sheet = csx.AddConductingSheet(
+            "benchmark_conducting_sheet",
+            conductivity=5.8e7,
+            thickness=1.0e-6,
+        )
+        sheet.AddBox([5, 5, nz // 2 + 5], [nx - 6, ny - 6, nz // 2 + 5], priority=15)
+
     if args.probe:
+        probe_x = args.probe_x if args.probe_x >= 0 else nx // 2
+        probe_y = args.probe_y if args.probe_y >= 0 else ny // 2
         probe_z = args.probe_z if args.probe_z >= 0 else nz // 2
         probe = csx.AddProbe("benchmark_voltage", p_type=0)
         probe.AddBox(
-            [nx // 2, ny // 2, probe_z],
-            [nx // 2 + 1, ny // 2, probe_z],
+            [probe_x, probe_y, probe_z],
+            [probe_x + 1, probe_y, probe_z],
         )
+
 
     sim_path = os.path.join(tempfile.gettempdir(), "openems_gpu_benchmark")
     print(
@@ -121,6 +140,7 @@ def main():
         f" boundary={args.boundary}"
         f" excitation={args.excitation}"
         f" local_abc={args.local_abc}"
+        f" material={args.material}"
         f" field_memory={args.field_memory}"
         f" profile={int(args.profile)}"
         f" probe={int(args.probe)}",

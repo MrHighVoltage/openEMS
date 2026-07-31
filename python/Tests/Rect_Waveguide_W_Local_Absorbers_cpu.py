@@ -65,9 +65,9 @@ unit = 1e-6; #drawing unit in um
 
 # waveguide dimensions
 # WR42
-a = 30700;   #waveguide width
+a = 70700;   #waveguide width
 b = 4300;    #waveguide height
-length = 50000;
+length = 90000;
 
 # frequency range of interest
 f_start = 50e9;
