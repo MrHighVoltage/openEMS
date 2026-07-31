@@ -122,15 +122,18 @@ jobs:
           #                required.
           #          false: use standard GitHub's actions/checkout.
           # docker-image: string, image on DockerHub to use
-          - name: "CentOS 7"
-            libc: "GNU"
-            ancient: true
-            docker-image: "centos:7"
+          # Temporarily disabled: these images use GCC 4.8-era toolchains and
+          # are not part of the supported CI set while the legacy path is
+          # being stabilized.
+          # - name: "CentOS 7"
+          #   libc: "GNU"
+          #   ancient: true
+          #   docker-image: "centos:7"
 
-          - name: "Ubuntu 14.04"
-            libc: "GNU"
-            ancient: true
-            docker-image: "ubuntu:14.04"
+          # - name: "Ubuntu 14.04"
+          #   libc: "GNU"
+          #   ancient: true
+          #   docker-image: "ubuntu:14.04"
 
           - name: "Debian oldoldstable"
             libc: "GNU"
