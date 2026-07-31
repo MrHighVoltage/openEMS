@@ -7,8 +7,11 @@ find_package(Threads REQUIRED)
 
 if(NOT DEFINED CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard used to build nf2ff")
+elseif(CMAKE_CXX_STANDARD LESS 17)
+  message(FATAL_ERROR "nf2ff requires C++17 or newer (CMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD})")
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # define build type
 IF( DEFINED CMAKE_BUILD_TYPE )

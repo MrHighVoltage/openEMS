@@ -181,7 +181,7 @@ def determine_build_options():
     # full compiler detection logic. This is good enough for 90% of
     # use cases.
     if os.name == "posix":
-        build_options["extra_compile_args"].append("-std=c++11")
+        build_options["extra_compile_args"].append("-std=c++17")
 
     # Setting this will cause an exception during build on Windows platforms.
     if os.name != "posix":
@@ -251,8 +251,8 @@ try:
         install_requires += add_csxcad()
 except ImportError:
     # Python < 3.8: importlib.metadata unavailable.  These old interpreters
-    # only appear on Linux (CentOS 7 / AlmaLinux 8 / Ubuntu 14.04) where
-    # "import CSXCAD" works reliably once the package is installed.
+    # are still supported by the packaging code where the package is installed
+    # before openEMS is built.
     try:
         import CSXCAD  # noqa: F401
         install_requires += ["CSXCAD"]

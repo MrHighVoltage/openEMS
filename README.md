@@ -150,7 +150,7 @@ python3 -m unittest discover -s python/Tests -p "test_*.py" -v
 
 Pull requests are welcome. Please:
 
-1. Follow the existing code style (C++11, no trailing whitespace — enforced by CI).
+1. Follow the existing code style (C++17, no trailing whitespace — enforced by CI).
 2. Add or update tests in `TESTSUITE/` for non-trivial changes.
 3. Disclose AI tool usage per [AI_POLICY.md](AI_POLICY.md).
 4. Include `Signed-off-by: Your Name <email>` in commit messages (DCO).
