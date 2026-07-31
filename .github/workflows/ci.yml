@@ -243,6 +243,8 @@ jobs:
           repository: "${{ needs.Dependencies.outputs.fparser_repo }}"
           ref: "${{ needs.Dependencies.outputs.fparser_branch }}"
           path: fparser
+          # Keep tags available for git describe in the dependency CMake.
+          fetch-depth: 0
 
       - if: ${{ matrix.os.ancient }}
         name: (legacy) Work around known problems
@@ -495,7 +497,7 @@ jobs:
           # the error above! There's no need to install MPI.
           cd $GITHUB_WORKSPACE/CSXCAD
           mkdir build && cd build
-          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt
+          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           make -j`nproc` && make install
 
       - name: Build and install CSXCAD Python module with --no-build-isolation
@@ -698,6 +700,8 @@ jobs:
           repository: "${{ needs.Dependencies.outputs.fparser_repo }}"
           ref: "${{ needs.Dependencies.outputs.fparser_branch }}"
           path: fparser
+          # Keep tags available for git describe in the dependency CMake.
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -742,13 +746,14 @@ jobs:
           patch -p1 < CVE-2023-34194.patch
 
           # You know something is truly deprecated when the patch itself needs
-          # patching! In CMake 4, 3.10 is deprecated and 3.5 has been removed.
-          # use 3.0...3.10 so all of these versions are acceptable as min. version.
+          # patching! In CMake 4, compatibility versions below 3.5 are removed.
+          # Use 3.5...3.10 to retain the old policy behavior without triggering
+          # the CMake 4 compatibility error.
           # (CMake 2 is dropped since openEMS already requires CMake 3, and also
           # because CMake 2 is too old that it's not even documented anymore)
           #
           # https://cmake.org/cmake/help/latest/command/cmake_minimum_required.html
-          sed -i -e "s/cmake_minimum_required(VERSION 2.4.6)/cmake_minimum_required(VERSION 3.0...3.10)/" \
+          sed -i -e "s/cmake_minimum_required(VERSION 2.4.6)/cmake_minimum_required(VERSION 3.5...3.10)/" \
                     tinyxml_CMakeLists.patch  # -e is not optional in BSD sed
           patch -p1 < tinyxml_CMakeLists.patch
 
@@ -776,7 +781,7 @@ jobs:
           source ~/.zprofile
           cd $GITHUB_WORKSPACE/CSXCAD
           mkdir build && cd build
-          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt
+          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           make -j$NCPUS && make install
 
       - name: Build and install CSXCAD Python module with --no-build-isolation
@@ -922,6 +927,8 @@ jobs:
           repository: "${{ needs.Dependencies.outputs.fparser_repo }}"
           ref: "${{ needs.Dependencies.outputs.fparser_branch }}"
           path: fparser
+          # Keep tags available for git describe in the dependency CMake.
+          fetch-depth: 0
 
       - name: Test in FreeBSD ${{ matrix.machine.version }} ${{ matrix.machine.arch }}
         uses: cross-platform-actions/action@v0.26.0
@@ -962,7 +969,7 @@ jobs:
             # the error above! There's no need to install MPI.
             cd $GITHUB_WORKSPACE/CSXCAD
             mkdir build && cd build
-            cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt
+            cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_POLICY_VERSION_MINIMUM=3.5
             make -j$NCPUS && make install
 
             echo "Build and install CSXCAD Python module with --no-build-isolation..."
@@ -1112,6 +1119,8 @@ jobs:
           repository: "${{ needs.Dependencies.outputs.fparser_repo }}"
           ref: "${{ needs.Dependencies.outputs.fparser_branch }}"
           path: fparser
+          # Keep tags available for git describe in the dependency CMake.
+          fetch-depth: 0
 
       # It doesn't really work, because MSVC itself doesn't support long path.
       # But for future-proofing (it does work for clang).
@@ -1158,6 +1167,7 @@ jobs:
           cmake ../ -GNinja `
                     -DCMAKE_BUILD_TYPE=Release `
                     -DCMAKE_INSTALL_PREFIX="$HOME/opt" `
+                    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
                     -DFPARSER_ROOT_DIR="$HOME/opt" `
                     -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
                     -DVCPKG_HOST_TRIPLET="x64-windows-release" `

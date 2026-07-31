@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 3.5...3.10)
 
 set(SOURCES
   ${SOURCES}
@@ -27,9 +28,7 @@ set(SOURCES
 # tools lib
 #add_library(tools STATIC ${SOURCES} )
 
-cmake_minimum_required(VERSION 3.0...3.10)
-
-PROJECT(sar CXX)
+project(sar CXX)
 
 ADD_EXECUTABLE( sar_bin sar_calc.cpp)
 SET_TARGET_PROPERTIES(sar_bin PROPERTIES OUTPUT_NAME sar_calc)
@@ -42,4 +41,3 @@ INSTALL(FILES arraylib/array_ij.h arraylib/array_ijk.h arraylib/array_nijk.h DES
 INSTALL(FILES arraylib/impl/allocator.h arraylib/impl/array_base.h arraylib/impl/subscript.h DESTINATION include/openEMS/arraylib/impl)
 
 INSTALL(TARGETS sar_bin DESTINATION bin)
-

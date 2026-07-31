@@ -1,3 +1,7 @@
+cmake_minimum_required(VERSION 3.5...3.10)
+
+project(openEMS CXX C)
+
 set(CMAKE_CXX_STANDARD 17)
 
 # define build type
@@ -6,13 +10,6 @@ IF( DEFINED CMAKE_BUILD_TYPE )
 ELSE()
   SET( CMAKE_BUILD_TYPE Release CACHE STRING "Set to either \"Release\" or \"Debug\"" )
 ENDIF()
-
-# In CMake 4, 3.10 is deprecated and 3.5 has been removed.
-# use 3.1...3.10 so all of these versions are acceptable as min. version.
-# https://cmake.org/cmake/help/latest/command/cmake_minimum_required.html
-cmake_minimum_required(VERSION 3.1...3.10)
-
-PROJECT(openEMS CXX C)
 
 # default
 set(LIB_VERSION_MAJOR 0)
