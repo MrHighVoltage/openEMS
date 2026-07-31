@@ -224,7 +224,7 @@ jobs:
         shell: sh
         run: |
           cat /etc/os-release
-          echo 'CSXCAD_POLICY_ARGS=-DCMAKE_POLICY_VERSION_MINIMUM=3.5' >> "$GITHUB_ENV"
+          echo 'CSXCAD_CMAKE_ARGS=-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBoost_NO_BOOST_CMAKE=ON' >> "$GITHUB_ENV"
 
           if grep -q "ID=fedora" /etc/os-release; then
             dnf install -y git
@@ -314,7 +314,7 @@ jobs:
           cd $GITHUB_WORKSPACE/CSXCAD
           mkdir build && cd build
           cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt \
-                    ${CSXCAD_POLICY_ARGS}
+                    ${CSXCAD_CMAKE_ARGS}
           make -j`nproc` && make install
 
       - name: Build and install CSXCAD Python module with --no-build-isolation
@@ -567,7 +567,9 @@ jobs:
           source ~/.zprofile
           cd $GITHUB_WORKSPACE/CSXCAD
           mkdir build && cd build
-          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt \
+                    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                    -DBoost_NO_BOOST_CMAKE=ON
           make -j$NCPUS && make install
 
       - name: Build and install CSXCAD Python module with --no-build-isolation
@@ -755,7 +757,9 @@ jobs:
             # the error above! There's no need to install MPI.
             cd $GITHUB_WORKSPACE/CSXCAD
             mkdir build && cd build
-            cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt \
+                      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                      -DBoost_NO_BOOST_CMAKE=ON
             make -j$NCPUS && make install
 
             echo "Build and install CSXCAD Python module with --no-build-isolation..."
@@ -931,6 +935,13 @@ jobs:
           restore-keys: |
             Windows - ${{ matrix.toolchain.name }}
 
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT/vcpkg.exe" install `
+            --triplet x64-windows-release `
+            --x-manifest-root="$env:GITHUB_WORKSPACE/openEMS"
+
       - name: Build and install fparser
         run: |
           & "$env:VS_ROOT_DIR/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
@@ -953,7 +964,7 @@ jobs:
           cmake ../ -GNinja `
                     -DCMAKE_BUILD_TYPE=Release `
                     -DCMAKE_INSTALL_PREFIX="$HOME/opt" `
-                    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
+                    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" `
                     -DFPARSER_ROOT_DIR="$HOME/opt" `
                     -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
                     -DVCPKG_HOST_TRIPLET="x64-windows-release" `
