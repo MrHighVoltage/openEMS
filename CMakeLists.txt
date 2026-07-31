@@ -206,6 +206,23 @@ set(SOURCES
 
 set(PUB_HEADERS openems.h openems_global.h)
 
+# AVX2 is an x86-only implementation. Keep those translation units out of
+# non-x86 builds so ARM toolchains never parse <immintrin.h>.
+include(CheckCXXCompilerFlag)
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" OPENEMS_SYSTEM_PROCESSOR)
+set(OPENEMS_ENABLE_AVX2 OFF)
+if(OPENEMS_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|i[3-6]86)$")
+  check_cxx_compiler_flag("-mavx2 -mfma" COMPILER_SUPPORTS_AVX2_FMA)
+  if(COMPILER_SUPPORTS_AVX2_FMA)
+    set(OPENEMS_ENABLE_AVX2 ON)
+    message(STATUS "AVX2+FMA engine: enabled")
+  else()
+    message(WARNING "AVX2+FMA engine: compiler does not support -mavx2 -mfma")
+  endif()
+else()
+  message(STATUS "AVX2+FMA engine: disabled for ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
 # libs
 ADD_SUBDIRECTORY( tools )
 ADD_SUBDIRECTORY( FDTD )
@@ -224,9 +241,7 @@ endif()
 
 # AVX2 + FMA compile flags for the AVX2 engine sources (must be set here, not in
 # subdirectory, because set_source_files_properties is directory-scoped in CMake)
-include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-mavx2 -mfma" COMPILER_SUPPORTS_AVX2_FMA)
-if(COMPILER_SUPPORTS_AVX2_FMA)
+if(OPENEMS_ENABLE_AVX2)
   set_source_files_properties(
     FDTD/operator_avx2.cpp
     FDTD/engine_avx2.cpp
@@ -235,9 +250,6 @@ if(COMPILER_SUPPORTS_AVX2_FMA)
     FDTD/engine_interface_avx2_fdtd.cpp
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma"
   )
-  message(STATUS "AVX2+FMA engine: enabled")
-else()
-  message(WARNING "AVX2+FMA engine: compiler does not support -mavx2 -mfma, engine will not work at runtime on non-AVX2 CPUs")
 endif()
 
 add_library( openEMS SHARED ${SOURCES})
@@ -287,5 +299,6 @@ if (UNIX)
 	endif()
 endif ()
 INSTALL(FILES ${PUB_HEADERS} DESTINATION include/openEMS)
+INSTALL(FILES tools/option_parser.h DESTINATION include/openEMS/tools)
 INSTALL( DIRECTORY matlab DESTINATION share/openEMS )
 # TODO mpi, tarball, debug, release

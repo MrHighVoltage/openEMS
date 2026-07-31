@@ -14,6 +14,16 @@ if (WITH_GPU)
      )
 endif()
 
+if(OPENEMS_ENABLE_AVX2)
+  set(AVX2_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/operator_avx2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine_avx2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/operator_avx2_multithread.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine_avx2_multithread.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_avx2_fdtd.cpp
+  )
+endif()
+
 set(SOURCES
   ${SOURCES}
   ${MPI_SOURCES}
@@ -34,10 +44,6 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_sse_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_cylindrical_fdtd.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/operator_avx2.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/engine_avx2.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/operator_avx2_multithread.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/engine_avx2_multithread.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_avx2_fdtd.cpp
+  ${AVX2_SOURCES}
   PARENT_SCOPE
 )
