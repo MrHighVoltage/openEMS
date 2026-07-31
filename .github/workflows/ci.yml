@@ -938,9 +938,11 @@ jobs:
       - name: Install vcpkg dependencies
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT/vcpkg.exe" install `
-            --triplet x64-windows-release `
-            --x-manifest-root="$env:GITHUB_WORKSPACE/openEMS"
+          & "$env:VS_ROOT_DIR/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
+          Push-Location "$env:GITHUB_WORKSPACE/openEMS"
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet x64-windows-release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
 
       - name: Build and install fparser
         run: |
