@@ -14,6 +14,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <vector>
@@ -66,6 +67,54 @@ struct VulkanCoeffKeyEq
 
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+unsigned int GetOperatorThreadCount(unsigned int numX)
+{
+	unsigned int numThreads = std::thread::hardware_concurrency();
+	if (numThreads == 0)
+		numThreads = 1;
+
+	const char* env = std::getenv("OPENEMS_OPERATOR_THREADS");
+	if (env == nullptr)
+		env = std::getenv("OPENEMS_GPU_OPERATOR_THREADS");
+	if (env != nullptr)
+	{
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if ((end != env) && (*end == '\0') && (parsed > 0))
+			numThreads = (unsigned int)parsed;
+	}
+
+	return std::max(1u, std::min(numThreads, numX));
+}
+
+template <typename Work>
+void RunOperatorRanges(unsigned int xStart, unsigned int xStop, Work work)
+{
+	if (xStop < xStart)
+		return;
+
+	const unsigned int numX = xStop - xStart + 1;
+	const unsigned int numThreads = GetOperatorThreadCount(numX);
+	std::vector<std::thread> threads;
+	threads.reserve(numThreads > 1 ? numThreads - 1 : 0);
+
+	for (unsigned int t = 1; t < numThreads; ++t)
+	{
+		const unsigned int begin = xStart + (numX * t) / numThreads;
+		const unsigned int end = xStart + (numX * (t + 1)) / numThreads - 1;
+		threads.emplace_back(work, t, begin, end);
+	}
+
+	work(0, xStart, xStart + numX / numThreads - 1);
+	for (auto& thread : threads)
+		thread.join();
+}
+
+} // namespace
+
 Operator_Vulkan::Operator_Vulkan() : Operator()
 {
 	m_numCompressed = 0;
@@ -96,43 +145,66 @@ int Operator_Vulkan::CalcECOperator(DebugFlags debugFlags)
 	return errCode;
 }
 
-void Operator_Vulkan::Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop)
+bool Operator_Vulkan::Calc_EC()
 {
-	if (xStop < xStart)
-		return;
-
-	unsigned int numThreads = std::thread::hardware_concurrency();
-	if (numThreads == 0)
-		numThreads = 1;
-
-	if (const char* env = std::getenv("OPENEMS_GPU_OPERATOR_THREADS"))
+	if (CSX == nullptr)
 	{
-		char* end = nullptr;
-		long parsed = std::strtol(env, &end, 10);
-		if ((end != env) && (*end == '\0') && (parsed > 0))
-			numThreads = (unsigned int)parsed;
+		std::cerr << "Operator_Vulkan::Calc_EC: CSX not given or invalid!!!" << std::endl;
+		return false;
 	}
 
-	const unsigned int numX = xStop - xStart + 1;
-	numThreads = std::max(1u, std::min(numThreads, numX));
+	MainOp->SetPos(0, 0, 0);
+	const unsigned int numThreads = GetOperatorThreadCount(numLines[0]);
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "  GPU operator material threads: " << numThreads << endl;
 
+	RunOperatorRanges(0, numLines[0] - 1,
+		[this](unsigned int, unsigned int begin, unsigned int end)
+		{
+			Operator::Calc_EC_Range(begin, end);
+		});
+	return true;
+}
+
+bool Operator_Vulkan::CalcPEC()
+{
+	m_Nr_PEC[0] = 0;
+	m_Nr_PEC[1] = 0;
+	m_Nr_PEC[2] = 0;
+
+	const unsigned int numThreads = GetOperatorThreadCount(numLines[0]);
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "  GPU operator PEC threads: " << numThreads << endl;
+
+	std::vector<std::array<unsigned int, 3>> counts(numThreads);
+	for (auto& count : counts)
+		count = {0, 0, 0};
+
+	RunOperatorRanges(0, numLines[0] - 1,
+		[this, &counts](unsigned int threadID, unsigned int begin, unsigned int end)
+		{
+			Operator::CalcPEC_Range(begin, end, counts[threadID].data());
+		});
+
+	for (const auto& count : counts)
+		for (int n = 0; n < 3; ++n)
+			m_Nr_PEC[n] += count[n];
+
+	CalcPEC_Curves();
+	return true;
+}
+
+void Operator_Vulkan::Calc_ECOperator_Range(unsigned int xStart, unsigned int xStop)
+{
+	const unsigned int numThreads = GetOperatorThreadCount(xStop - xStart + 1);
 	if (g_settings.GetVerboseLevel() > 0)
 		cout << "  GPU operator coefficient threads: " << numThreads << endl;
 
-	std::vector<std::thread> threads;
-	threads.reserve(numThreads - 1);
-	for (unsigned int t = 1; t < numThreads; ++t)
-	{
-		unsigned int begin = xStart + (numX * t) / numThreads;
-		unsigned int end = xStart + (numX * (t + 1)) / numThreads - 1;
-		threads.emplace_back([this, begin, end]() {
+	RunOperatorRanges(xStart, xStop,
+		[this](unsigned int, unsigned int begin, unsigned int end)
+		{
 			Operator::Calc_ECOperator_Range(begin, end);
 		});
-	}
-
-	Operator::Calc_ECOperator_Range(xStart, xStart + numX / numThreads - 1);
-	for (auto& thread : threads)
-		thread.join();
 }
 
 void Operator_Vulkan::CompressOperator()

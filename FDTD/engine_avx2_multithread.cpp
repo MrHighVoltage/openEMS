@@ -273,29 +273,41 @@ void thread::operator()()
 		{
 			// Pre-voltage extensions
 			m_enginePtr->DoPreVoltageUpdates(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after voltage pre-extensions");
 
 			// Voltage update (x-range for this thread)
 			m_enginePtr->UpdateVoltages(m_start, m_stop - m_start + 1);
 
 			// Synchronize
 			m_enginePtr->m_IterateBarrier->wait();
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after voltage update");
 
 			// Post-voltage extensions
 			m_enginePtr->DoPostVoltageUpdates(m_threadID);
 			m_enginePtr->Apply2Voltages(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after voltage extensions");
 
 			// Pre-current extensions
 			m_enginePtr->DoPreCurrentUpdates(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after current pre-extensions");
 
 			// Current update (last thread processes one fewer x-line for H-field)
 			m_enginePtr->UpdateCurrents(m_start, m_stop_h - m_start + 1);
 
 			// Synchronize
 			m_enginePtr->m_IterateBarrier->wait();
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after current update");
 
 			// Post-current extensions
 			m_enginePtr->DoPostCurrentUpdates(m_threadID);
 			m_enginePtr->Apply2Current(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after current extensions");
 
 			if (m_threadID == 0)
 				++m_enginePtr->numTS;

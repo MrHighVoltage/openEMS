@@ -22,6 +22,9 @@
 #include "processfields.h"
 #include "processfields_calc.h"
 #include "FDTD/engine_interface_fdtd.h"
+#ifdef WITH_GPU
+#include "FDTD/engine_vulkan.h"
+#endif
 
 using std::cerr;
 using std::endl;
@@ -318,8 +321,15 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 			break;
 #ifdef WITH_GPU
 		case Engine::GPU:
-			// GPU engine: lazy-syncs fields to CPU on first GetVolt/GetCurr,
-			// then uses the same base Engine template path.
+			// The templated extractor intentionally uses qualified base-Engine
+			// accessors for thread-safe bulk reads.  Synchronize the Vulkan field
+			// buffers first so those reads do not see the zeroed host shadow.
+			static_cast<const Engine_Vulkan*>(eng)->SyncFieldsToHost();
+			ok = FieldCalc::CalcFieldForEngine<Engine>(
+				eng, op, mat,
+				m_DumpType, m_Eng_Interface->GetInterpolationType(),
+				numLines, posLines, field, nThreads);
+			break;
 #endif
 		case Engine::BASIC:
 			ok = FieldCalc::CalcFieldForEngine<Engine>(

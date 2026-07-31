@@ -47,7 +47,8 @@ void main()
             float I   = curr[g_idx];
 
             lor += i_Lor_ADE[ade_idx] * ade;
-            ade  = i_int_ADE[ade_idx] * ade + i_ext_ADE[ade_idx] * (I - lor);
+            ade  = i_int_ADE[ade_idx] * ade;
+            ade += i_ext_ADE[ade_idx] * (I - lor);
 
             curr_Lor_ADE[ade_idx] = lor;
             curr_ADE[ade_idx]     = ade;
@@ -63,7 +64,8 @@ void main()
             float ade = curr_ADE[ade_idx];
             float I   = curr[g_idx];
 
-            ade = i_int_ADE[ade_idx] * ade + i_ext_ADE[ade_idx] * I;
+            ade = i_int_ADE[ade_idx] * ade;
+            ade += i_ext_ADE[ade_idx] * I;
 
             curr_ADE[ade_idx] = ade;
         }

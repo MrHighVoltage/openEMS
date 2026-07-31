@@ -328,6 +328,8 @@ void thread::operator()()
 		{
 			// pre voltage stuff...
 			m_enginePtr->DoPreVoltageUpdates(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after voltage pre-extensions");
 
 			//voltage updates
 			m_enginePtr->UpdateVoltages(m_start,m_stop-m_start+1);
@@ -337,6 +339,8 @@ void thread::operator()()
 
 			//cout << "Thread " << std::this_thread::get_id() << " m_barrier1 waiting..." << endl;
 			m_enginePtr->m_IterateBarrier->wait();
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after voltage update");
 
 			// record time
 			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
@@ -344,6 +348,8 @@ void thread::operator()()
 			//post voltage stuff...
 			m_enginePtr->DoPostVoltageUpdates(m_threadID);
 			m_enginePtr->Apply2Voltages(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after voltage extensions");
 
 #ifdef MPI_SUPPORT
 			if (m_threadID==0)
@@ -360,6 +366,8 @@ void thread::operator()()
 
 			//pre current stuff
 			m_enginePtr->DoPreCurrentUpdates(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after current pre-extensions");
 
 			//current updates
 			m_enginePtr->UpdateCurrents(m_start,m_stop_h-m_start+1);
@@ -367,6 +375,8 @@ void thread::operator()()
 			// record time
 			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
 			m_enginePtr->m_IterateBarrier->wait();
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after current update");
 
 			// record time
 			DEBUG_TIME( m_enginePtr->m_timer_list[std::this_thread::get_id()].push_back( timer1.elapsed() ); )
@@ -374,6 +384,8 @@ void thread::operator()()
 			//post current stuff
 			m_enginePtr->DoPostCurrentUpdates(m_threadID);
 			m_enginePtr->Apply2Current(m_threadID);
+			if (m_threadID == 0)
+				m_enginePtr->TraceFieldCell("after current extensions");
 
 #ifdef MPI_SUPPORT
 			if (m_threadID==0)
@@ -396,4 +408,3 @@ void thread::operator()()
 }
 
 } // namespace
-

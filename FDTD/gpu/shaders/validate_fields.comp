@@ -1,0 +1,80 @@
+/*
+ * Debug-only finite-value scan for the raw voltage/current field buffers.
+ *
+ * The result buffer stores the first bad cell index for each component:
+ *   [voltage 0, voltage 1, voltage 2, current 0, current 1, current 2]
+ * It is initialized to UINT_MAX by the host before each dispatch.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) readonly buffer VoltBuf { float volt[]; };
+layout(set=0, binding=1) readonly buffer CurrBuf { float curr[]; };
+layout(set=0, binding=2) buffer BadBuf { uint bad[]; };
+layout(set=0, binding=3) readonly buffer OpIdxBuf { uint opIdx[]; };
+layout(set=0, binding=4) readonly buffer VVBuf { float vv_comp[]; };
+layout(set=0, binding=5) readonly buffer VIBuf { float vi_comp[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint outputBase;
+    uint traceIndex;
+    uint numComp;
+    uint Ny;
+    uint Nz;
+    uint checkMagnitude;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+
+    for (uint i = gid; i < N; i += stride)
+    {
+        float v0 = volt[i];
+        float v1 = volt[N + i];
+        float v2 = volt[2u * N + i];
+        if (isnan(v0) || isinf(v0) || (checkMagnitude != 0u && abs(v0) > 1.0e20)) atomicMin(bad[outputBase + 0u], i);
+        if (isnan(v1) || isinf(v1) || (checkMagnitude != 0u && abs(v1) > 1.0e20)) atomicMin(bad[outputBase + 1u], i);
+        if (isnan(v2) || isinf(v2) || (checkMagnitude != 0u && abs(v2) > 1.0e20)) atomicMin(bad[outputBase + 2u], i);
+
+        float c0 = curr[i];
+        float c1 = curr[N + i];
+        float c2 = curr[2u * N + i];
+        if (isnan(c0) || isinf(c0) || (checkMagnitude != 0u && abs(c0) > 1.0e20)) atomicMin(bad[outputBase + 3u], i);
+        if (isnan(c1) || isinf(c1) || (checkMagnitude != 0u && abs(c1) > 1.0e20)) atomicMin(bad[outputBase + 4u], i);
+        if (isnan(c2) || isinf(c2) || (checkMagnitude != 0u && abs(c2) > 1.0e20)) atomicMin(bad[outputBase + 5u], i);
+
+        if (i == traceIndex)
+        {
+            uint z = i % Nz;
+            uint y = (i / Nz) % Ny;
+            uint x = i / (Ny * Nz);
+            uint ym = max(y, 1u) - 1u;
+            uint zm = max(z, 1u) - 1u;
+            uint sYZ = Ny * Nz;
+            uint base = x * sYZ;
+            uint oi = opIdx[i];
+            float cz0 = curr[2u*N + base + y*Nz + z];
+            float czm = curr[2u*N + base + ym*Nz + z];
+            float cy0 = curr[N + base + y*Nz + z];
+            float cym = curr[N + base + y*Nz + zm];
+            float curl0 = cz0 - czm - cy0 + cym;
+            float vv0 = vv_comp[oi];
+            float vi0 = vi_comp[oi];
+            uint t = outputBase + 6u;
+            bad[t + 0u] = floatBitsToUint(v0);
+            bad[t + 1u] = floatBitsToUint(cz0);
+            bad[t + 2u] = floatBitsToUint(czm);
+            bad[t + 3u] = floatBitsToUint(cy0);
+            bad[t + 4u] = floatBitsToUint(cym);
+            bad[t + 5u] = floatBitsToUint(curl0);
+            bad[t + 6u] = oi;
+            bad[t + 7u] = floatBitsToUint(vv0);
+            bad[t + 8u] = floatBitsToUint(vi0);
+            bad[t + 9u] = floatBitsToUint(fma(vv0, v0, vi0 * curl0));
+        }
+    }
+}

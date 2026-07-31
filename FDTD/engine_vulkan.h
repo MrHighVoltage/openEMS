@@ -279,6 +279,10 @@ private:
 	bool         m_deviceDirty;
 	bool         m_hasCPUExtensions;
 	bool         m_hasGPUExcitation;
+	bool         m_validateFields;
+	bool         m_validateStages;
+	bool         m_validateMagnitude;
+	uint32_t     m_validateTraceIndex;
 	mutable bool m_gpuDrained;       //!< true after DrainGPU(), cleared on submit
 	unsigned int m_maxTSPerSubmit;   //!< Max timesteps per pure-GPU vkQueueSubmit
 	double       m_chunkProgressIntervalSec; //!< Minimum interval between chunk-progress prints
@@ -598,6 +602,21 @@ private:
 	struct EnergyPC { uint32_t N; uint32_t numWG; };
 	void SetupGPU_EnergyReduction();     //!< Create energy reduction resources
 	void CleanupGPU_EnergyReduction();   //!< Destroy energy reduction resources
+
+	// ---- Optional raw-field finite-value scan -------------------------
+	GpuBuf       m_validateBadBuf;       //!< [V0,V1,V2,C0,C1,C2] first bad cell indices
+	uint32_t*    m_validateBadMapped = nullptr;
+	VkDescriptorSetLayout m_validateDescLayout = VK_NULL_HANDLE;
+	VkPipelineLayout      m_validatePipeLayout = VK_NULL_HANDLE;
+	VkPipeline            m_validatePipeline = VK_NULL_HANDLE;
+	VkDescriptorPool      m_validateDescPool = VK_NULL_HANDLE;
+	VkDescriptorSet       m_validateDescSet = VK_NULL_HANDLE;
+	struct ValidatePC { uint32_t N, outputBase, traceIndex, numComp, Ny, Nz, checkMagnitude; };
+	void SetupGPU_FieldValidation();
+	void CleanupGPU_FieldValidation();
+	void RecordGPUFieldValidation(VkCommandBuffer cmd, uint32_t outputBase) const;
+	void ValidateGPUFields(unsigned int timestep) const; //!< Debug-only finite-value scan
+	void ReportGPUFieldValidation(unsigned int timestep) const; //!< Report staged scans
 
 	// ---- Async processing thread --------------------------------------
 	std::thread             m_asyncThread;

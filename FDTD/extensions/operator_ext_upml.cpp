@@ -20,6 +20,11 @@
 #include "engine_ext_upml.h"
 #include "fparser.hh"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <thread>
+
 using namespace std;
 
 Operator_Ext_UPML::Operator_Ext_UPML(Operator* op) : Operator_Extension(op)
@@ -266,8 +271,9 @@ bool Operator_Ext_UPML::SetGradingFunction(string func)
 	return false;
 }
 
-void Operator_Ext_UPML::CalcGradingKappa(int ny, unsigned int pos[3], double Zm, double kappa_v[3], double kappa_i[3])
+void Operator_Ext_UPML::CalcGradingKappa(int ny, unsigned int pos[3], double Zm, double kappa_v[3], double kappa_i[3], FunctionParser* gradingFunction)
 {
+	FunctionParser* parser = gradingFunction != nullptr ? gradingFunction : m_GradingFunction;
 	double depth=0;
 	double width=0;
 	for (int n=0; n<3; ++n)
@@ -287,7 +293,7 @@ void Operator_Ext_UPML::CalcGradingKappa(int ny, unsigned int pos[3], double Zm,
 				depth-=m_Op->GetEdgeLength(n,pos)/2;
 			double vars[5] = {depth, width/m_Size[2*n], width, Zm, (double)m_Size[2*n]};
 			if (depth>0)
-				kappa_v[n] = m_GradingFunction->Eval(vars);
+				kappa_v[n] = parser->Eval(vars);
 			else
 				kappa_v[n]=0;
 			if (n==ny)
@@ -299,7 +305,7 @@ void Operator_Ext_UPML::CalcGradingKappa(int ny, unsigned int pos[3], double Zm,
 				depth=0;
 			vars[0]=depth;
 			if (depth>0)
-				kappa_i[n] = m_GradingFunction->Eval(vars);
+				kappa_i[n] = parser->Eval(vars);
 			else
 				kappa_i[n] = 0;
 		}
@@ -318,7 +324,7 @@ void Operator_Ext_UPML::CalcGradingKappa(int ny, unsigned int pos[3], double Zm,
 				depth+=m_Op->GetEdgeLength(n,pos)/2;
 			double vars[5] = {depth, width/(m_Size[2*n+1]), width, Zm, (double)m_Size[2*n+1]};
 			if (depth>0)
-				kappa_v[n] = m_GradingFunction->Eval(vars);
+				kappa_v[n] = parser->Eval(vars);
 			else
 				kappa_v[n]=0;
 			if (n==ny)
@@ -330,7 +336,7 @@ void Operator_Ext_UPML::CalcGradingKappa(int ny, unsigned int pos[3], double Zm,
 				depth=0;
 			vars[0]=depth;
 			if (depth>0)
-				kappa_i[n] = m_GradingFunction->Eval(vars);
+				kappa_i[n] = parser->Eval(vars);
 			else
 				kappa_i[n]=0;
 		}
@@ -342,23 +348,13 @@ void Operator_Ext_UPML::CalcGradingKappa(int ny, unsigned int pos[3], double Zm,
 	}
 }
 
-bool Operator_Ext_UPML::BuildExtension()
+bool Operator_Ext_UPML::BuildExtension_Range(unsigned int xStart, unsigned int xStop, FunctionParser* gradingFunction)
 {
 	/*Calculate the upml coefficients as defined in:
 	  Allen Taflove, computational electrodynamics - the FDTD method, third edition, chapter 7.8, pages 297-300
 	  - modified by Thorsten Liebig to match the equivalent circuit (EC) FDTD method
 	  - kappa is used for conductivities (instead of sigma)
 	*/
-	if (m_Op==NULL)
-		return false;
-
-	vv.Init("vv", m_numLines);
-	vvfo.Init("vvfo", m_numLines);
-	vvfn.Init("vvfn", m_numLines);
-	ii.Init("ii", m_numLines);
-	iifo.Init("iifo", m_numLines);
-	iifn.Init("iifn", m_numLines);
-
 	unsigned int pos[3];
 	unsigned int loc_pos[3];
 	int nP,nPP;
@@ -367,7 +363,7 @@ bool Operator_Ext_UPML::BuildExtension()
 	double eff_Mat[4];
 	double dT = m_Op->GetTimestep();
 
-	for (loc_pos[0]=0; loc_pos[0]<m_numLines[0]; ++loc_pos[0])
+	for (loc_pos[0]=xStart; loc_pos[0]<=xStop; ++loc_pos[0])
 	{
 		pos[0] = loc_pos[0] + m_StartPos[0];
 		for (loc_pos[1]=0; loc_pos[1]<m_numLines[1]; ++loc_pos[1])
@@ -380,7 +376,7 @@ bool Operator_Ext_UPML::BuildExtension()
 				for (int n=0; n<3; ++n)
 				{
 					m_Op->Calc_EffMatPos(n,pos,eff_Mat,vPrims);
-					CalcGradingKappa(n, pos,Z0 ,kappa_v ,kappa_i);
+					CalcGradingKappa(n, pos, Z0, kappa_v, kappa_i, gradingFunction);
 					nP = (n+1)%3;
 					nPP = (n+2)%3;
 					// if eff_Mat[1] > 1e3 assume a metal and disable PML to continue a signal layer
@@ -442,6 +438,64 @@ bool Operator_Ext_UPML::BuildExtension()
 		}
 	}
 	return true;
+}
+
+bool Operator_Ext_UPML::BuildExtension()
+{
+	if (m_Op==NULL)
+		return false;
+
+	vv.Init("vv", m_numLines);
+	vvfo.Init("vvfo", m_numLines);
+	vvfn.Init("vvfn", m_numLines);
+	ii.Init("ii", m_numLines);
+	iifo.Init("iifo", m_numLines);
+	iifn.Init("iifn", m_numLines);
+
+	unsigned int numThreads = std::thread::hardware_concurrency();
+	if (numThreads == 0)
+		numThreads = 1;
+	const char* threadEnv = std::getenv("OPENEMS_OPERATOR_THREADS");
+	if (threadEnv == nullptr)
+		threadEnv = std::getenv("OPENEMS_GPU_OPERATOR_THREADS");
+	if (threadEnv != nullptr)
+	{
+		char* end = nullptr;
+		long parsed = std::strtol(threadEnv, &end, 10);
+		if ((end != threadEnv) && (*end == '\0') && (parsed > 0))
+			numThreads = (unsigned int)parsed;
+	}
+	numThreads = std::max(1u, std::min(numThreads, m_numLines[0]));
+
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "  UPML operator threads: " << numThreads << endl;
+
+	std::atomic<bool> success(true);
+	auto worker = [this, &success](unsigned int xStart, unsigned int xStop)
+	{
+		FunctionParser gradingFunction;
+		if (gradingFunction.Parse(m_GradFunc.c_str(), "D,dl,W,Z,N") >= 0)
+		{
+			success = false;
+			return;
+		}
+		if (!BuildExtension_Range(xStart, xStop, &gradingFunction))
+			success = false;
+	};
+
+	std::vector<std::thread> threads;
+	threads.reserve(numThreads > 1 ? numThreads - 1 : 0);
+	for (unsigned int t = 1; t < numThreads; ++t)
+	{
+		const unsigned int begin = (m_numLines[0] * t) / numThreads;
+		const unsigned int end = (m_numLines[0] * (t + 1)) / numThreads - 1;
+		threads.emplace_back(worker, begin, end);
+	}
+	worker(0, m_numLines[0] / numThreads - 1);
+	for (auto& thread : threads)
+		thread.join();
+
+	return success;
 }
 
 Engine_Extension* Operator_Ext_UPML::CreateEngineExtention()

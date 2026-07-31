@@ -107,5 +107,5 @@ double Engine_Interface_AVX2_FDTD::CalcFastEnergy() const
 	float H_total;
 	_mm_store_ss(&H_total, h_sum);
 
-	return __EPS0__ * (double)E_total + __MUE0__ * (double)H_total;
+	return EPS0 * (double)E_total + MUE0 * (double)H_total;
 }

@@ -96,7 +96,7 @@ if (WITH_GPU)
 		tfsf_voltage tfsf_current
 		mur_pre_voltage mur_post_voltage mur_apply_voltage
 		rlc_pre_voltage rlc_apply_voltage
-		gather_probes reduce_energy
+		gather_probes reduce_energy validate_fields
 		steady_state_sample
 		local_absorbing_bc
 		fused_update_voltages fused_update_currents

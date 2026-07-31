@@ -57,7 +57,11 @@ void main()
             float V   = volt[g_idx];
 
             lor += v_Lor_ADE[ade_idx] * ade;
-            ade  = v_int_ADE[ade_idx] * ade + v_ext_ADE[ade_idx] * (V - lor);
+            // Keep the operation order of Engine_Ext_LorentzMaterial.  The
+            // conducting-sheet coefficients rely on this recurrence being
+            // evaluated as two sequential float updates.
+            ade  = v_int_ADE[ade_idx] * ade;
+            ade += v_ext_ADE[ade_idx] * (V - lor);
 
             volt_Lor_ADE[ade_idx] = lor;
             volt_ADE[ade_idx]     = ade;
@@ -74,7 +78,8 @@ void main()
             float ade = volt_ADE[ade_idx];
             float V   = volt[g_idx];
 
-            ade = v_int_ADE[ade_idx] * ade + v_ext_ADE[ade_idx] * V;
+            ade = v_int_ADE[ade_idx] * ade;
+            ade += v_ext_ADE[ade_idx] * V;
 
             volt_ADE[ade_idx] = ade;
         }

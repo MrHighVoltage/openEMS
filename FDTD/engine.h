@@ -19,6 +19,7 @@
 #define ENGINE_H
 
 #include <fstream>
+#include <iomanip>
 #include "operator.h"
 
 #include "tools/arraylib/array_nijk.h"
@@ -122,6 +123,10 @@ public:
 	//! Apply extension current changes
 	virtual void Apply2Current();
 
+	//! Optional diagnostic trace for one native Yee cell, enabled by
+	//! OPENEMS_CPU_TRACE_CELL=x,y,z.
+	void TraceFieldCell(const char* stage) const;
+
 	inline size_t GetExtensionCount() {return m_Eng_exts.size();}
 	inline Engine_Extension* GetExtension(size_t nr) {return m_Eng_exts.at(nr);}
 	virtual void SortExtensionByPriority();
@@ -139,6 +144,10 @@ protected:
 	ArrayLib::ArrayNIJK<FDTD_FLOAT>* volt_ptr;
 	ArrayLib::ArrayNIJK<FDTD_FLOAT>* curr_ptr;
 	unsigned int numTS;
+
+	bool m_traceFieldEnabled;
+	unsigned int m_traceFieldCell[3];
+	mutable std::ofstream m_traceFieldFile;
 
 	virtual void InitExtensions();
 	virtual void ClearExtensions();

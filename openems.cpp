@@ -22,6 +22,8 @@
 #include <thread>
 #include <cstdlib>
 #include <chrono>
+#include <cmath>
+#include <exception>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -589,9 +591,9 @@ bool openEMS::SetupProcessing()
 				{
 					ProcessModeMatch* pmm = new ProcessModeMatch(NewEngineInterface());
 					pmm->SetFieldType(pb->GetProbeType()-10);
-					pmm->SetModeFunction(0,pb->GetAttributeValue("ModeFunctionX"));
-					pmm->SetModeFunction(1,pb->GetAttributeValue("ModeFunctionY"));
-					pmm->SetModeFunction(2,pb->GetAttributeValue("ModeFunctionZ"));
+					pmm->SetWeightFunction(0,pb->GetAttributeValue("ModeFunctionX"));
+					pmm->SetWeightFunction(1,pb->GetAttributeValue("ModeFunctionY"));
+					pmm->SetWeightFunction(2,pb->GetAttributeValue("ModeFunctionZ"));
 					proc = pmm;
 				}
 				else
@@ -1507,6 +1509,47 @@ void openEMS::RunFDTD()
 	ProcessFields* ProcField = new ProcessFields(NewEngineInterface());
 	PA->AddProcessing(ProcField);
 	double maxE=0,currE=0;
+	double change=1;
+	bool numericalFailure = false;
+	std::string numericalFailureReason;
+
+	auto failNumerically = [&](const std::string& reason)
+	{
+		if (numericalFailure)
+			return;
+		numericalFailure = true;
+		numericalFailureReason = reason;
+		cerr << "RunFDTD: " << reason << ", cancelling simulation." << endl;
+	};
+
+	auto sampleEnergy = [&]() -> bool
+	{
+		currE = ProcField->CalcTotalEnergyEstimate();
+		if (!std::isfinite(currE) || currE < 0.0)
+		{
+			std::ostringstream reason;
+			reason << "invalid field energy at timestep "
+			       << FDTD_Eng->GetNumberOfTimesteps() << " (value=" << currE << ")";
+			failNumerically(reason.str());
+			return false;
+		}
+		if (currE>maxE)
+			maxE=currE;
+		return true;
+	};
+
+	auto validateChange = [&]() -> bool
+	{
+		if (!std::isfinite(change) || change < 0.0)
+		{
+			std::ostringstream reason;
+			reason << "invalid residual-energy ratio at timestep "
+			       << FDTD_Eng->GetNumberOfTimesteps() << " (value=" << change << ")";
+			failNumerically(reason.str());
+			return false;
+		}
+		return true;
+	};
 
 	//init processings
 	PA->InitAll();
@@ -1517,7 +1560,6 @@ void openEMS::RunFDTD()
 //		ProcField->AddStep(FDTD_Op->Exc->Volt_delay[n]+maxExcite);
 	ProcField->AddStep(maxExcite);
 
-	double change=1;
 	int prevTS=0,currTS=0;
 	double numCells = FDTD_Op->GetNumberCells();
 	double speed = 0;
@@ -1533,20 +1575,22 @@ void openEMS::RunFDTD()
 		InitRunStatistics(OPENEMS_RUN_STAT_FILE);
 	//*************** simulate ************//
 
-	PA->PreProcess();
-
 #ifdef WITH_GPU
-	// --- GPU pipelined processing path ---
 	Engine_Vulkan* gpuEng = dynamic_cast<Engine_Vulkan*>(FDTD_Eng);
-	if (gpuEng)
-	{
-		// Enable probe access recording during initial PA->Process()
-		gpuEng->StartProbeRecording();
-	}
 #endif
 
-	int step=PA->Process();
-	if ((step<0) || (step>(int)NrTS)) step=NrTS;
+	try
+	{
+		PA->PreProcess();
+
+#ifdef WITH_GPU
+		// Enable probe access recording during initial PA->Process().
+		if (gpuEng)
+			gpuEng->StartProbeRecording();
+#endif
+
+		int step=PA->Process();
+		if ((step<0) || (step>(int)NrTS)) step=NrTS;
 
 #ifdef WITH_GPU
 	if (gpuEng)
@@ -1646,9 +1690,8 @@ void openEMS::RunFDTD()
 			if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
 			{
 				// Energy computation needs full field access — disable pipelined reading
-				currE = ProcField->CalcTotalEnergyEstimate();
-				if (currE>maxE)
-					maxE=currE;
+				if (!sampleEnergy())
+					break;
 			}
 
 			currTS = FDTD_Eng->GetNumberOfTimesteps();
@@ -1666,16 +1709,19 @@ void openEMS::RunFDTD()
 				cout << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
 				if (Eng_Ext_SSD==NULL)
 				{
-					currE = ProcField->CalcTotalEnergyEstimate();
-					if (currE>maxE)
-						maxE=currE;
+					if (!sampleEnergy())
+						break;
 					if (maxE)
 						change = currE/maxE;
+					if (!validateChange())
+						break;
 					cout << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
 				}
 				else
 				{
 					change = Eng_Ext_SSD->GetLastDiff();
+					if (!validateChange())
+						break;
 					cout << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
 				}
 				prevTime=currTime;
@@ -1689,25 +1735,27 @@ void openEMS::RunFDTD()
 			}
 		}
 
-		// Final process for the last snapshot
-		gpuEng->EnablePipelinedReading(true);
-		PA->Process();
-		gpuEng->EnablePipelinedReading(false);
+		// Final process for the last snapshot, unless numerical validation stopped the run.
+		if (!numericalFailure)
+		{
+			gpuEng->EnablePipelinedReading(true);
+			PA->Process();
+			gpuEng->EnablePipelinedReading(false);
+		}
 	}
 	else
 #endif
 	{
 	// ====== Standard (non-pipelined) main loop ======
-	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
+	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !numericalFailure && !CheckAbortCond())
 	{
 		FDTD_Eng->IterateTS(step);
 		step=PA->Process();
 
 		if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
 		{
-			currE = ProcField->CalcTotalEnergyEstimate();
-			if (currE>maxE)
-				maxE=currE;
+			if (!sampleEnergy())
+				break;
 		}
 
 //		cout << " do " << step << " steps; current: " << eng.GetNumberOfTimesteps() << endl;
@@ -1726,16 +1774,19 @@ void openEMS::RunFDTD()
 			cout << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
 			if (Eng_Ext_SSD==NULL)
 			{
-				currE = ProcField->CalcTotalEnergyEstimate();
-				if (currE>maxE)
-					maxE=currE;
+				if (!sampleEnergy())
+					break;
 				if (maxE)
 					change = currE/maxE;
+				if (!validateChange())
+					break;
 				cout << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
 			}
 			else
 			{
 				change = Eng_Ext_SSD->GetLastDiff();
+				if (!validateChange())
+					break;
 				cout << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
 			}
 			prevTime=currTime;
@@ -1749,9 +1800,67 @@ void openEMS::RunFDTD()
 		}
 	}
 	} // end standard main loop
+	} // end simulation try block
+	catch (const std::exception& e)
+	{
+		failNumerically(std::string("FDTD engine exception: ") + e.what());
+	}
+	catch (...)
+	{
+		failNumerically("unknown FDTD engine exception");
+	}
+
+	if (numericalFailure)
+	{
+		ofstream marker("openEMS_numerical_failure.txt", ios::out | ios::trunc);
+		if (marker)
+			marker << numericalFailureReason << endl;
+		else
+			cerr << "RunFDTD: Warning: unable to write openEMS_numerical_failure.txt" << endl;
+
+#ifdef WITH_GPU
+		// A validation exception can leave asynchronous work outstanding.  Drain
+		// best-effort before returning, but never mask the original failure.
+		if (gpuEng)
+		{
+			try
+			{
+				gpuEng->DrainGPU();
+			}
+			catch (...)
+			{
+			}
+		}
+#endif
+
+		gettimeofday(&currTime,NULL);
+		t_diff = CalcDiffTime(currTime,startTime);
+		cout << "Time for " << FDTD_Eng->GetNumberOfTimesteps()
+		     << " iterations with " << FDTD_Op->GetNumberCells()
+		     << " cells : " << t_diff << " sec (cancelled)" << endl;
+
+		Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+		return;
+	}
+
+	if (change <= endCrit)
+	{
+		if (Eng_Ext_SSD == NULL)
+			cout << "RunFDTD: residual field energy reached -"
+			     << fabs(10.0*log10(endCrit)) << " dB; stopping simulation." << endl;
+		else
+			cout << "RunFDTD: steady-state criterion reached; stopping simulation." << endl;
+	}
+
 	if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
 		cerr << "RunFDTD: Warning: Max. number of timesteps was reached before the end-criteria of -" << fabs(10.0*log10(endCrit)) << "dB was reached... " << endl << \
 				"\tYou may want to choose a higher number of max. timesteps... " << endl;
+
+#ifdef WITH_GPU
+	// Include outstanding asynchronous GPU work in runtime and speed reports.
+	if (gpuEng)
+		gpuEng->DrainGPU();
+#endif
 
 	gettimeofday(&currTime,NULL);
 	t_diff = CalcDiffTime(currTime,startTime);

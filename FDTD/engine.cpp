@@ -19,6 +19,9 @@
 #include "extensions/engine_extension.h"
 #include "extensions/operator_extension.h"
 
+#include <cstdlib>
+#include <cstdio>
+
 using std::cout;
 using std::endl;
 
@@ -41,11 +44,54 @@ Engine::Engine(const Operator* op)
 		numLines[n] = Op->GetNumberOfLines(n, true);
 	volt_ptr = NULL;
 	curr_ptr = NULL;
+	m_traceFieldEnabled = false;
+	m_traceFieldCell[0] = m_traceFieldCell[1] = m_traceFieldCell[2] = 0;
+	if (const char* env = std::getenv("OPENEMS_CPU_TRACE_CELL"))
+	{
+		unsigned int x = 0, y = 0, z = 0;
+		if (std::sscanf(env, "%u,%u,%u", &x, &y, &z) == 3 &&
+		    x < numLines[0] && y < numLines[1] && z < numLines[2])
+		{
+			m_traceFieldEnabled = true;
+			m_traceFieldCell[0] = x;
+			m_traceFieldCell[1] = y;
+			m_traceFieldCell[2] = z;
+			const char* filename = std::getenv("OPENEMS_CPU_TRACE_FILE");
+			m_traceFieldFile.open(filename ? filename : "openems_cpu_field_trace.txt");
+			if (!m_traceFieldFile)
+			{
+				m_traceFieldEnabled = false;
+				std::cerr << "Engine: unable to open CPU field trace file" << std::endl;
+			}
+		}
+	}
 }
 
 Engine::~Engine()
 {
 	this->Reset();
+}
+
+void Engine::TraceFieldCell(const char* stage) const
+{
+	if (!m_traceFieldEnabled || !m_traceFieldFile)
+		return;
+
+	const unsigned int x = m_traceFieldCell[0];
+	const unsigned int y = m_traceFieldCell[1];
+	const unsigned int z = m_traceFieldCell[2];
+	m_traceFieldFile << std::setprecision(17)
+	                 << "TRACE_FIELD timestep=" << numTS
+	                 << " stage=" << stage
+	                 << " cell=" << x << "," << y << "," << z
+	                 << " v0=" << GetVolt(0, x, y, z)
+	                 << " v1=" << GetVolt(1, x, y, z)
+	                 << " v2=" << GetVolt(2, x, y, z)
+	                 << " c0=" << GetCurr(0, x, y, z)
+	                 << " c1=" << GetCurr(1, x, y, z)
+	                 << " c2=" << GetCurr(2, x, y, z)
+	                 << '\n';
+	m_traceFieldFile.flush();
 }
 
 void Engine::Init()

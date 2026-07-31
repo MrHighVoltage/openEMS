@@ -18,6 +18,8 @@
 #include <fstream>
 #include <algorithm>
 #include <stdexcept>
+#include <chrono>
+#include <cstdlib>
 #include "operator.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
@@ -988,11 +990,26 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
+	const bool profile = std::getenv("OPENEMS_OPERATOR_PROFILE") != nullptr;
+	auto phaseStart = std::chrono::steady_clock::now();
+	auto reportPhase = [&](const char* name)
+	{
+		if (!profile)
+			return;
+		const auto now = std::chrono::steady_clock::now();
+		const double elapsedMs = std::chrono::duration<double, std::milli>(now - phaseStart).count();
+		cout << "Operator profile: " << name << " = " << elapsedMs << " ms" << endl;
+		phaseStart = now;
+	};
+
 	Init_EC();
+	reportPhase("Init_EC");
 	InitDataStorage();
+	reportPhase("InitDataStorage");
 
 	if (Calc_EC()==0)
 		return -1;
+	reportPhase("Calc_EC");
 
 	m_InvaildTimestep = false;
 	opt_dT = 0;
@@ -1011,6 +1028,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	}
 	else
 		CalcTimestep();
+	reportPhase("CalcTimestep");
 
 	dT*=m_TimeStepFactor;
 
@@ -1025,7 +1043,9 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	m_Exc->Reset(dT);
 
 	InitOperator();
+	reportPhase("InitOperator");
 	Calc_ECOperator_Range(0, numLines[0]-1);
+	reportPhase("Calc_ECOperator_Range");
 
 	//Apply PEC to all boundary's
 	bool PEC[6]={1,1,1,1,1,1};
@@ -1034,19 +1054,30 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		if (m_BC[n]==-1)
 			PEC[n] = false;
 	ApplyElectricBC(PEC);
+	reportPhase("ApplyElectricBC");
 
 	CalcPEC();
+	reportPhase("CalcPEC");
 
 	Calc_LumpedElements();
+	reportPhase("Calc_LumpedElements");
 
 	bool PMC[6];
 	for (int n=0; n<6; ++n)
 		PMC[n] = m_BC[n]==1;
 	ApplyMagneticBC(PMC);
+	reportPhase("ApplyMagneticBC");
 
 	//all information available for extension... create now...
 	for (size_t n=0; n<m_Op_exts.size(); ++n)
+	{
 		m_Op_exts.at(n)->BuildExtension();
+		if (profile)
+		{
+			std::string name = "BuildExtension[" + std::to_string(n) + "]";
+			reportPhase(name.c_str());
+		}
+	}
 
 	//remove inactive extensions
 	std::vector<Operator_Extension*>::iterator it = m_Op_exts.begin();
@@ -1067,6 +1098,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		DumpOperator2File( "operator_dump" );
 	if (debugFlags & debugPEC)
 		DumpPEC2File( "PEC_dump" );
+	reportPhase("DebugDumps");
 
 	//cleanup
 	for (int n=0; n<3; ++n)
