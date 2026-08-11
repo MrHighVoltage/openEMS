@@ -12,6 +12,7 @@ jobs:
   Lint:
     runs-on: ubuntu-latest
     name: "Lint"
+    timeout-minutes: 10
 
     steps:
       - name: Checkout openEMS.git
@@ -28,6 +29,7 @@ jobs:
   Dependencies:
     runs-on: ubuntu-latest
     name: "Resolve repo dependencies"
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repo
@@ -100,6 +102,8 @@ jobs:
   Linux:
     runs-on: ubuntu-latest
     needs: Dependencies
+    # Typical run is 6-9 min; the limit only catches builds/simulations that hang.
+    timeout-minutes: 45
 
     defaults:
       run:
@@ -380,11 +384,13 @@ jobs:
           ip netns exec no-network pip3 install . "${pip_opts[@]}"
 
       - name: Smoketest Octave execution
+        timeout-minutes: 15
         run: |
           cd $GITHUB_WORKSPACE/openEMS/.github/smoketests/octave
           octave MSL_NotchFilter.m
 
       - name: Smoketest Python execution
+        timeout-minutes: 15
         run: |
           cd $GITHUB_WORKSPACE/openEMS/.github/smoketests/python
           python3 -c "import CSXCAD; print(CSXCAD.__version__)"
@@ -392,6 +398,7 @@ jobs:
           python3 MSL_NotchFilter.py
 
       - name: Run Python unit tests
+        timeout-minutes: 30
         run: |
           python3 -m unittest discover -s $GITHUB_WORKSPACE/openEMS/python/Tests -p "test_*.py" -v
 
@@ -429,6 +436,7 @@ jobs:
           pip3 install . --verbose
 
       - name: Smoketest Python execution in venv
+        timeout-minutes: 15
         run: |
           source ~/venv/bin/activate
           cd $GITHUB_WORKSPACE/openEMS/.github/smoketests/python
@@ -437,6 +445,7 @@ jobs:
           python3 MSL_NotchFilter.py
 
       - name: Run Python unit tests in venv
+        timeout-minutes: 30
         run: |
           source ~/venv/bin/activate
           python3 -m unittest discover -s $GITHUB_WORKSPACE/openEMS/python/Tests -p "test_*.py" -v
@@ -446,6 +455,8 @@ jobs:
 
     runs-on: macos-latest
     needs: Dependencies
+    # Typical run is ~6 min; the limit only catches builds/simulations that hang.
+    timeout-minutes: 45
 
     steps:
       - name: Show checkout sources
@@ -602,11 +613,13 @@ jobs:
           pip3 install . --user --break-system-packages --no-build-isolation --verbose
 
       - name: Smoketest Octave execution
+        timeout-minutes: 15
         run: |
           cd $GITHUB_WORKSPACE/openEMS/.github/smoketests/octave
           octave MSL_NotchFilter.m
 
       - name: Smoketest Python execution
+        timeout-minutes: 15
         run: |
           cd $GITHUB_WORKSPACE/openEMS/.github/smoketests/python
           python3 -c "import CSXCAD; print(CSXCAD.__version__)"
@@ -614,6 +627,7 @@ jobs:
           python3 MSL_NotchFilter.py
 
       - name: Run Python unit tests
+        timeout-minutes: 30
         run: |
           python3 -m unittest discover -s $GITHUB_WORKSPACE/openEMS/python/Tests -p "test_*.py" -v
 
@@ -643,6 +657,7 @@ jobs:
           pip3 install . --verbose
 
       - name: Smoketest Python execution in venv
+        timeout-minutes: 15
         run: |
           source ~/venv/bin/activate
           cd $GITHUB_WORKSPACE/openEMS/.github/smoketests/python
@@ -651,6 +666,7 @@ jobs:
           python3 MSL_NotchFilter.py
 
       - name: Run Python unit tests in venv
+        timeout-minutes: 30
         run: |
           source ~/venv/bin/activate
           python3 -m unittest discover -s $GITHUB_WORKSPACE/openEMS/python/Tests -p "test_*.py" -v
@@ -658,6 +674,8 @@ jobs:
   FreeBSD:
     runs-on: ubuntu-latest
     needs: Dependencies
+    # Runs in an emulated VM, so it is slower: typical run is ~16 min.
+    timeout-minutes: 60
 
     strategy:
       matrix:
@@ -828,6 +846,8 @@ jobs:
   Windows:
     runs-on: windows-latest
     needs: Dependencies
+    # Building the vcpkg dependency tree from a cold cache alone takes ~60 min.
+    timeout-minutes: 120
 
     strategy:
       # Use "false" means a single failed build won't terminate other combinations
