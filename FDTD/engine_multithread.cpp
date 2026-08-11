@@ -309,7 +309,13 @@ void thread::operator()()
 	// speed up the calculation of denormal floating point values (flush-to-zero)
 	Denormal::Disable();
 
-	while (!m_enginePtr->m_stopThreads)
+	// Note: the loop must be unconditional. Testing m_stopThreads here would let
+	// a worker leave without ever arriving at m_startBarrier, while the shutdown
+	// path in Reset()/changeNumThreads() blocks on that same barrier expecting
+	// m_numThreads+1 arrivals -> deadlock. Shutdown is signalled solely by the
+	// check *after* the barrier, which is also the point where m_stopThreads is
+	// safely visible (the barrier's mutex provides the happens-before edge).
+	for (;;)
 	{
 		// wait for start
 		//DBG().cout() << "Thread " << m_threadID << " (" << std::this_thread::get_id() << ") waiting..." << endl;
