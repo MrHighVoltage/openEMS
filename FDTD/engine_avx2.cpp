@@ -146,6 +146,27 @@ void Engine_AVX2::Reset()
 //   into local __m256 once per z-vector and reused explicitly. Single-
 //   threaded throughput: ~7-8% (benchmarked, does not show up in the
 //   memory-bandwidth-bound multithreaded engine).
+//
+// Multithreaded engine is at its memory-bandwidth roofline, not compute-
+// bound: on a 4-core/8-thread Skylake host, `perf stat -e
+// uncore_imc/data_reads/,data_writes/` measured ~27-38 GB/s of real DRAM
+// traffic during a 4-thread run (its optimal thread count -- see
+// Engine_AVX2_Multithread's runtime thread-count auto-tune), against a
+// ~29 GB/s ceiling from a STREAM-Triad-style probe with the same ~2:1
+// read:write mix on the same host. Two consequences already validated here,
+// don't redo them without new evidence:
+//   - Using all logical (hyperthreaded) cores hurts, not helps: 8 threads
+//     ran ~6% *slower* than 4 on this host. SMT siblings add no memory
+//     bandwidth, only L1/L2 and load/store-port contention. The runtime
+//     auto-tune already discovers this on its own when numThreads=0.
+//   - _mm256_stream_ps() for the volt/curr writes (skipping the normal
+//     store's write-allocate fetch) was tried and made things *worse*
+//     (~15% slower single-threaded, several % slower multithreaded): the
+//     3-f8vector-wide polarisation stride (96 bytes) doesn't align to
+//     64-byte cache lines, so the non-temporal write-combining buffers
+//     can't reliably gather full lines and get flushed early -- worse than
+//     the write-allocate they were meant to avoid. Revisit only if the
+//     field layout is changed to a cache-line-aligned stride.
 // ============================================================================
 
 void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
