@@ -33,6 +33,9 @@ python/dist
 !python/doc
 python/doc/_build
 python/doc/Tutorials/__*
+python/Tests/output/
+python/Tests/*.png
+python/Tests/profile.txt
 
 # AI assistant configuration files (each contributor may maintain their own)
 CLAUDE.md
