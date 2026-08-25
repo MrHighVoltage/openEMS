@@ -27,6 +27,12 @@
 using std::cerr;
 using std::endl;
 
+std::recursive_mutex& HDF5_GlobalMutex()
+{
+	static std::recursive_mutex mtx;
+	return mtx;
+}
+
 HDF5_File_Reader::HDF5_File_Reader(std::string filename)
 {
 	m_filename = filename;
@@ -327,6 +333,8 @@ bool HDF5_File_Reader::ReadDataSet(std::string ds_name, hsize_t &nDim, hsize_t* 
 template <typename T>
 hid_t HDF5_File_Reader::GetH5Type()
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	if (typeid(T) == typeid(float))
 		return H5T_NATIVE_FLOAT;
 	else if (typeid(T) == typeid(double))
@@ -380,6 +388,8 @@ template hid_t HDF5_File_Reader::GetH5Type<std::complex<double>>();
 template <typename T>
 bool HDF5_File_Reader::CheckH5Type(hid_t type)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	// cerr << "CheckH5Type Comp?: " << (H5Tget_class(type)==H5T_COMPOUND) << " size? " << H5Tget_size(type) << endl;
 	if (H5Tequal(type, H5T_NATIVE_FLOAT) && (typeid(T) == typeid(float)))
 		return true;

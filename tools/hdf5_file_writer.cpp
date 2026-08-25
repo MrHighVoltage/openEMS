@@ -20,6 +20,7 @@ using namespace std;
 #include "hdf5_file_writer.h"
 #include <hdf5.h>
 
+#include <mutex>
 #include <sstream>
 #include <iostream>
 #include <iomanip>
@@ -27,6 +28,8 @@ using namespace std;
 
 HDF5_File_Writer::HDF5_File_Writer(string filename)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	m_filename = filename;
 	m_Group = "/";
 	m_h5file = -1;
@@ -45,6 +48,8 @@ HDF5_File_Writer::~HDF5_File_Writer()
 
 bool HDF5_File_Writer::OpenFile()
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	if (m_h5file >= 0)
 		return true;
 	m_h5file = H5Fopen(m_filename.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
@@ -58,6 +63,8 @@ bool HDF5_File_Writer::OpenFile()
 
 void HDF5_File_Writer::CloseFile()
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	if (m_h5file >= 0)
 	{
 		H5Fclose(m_h5file);
@@ -67,6 +74,8 @@ void HDF5_File_Writer::CloseFile()
 
 void HDF5_File_Writer::FlushFile()
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	if (m_h5file >= 0)
 		H5Fflush(m_h5file, H5F_SCOPE_LOCAL);
 }
@@ -147,6 +156,8 @@ hid_t HDF5_File_Writer::OpenGroup(hid_t hdf5_file, string group)
 
 void HDF5_File_Writer::SetCurrentGroup(std::string group, bool createGrp)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	m_Group = group;
 	if (createGrp==false)
 		return;
@@ -183,6 +194,8 @@ bool HDF5_File_Writer::WriteRectMesh(unsigned int const* numLines, float const* 
 
 bool HDF5_File_Writer::WriteRectMesh(unsigned int const* numLines, double const* const* discLines, int MeshType, double scaling, std::string s_mesh_grp)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	hid_t hdf5_file = AcquireFile();
 	if (hdf5_file<0)
 	{
@@ -253,6 +266,8 @@ bool HDF5_File_Writer::WriteRectMesh(unsigned int const* numLines, double const*
 template <typename T>
 bool HDF5_File_Writer::WriteScalarField(std::string dataSetName, ArrayLib::ArrayIJK<T> &data, bool legacy_fmt)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	hid_t type = HDF5_File_Reader::GetH5Type<T>();
 	size_t size = data.size();
 
@@ -306,6 +321,8 @@ template bool HDF5_File_Writer::WriteScalarField<std::complex<float>>(std::strin
 template <typename T>
 bool HDF5_File_Writer::WriteVectorField(std::string dataSetName, ArrayLib::ArrayNIJK<T> &data, bool legacy_fmt)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	size_t size = data.size();
 	hid_t type = HDF5_File_Reader::GetH5Type<T>();
 
@@ -382,6 +399,8 @@ bool HDF5_File_Writer::WriteData(std::string dataSetName, std::complex<double> c
 
 bool HDF5_File_Writer::WriteData(std::string dataSetName,  hid_t mem_type, void const* field_buf, size_t dim, size_t* datasize, std::string d_order)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	hid_t hdf5_file = AcquireFile();
 	if (hdf5_file<0)
 	{
@@ -438,6 +457,8 @@ bool HDF5_File_Writer::WriteData(hid_t group, std::string dataSetName, hid_t mem
 
 bool HDF5_File_Writer::WriteAttribute(std::string locName, std::string attr_name, void const* value, hsize_t size, hid_t mem_type)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	hid_t hdf5_file = AcquireFile();
 	if (hdf5_file<0)
 	{
@@ -571,6 +592,8 @@ bool HDF5_File_Writer::WriteAttribute(std::string locName, std::string attr_name
 
 bool HDF5_File_Writer::WriteAttribute(std::string locName, std::string attr_name, std::string value)
 {
+	std::lock_guard<std::recursive_mutex> lock(HDF5_GlobalMutex());
+
 	hid_t tid = H5Tcopy(H5T_C_S1);
     H5Tset_size(tid, H5T_VARIABLE);
     H5Tset_cset(tid, H5T_CSET_UTF8);

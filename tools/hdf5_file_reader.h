@@ -21,11 +21,19 @@
 #include <string>
 #include <vector>
 #include <complex>
+#include <mutex>
 #include <hdf5.h>
 #include "arraylib/array_nijk.h"
 #include "arraylib/array_ijk.h"
 
 #define _USE_MATH_DEFINES
+
+//! The HDF5 C library is not thread-safe unless built with --enable-threadsafe
+//! (the common case for distro packages is not). All calls into the HDF5 API,
+//! across every HDF5_File_Writer/HDF5_File_Reader instance and file, must be
+//! serialized through this single process-wide mutex. Recursive so that a
+//! locked entry point may call other locked helpers without deadlocking.
+std::recursive_mutex& HDF5_GlobalMutex();
 
 class HDF5_File_Reader
 {
