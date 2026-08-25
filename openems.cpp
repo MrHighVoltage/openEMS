@@ -127,8 +127,7 @@ void openEMS::Reset()
 	m_CSX=0;
 	delete m_Exc;
 	m_Exc=0;
-	// The engine owns its extension instances.
-	Eng_Ext_SSD=0;
+Eng_Ext_SSD=0; // non-owning observer; deleted by the engine (m_Eng_exts) in 'delete FDTD_Eng' above
 
 	CylinderCoords = false;
 	m_CC_MultiGrid.clear();
@@ -1203,6 +1202,9 @@ void openEMS::SetCSX(ContinuousStructure* csx)
 {
 	delete m_CSX;
 	m_CSX = csx;
+	// we destroy it, so tell language bindings not to do it as well
+	if (m_CSX)
+		m_CSX->SetOwnedExternally(true);
 }
 
 ContinuousStructure* openEMS::GetCSX() const
