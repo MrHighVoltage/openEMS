@@ -22,6 +22,7 @@
 #include "processfields.h"
 #include "processfields_calc.h"
 #include "FDTD/engine_interface_fdtd.h"
+#include "FDTD/engine_avx2.h"
 #ifdef WITH_GPU
 #include "FDTD/engine_vulkan.h"
 #endif
@@ -317,6 +318,20 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 		case Engine::SSE:
 			ok = FieldCalc::CalcFieldForEngine<Engine_sse>(
 				static_cast<const Engine_sse*>(eng), op, mat, m_DumpType,
+				m_Eng_Interface->GetInterpolationType(), numLines, posLines, field, nThreads);
+			break;
+		case Engine::AVX2:
+			// Covers both Engine_AVX2 and Engine_AVX2_Multithread -- they share
+			// this EngineType tag and Engine_AVX2_Multithread adds no new field
+			// accessors, so the base Engine_AVX2 scalar GetVolt()/GetCurr() cover
+			// both. Without this case, AVX2 fell through to the generic
+			// per-cell virtual-dispatch loop below: single-threaded, and each
+			// scalar access pays a runtime %/ against numVectors. Measured ~32%
+			// slower overall than no-dump on a full-domain every-timestep E-field
+			// dump (vs. ~12% for SSE with this fast path), because AVX2 was the
+			// only multithreaded engine still hitting that fallback.
+			ok = FieldCalc::CalcFieldForEngine<Engine_AVX2>(
+				static_cast<const Engine_AVX2*>(eng), op, mat, m_DumpType,
 				m_Eng_Interface->GetInterpolationType(), numLines, posLines, field, nThreads);
 			break;
 #ifdef WITH_GPU
