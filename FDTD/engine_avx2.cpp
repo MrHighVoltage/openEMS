@@ -138,6 +138,14 @@ void Engine_AVX2::Reset()
 // Boundary handling:
 //   Branchless: i_shift_x = (x>0)*vs_x, i_shift_y = (y>0)*vs_y
 //   At x=0 or y=0, the shift is 0, making "(here) - (here-shift)" = 0.
+//
+// Load reuse:
+//   Each of curr[base], curr[base+1], curr[base+2] ("H at here") feeds two of
+//   the three polarisation curls. GCC does not CSE these across the three
+//   per-polarisation blocks (confirmed via disassembly), so they are loaded
+//   into local __m256 once per z-vector and reused explicitly. Single-
+//   threaded throughput: ~7-8% (benchmarked, does not show up in the
+//   memory-bandwidth-bound multithreaded engine).
 // ============================================================================
 
 void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
@@ -167,6 +175,13 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 				const unsigned int index = Op->m_Op_index(pos[0], pos[1], pos[2]);
 				const int base = (int)(pos[0] * m_vs_x + pos[1] * m_vs_y + pos[2] * m_vs_z);
 
+				// H-field values at "here" are each used by two of the three
+				// curl computations below -- load once and reuse instead of
+				// re-reading the same address from memory twice.
+				const __m256 curr_here_x = _mm256_load_ps(curr[base].f);
+				const __m256 curr_here_y = _mm256_load_ps(curr[base + 1].f);
+				const __m256 curr_here_z = _mm256_load_ps(curr[base + 2].f);
+
 				// X-polarisation: V_x = vv_x * V_x + vi_x * (dHz/dy - dHy/dz)
 				{
 					__m256 v  = _mm256_load_ps(volt[base].f);
@@ -174,11 +189,10 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[0][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(curr[base + 2].f),
+						curr_here_z,
 						_mm256_load_ps(curr[base + 2 - i_shift_y].f)
 					);
-					curl = _mm256_sub_ps(curl,
-						_mm256_load_ps(curr[base + 1].f));
+					curl = _mm256_sub_ps(curl, curr_here_y);
 					curl = _mm256_add_ps(curl,
 						_mm256_load_ps(curr[base + 1 - vs_z].f));
 
@@ -193,11 +207,10 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[1][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(curr[base].f),
+						curr_here_x,
 						_mm256_load_ps(curr[base - vs_z].f)
 					);
-					curl = _mm256_sub_ps(curl,
-						_mm256_load_ps(curr[base + 2].f));
+					curl = _mm256_sub_ps(curl, curr_here_z);
 					curl = _mm256_add_ps(curl,
 						_mm256_load_ps(curr[base + 2 - i_shift_x].f));
 
@@ -212,11 +225,10 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[2][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(curr[base + 1].f),
+						curr_here_y,
 						_mm256_load_ps(curr[base + 1 - i_shift_x].f)
 					);
-					curl = _mm256_sub_ps(curl,
-						_mm256_load_ps(curr[base].f));
+					curl = _mm256_sub_ps(curl, curr_here_x);
 					curl = _mm256_add_ps(curl,
 						_mm256_load_ps(curr[base - i_shift_y].f));
 
@@ -239,6 +251,10 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 					_mm256_load_ps(curr[end].f)
 				);
 
+				const __m256 curr_here_x = _mm256_load_ps(curr[base].f);
+				const __m256 curr_here_y = _mm256_load_ps(curr[base + 1].f);
+				const __m256 curr_here_z = _mm256_load_ps(curr[base + 2].f);
+
 				// X-polarisation
 				{
 					__m256 v  = _mm256_load_ps(volt[base].f);
@@ -246,10 +262,10 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[0][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(curr[base + 2].f),
+						curr_here_z,
 						_mm256_load_ps(curr[base + 2 - i_shift_y].f)
 					);
-					curl = _mm256_sub_ps(curl, _mm256_load_ps(curr[base + 1].f));
+					curl = _mm256_sub_ps(curl, curr_here_y);
 					curl = _mm256_add_ps(curl, curr_Hy_zm1);
 
 					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
@@ -263,10 +279,10 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[1][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(curr[base].f),
+						curr_here_x,
 						curr_Hx_zm1
 					);
-					curl = _mm256_sub_ps(curl, _mm256_load_ps(curr[base + 2].f));
+					curl = _mm256_sub_ps(curl, curr_here_z);
 					curl = _mm256_add_ps(curl, _mm256_load_ps(curr[base + 2 - i_shift_x].f));
 
 					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
@@ -280,10 +296,10 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 					__m256 vi = _mm256_load_ps(Op->f8_vi_Comp[2][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(curr[base + 1].f),
+						curr_here_y,
 						_mm256_load_ps(curr[base + 1 - i_shift_x].f)
 					);
-					curl = _mm256_sub_ps(curl, _mm256_load_ps(curr[base].f));
+					curl = _mm256_sub_ps(curl, curr_here_x);
 					curl = _mm256_add_ps(curl, _mm256_load_ps(curr[base - i_shift_y].f));
 
 					v = _mm256_fmadd_ps(vv, v, _mm256_mul_ps(vi, curl));
@@ -326,6 +342,12 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 				const unsigned int index = Op->m_Op_index(pos[0], pos[1], pos[2]);
 				const int base = (int)(pos[0] * m_vs_x + pos[1] * m_vs_y + pos[2] * m_vs_z);
 
+				// E-field values at "here" are each used by two of the three
+				// curl computations below -- load once and reuse.
+				const __m256 volt_here_x = _mm256_load_ps(volt[base].f);
+				const __m256 volt_here_y = _mm256_load_ps(volt[base + 1].f);
+				const __m256 volt_here_z = _mm256_load_ps(volt[base + 2].f);
+
 				// X-polarisation: I_x = ii_x * I_x + iv_x * (dEz/dy - dEy/dz)
 				{
 					__m256 c  = _mm256_load_ps(curr[base].f);
@@ -333,11 +355,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[0][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(volt[base + 2].f),
+						volt_here_z,
 						_mm256_load_ps(volt[base + 2 + vs_y].f)
 					);
-					curl = _mm256_sub_ps(curl,
-						_mm256_load_ps(volt[base + 1].f));
+					curl = _mm256_sub_ps(curl, volt_here_y);
 					curl = _mm256_add_ps(curl,
 						_mm256_load_ps(volt[base + 1 + vs_z].f));
 
@@ -352,11 +373,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[1][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(volt[base].f),
+						volt_here_x,
 						_mm256_load_ps(volt[base + vs_z].f)
 					);
-					curl = _mm256_sub_ps(curl,
-						_mm256_load_ps(volt[base + 2].f));
+					curl = _mm256_sub_ps(curl, volt_here_z);
 					curl = _mm256_add_ps(curl,
 						_mm256_load_ps(volt[base + 2 + vs_x].f));
 
@@ -371,11 +391,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[2][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(volt[base + 1].f),
+						volt_here_y,
 						_mm256_load_ps(volt[base + 1 + vs_x].f)
 					);
-					curl = _mm256_sub_ps(curl,
-						_mm256_load_ps(volt[base].f));
+					curl = _mm256_sub_ps(curl, volt_here_x);
 					curl = _mm256_add_ps(curl,
 						_mm256_load_ps(volt[base + vs_y].f));
 
@@ -399,6 +418,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 					_mm256_load_ps(volt[base_z0].f)
 				);
 
+				const __m256 volt_here_x = _mm256_load_ps(volt[base].f);
+				const __m256 volt_here_y = _mm256_load_ps(volt[base + 1].f);
+				const __m256 volt_here_z = _mm256_load_ps(volt[base + 2].f);
+
 				// X-polarisation
 				{
 					__m256 c  = _mm256_load_ps(curr[base].f);
@@ -406,10 +429,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[0][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(volt[base + 2].f),
+						volt_here_z,
 						_mm256_load_ps(volt[base + 2 + vs_y].f)
 					);
-					curl = _mm256_sub_ps(curl, _mm256_load_ps(volt[base + 1].f));
+					curl = _mm256_sub_ps(curl, volt_here_y);
 					curl = _mm256_add_ps(curl, volt_Ey_zp1);
 
 					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
@@ -423,10 +446,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[1][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(volt[base].f),
+						volt_here_x,
 						volt_Ex_zp1
 					);
-					curl = _mm256_sub_ps(curl, _mm256_load_ps(volt[base + 2].f));
+					curl = _mm256_sub_ps(curl, volt_here_z);
 					curl = _mm256_add_ps(curl, _mm256_load_ps(volt[base + 2 + vs_x].f));
 
 					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
@@ -440,10 +463,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 					__m256 iv = _mm256_load_ps(Op->f8_iv_Comp[2][index].f);
 
 					__m256 curl = _mm256_sub_ps(
-						_mm256_load_ps(volt[base + 1].f),
+						volt_here_y,
 						_mm256_load_ps(volt[base + 1 + vs_x].f)
 					);
-					curl = _mm256_sub_ps(curl, _mm256_load_ps(volt[base].f));
+					curl = _mm256_sub_ps(curl, volt_here_x);
 					curl = _mm256_add_ps(curl, _mm256_load_ps(volt[base + vs_y].f));
 
 					c = _mm256_fmadd_ps(ii, c, _mm256_mul_ps(iv, curl));
