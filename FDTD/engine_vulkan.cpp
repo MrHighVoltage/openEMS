@@ -412,16 +412,6 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 
 Engine_Vulkan::~Engine_Vulkan()
 {
-	// Shut down async processing thread first
-	if (m_asyncThread.joinable())
-	{
-		{
-			std::lock_guard<std::mutex> lk(m_asyncMutex);
-			m_asyncShutdown = true;
-			m_asyncCond.notify_one();
-		}
-		m_asyncThread.join();
-	}
 	DrainGPU();
 	Reset();
 }
@@ -726,6 +716,48 @@ void Engine_Vulkan::InitVulkan()
 	m_transferQueueFamily = m_computeQueueFamily;
 	m_hasDedicatedTransferQueue = false;
 
+	bool dumpAsyncDisabled = false;
+	if (const char* env = std::getenv("OPENEMS_GPU_DISABLE_DUMP_ASYNC"))
+	{
+		char* endPtr = nullptr;
+		long v = std::strtol(env, &endPtr, 10);
+		dumpAsyncDisabled = (endPtr && *endPtr == '\0' && v != 0);
+	}
+
+	// A second, genuinely independent queue for the large field-dump download
+	// pipeline (see SetupDumpTransferQueue()). Unlike the probe/transfer queue
+	// above, dump downloads move hundreds of MB, so a real concurrent hardware
+	// queue is worth the extra device-queue setup. Prefer a family that has
+	// COMPUTE+TRANSFER but not GRAPHICS (an async-compute/DMA-capable family
+	// on most discrete GPUs) and more than one queue, distinct from whichever
+	// family m_computeQueueFamily landed on above.
+	uint32_t qfCount = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, nullptr);
+	std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+	vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, qfProps.data());
+
+	bool haveDumpFamily = false;
+	uint32_t bestScore = 0;
+	for (uint32_t i = 0; i < qfCount && !dumpAsyncDisabled; i++)
+	{
+		if (i == m_computeQueueFamily) continue;
+		const auto& p = qfProps[i];
+		if (!(p.queueFlags & VK_QUEUE_TRANSFER_BIT) && !(p.queueFlags & VK_QUEUE_COMPUTE_BIT))
+			continue;
+		bool noGraphics = !(p.queueFlags & VK_QUEUE_GRAPHICS_BIT);
+		uint32_t score = (noGraphics ? 2u : 0u) + ((p.queueFlags & VK_QUEUE_COMPUTE_BIT) ? 1u : 0u);
+		if (!haveDumpFamily || score > bestScore)
+		{
+			m_dumpQueueFamily = i;
+			haveDumpFamily = true;
+			bestScore = score;
+		}
+	}
+	// m_hasDumpQueue is only latched true once the device/queue/pool below
+	// are actually created; EnsureDumpBuffers() checks it again before
+	// touching any of this, so a failure anywhere just disables the feature.
+	m_hasDumpQueue = haveDumpFamily;
+
 	// --- Logical device ---
 	float priority = 1.0f;
 	std::vector<VkDeviceQueueCreateInfo> queueInfos;
@@ -744,6 +776,15 @@ void Engine_Vulkan::InitVulkan()
 		transferQueueInfo.pQueuePriorities = &priority;
 		queueInfos.push_back(transferQueueInfo);
 	}
+	if (m_hasDumpQueue)
+	{
+		VkDeviceQueueCreateInfo dumpQueueInfo{};
+		dumpQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+		dumpQueueInfo.queueFamilyIndex = m_dumpQueueFamily;
+		dumpQueueInfo.queueCount = 1;
+		dumpQueueInfo.pQueuePriorities = &priority;
+		queueInfos.push_back(dumpQueueInfo);
+	}
 
 	VkDeviceCreateInfo devInfo{};
 	devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -753,6 +794,22 @@ void Engine_Vulkan::InitVulkan()
 
 	vkGetDeviceQueue(m_device, m_computeQueueFamily, 0, &m_computeQueue);
 	vkGetDeviceQueue(m_device, m_transferQueueFamily, 0, &m_transferQueue);
+	if (m_hasDumpQueue)
+	{
+		vkGetDeviceQueue(m_device, m_dumpQueueFamily, 0, &m_dumpQueue);
+
+		VkCommandPoolCreateInfo dumpPoolInfo{};
+		dumpPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+		dumpPoolInfo.queueFamilyIndex = m_computeQueueFamily;
+		dumpPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		VkCommandPoolCreateInfo dumpXferPoolInfo = dumpPoolInfo;
+		dumpXferPoolInfo.queueFamilyIndex = m_dumpQueueFamily;
+		if (vkCreateCommandPool(m_device, &dumpPoolInfo, nullptr, &m_dumpCmdPool) != VK_SUCCESS ||
+		    vkCreateCommandPool(m_device, &dumpXferPoolInfo, nullptr, &m_dumpXferCmdPool) != VK_SUCCESS)
+		{
+			m_hasDumpQueue = false;
+		}
+	}
 
 	// --- Command pool + buffer ---
 	VkCommandPoolCreateInfo poolInfo{};
@@ -1100,7 +1157,15 @@ void Engine_Vulkan::CreateBuffers()
 	// and fallback field sync when ReBAR is not available)
 	VkBufferUsageFlags stgUse = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 	                            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	CreateBufferWithMemory(m_fieldBufSize, stgUse, host, m_stagingBuf, m_stagingMem);
+	// Prefer a HOST_CACHED type: this buffer is read back by the CPU in
+	// DownloadFromDeviceBuffer() (field sync without ReBAR, energy/probe
+	// fallback), and a plain HOST_VISIBLE|HOST_COHERENT type can land on
+	// write-combined memory -- fast to write, ~10x slower than a cached
+	// read for the CPU to read back. Falls back to the plain flags on
+	// drivers without a cached host-visible type.
+	if (!TryCreateBufferWithMemory(m_fieldBufSize, stgUse, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+	                                m_stagingBuf, m_stagingMem))
+		CreateBufferWithMemory(m_fieldBufSize, stgUse, host, m_stagingBuf, m_stagingMem);
 }
 
 // ===========================================================================
@@ -3190,6 +3255,14 @@ void Engine_Vulkan::DrainGPU() const
 
 void Engine_Vulkan::SyncFieldsToHost() const
 {
+	if (m_dumpAsyncPending)
+	{
+		// A BeginAsyncFieldDownload() request is already in flight (or done) on
+		// the dump queue -- just wait for it and copy into the CPU shadow, no
+		// need to also drain/re-copy on the compute queue.
+		const_cast<Engine_Vulkan*>(this)->FinishAsyncFieldDownload();
+		return;
+	}
 	DrainGPU();  // ensure all pending GPU work is complete
 	if (!m_hostDirty) return;
 	if (m_voltMapped && m_currMapped)
@@ -3222,6 +3295,251 @@ void Engine_Vulkan::SyncFieldsToDevice()
 		UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
 	}
 	m_deviceDirty = false;
+}
+
+void Engine_Vulkan::EnsureDumpBuffers()
+{
+	if (m_dumpBuffersReady || !m_hasDumpQueue) return;
+	// ReBAR fields are already directly host-mapped -- the async pipeline's
+	// whole point is to hide a staging-buffer PCIe copy, so there is nothing
+	// to gain here (and DrainGPU() + memcpy is already fast in that case).
+	if (m_voltMapped && m_currMapped) { m_hasDumpQueue = false; return; }
+
+	VkBufferUsageFlags snapUsage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkMemoryPropertyFlags dLoc    = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkMemoryPropertyFlags host    = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	// HOST_VISIBLE|HOST_COHERENT alone is satisfied by write-combined memory
+	// on this driver -- fine for the CPU *writing* into GPU-visible memory
+	// (the upload path elsewhere), catastrophic for *reading* it back: a
+	// plain memcpy() out of uncached mapped memory measured ~260 MB/s here
+	// (2+ seconds for a 564 MB dump) vs. the ~26 ms the underlying PCIe copy
+	// itself takes. HOST_CACHED turns that memcpy into an ordinary cached
+	// read. Try it first; fall back to the plain flags on drivers that don't
+	// expose a cached host-visible type.
+	VkMemoryPropertyFlags hostCached = host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+	uint32_t sharingFamilies[2] = {m_computeQueueFamily, m_dumpQueueFamily};
+
+	auto createStaging = [&](GpuBuf& gb) -> bool
+	{
+		return TryCreateBufferWithMemory(m_fieldBufSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		                                  hostCached, gb.buffer, gb.memory) ||
+		       TryCreateBufferWithMemory(m_fieldBufSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		                                  host, gb.buffer, gb.memory);
+	};
+
+	auto createConcurrent = [&](GpuBuf& gb, VkDeviceSize size) -> bool
+	{
+		VkBufferCreateInfo ci{};
+		ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		ci.size  = size;
+		ci.usage = snapUsage;
+		ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		ci.queueFamilyIndexCount = 2;
+		ci.pQueueFamilyIndices   = sharingFamilies;
+		if (vkCreateBuffer(m_device, &ci, nullptr, &gb.buffer) != VK_SUCCESS)
+			return false;
+		VkMemoryRequirements memReq;
+		vkGetBufferMemoryRequirements(m_device, gb.buffer, &memReq);
+		uint32_t memType = FindMemoryTypeSoft(memReq.memoryTypeBits, dLoc);
+		if (memType == UINT32_MAX)
+		{
+			vkDestroyBuffer(m_device, gb.buffer, nullptr);
+			gb.buffer = VK_NULL_HANDLE;
+			return false;
+		}
+		VkMemoryAllocateInfo ai{};
+		ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		ai.allocationSize  = memReq.size;
+		ai.memoryTypeIndex = memType;
+		if (vkAllocateMemory(m_device, &ai, nullptr, &gb.memory) != VK_SUCCESS)
+		{
+			vkDestroyBuffer(m_device, gb.buffer, nullptr);
+			gb.buffer = VK_NULL_HANDLE;
+			return false;
+		}
+		vkBindBufferMemory(m_device, gb.buffer, gb.memory, 0);
+		return true;
+	};
+
+	bool ok = true;
+	for (int i = 0; i < DUMP_RING && ok; ++i)
+	{
+		ok = ok && createConcurrent(m_dumpSnapVolt[i], m_fieldBufSize);
+		ok = ok && createConcurrent(m_dumpSnapCurr[i], m_fieldBufSize);
+		if (!ok) break;
+
+		// Staging is only ever touched by m_dumpQueue (writer) and the host
+		// (reader), so it can stay VK_SHARING_MODE_EXCLUSIVE.
+		ok = ok && createStaging(m_dumpStageVolt[i]);
+		ok = ok && createStaging(m_dumpStageCurr[i]);
+		if (!ok) break;
+
+		if (vkMapMemory(m_device, m_dumpStageVolt[i].memory, 0, m_fieldBufSize, 0,
+		                 (void**)&m_dumpStageVoltMapped[i]) != VK_SUCCESS) { ok = false; break; }
+		if (vkMapMemory(m_device, m_dumpStageCurr[i].memory, 0, m_fieldBufSize, 0,
+		                 (void**)&m_dumpStageCurrMapped[i]) != VK_SUCCESS) { ok = false; break; }
+
+		VkCommandBufferAllocateInfo snapAlloc{};
+		snapAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		snapAlloc.commandPool = m_dumpCmdPool;
+		snapAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		snapAlloc.commandBufferCount = 1;
+		if (vkAllocateCommandBuffers(m_device, &snapAlloc, &m_dumpSnapshotCmdBuf[i]) != VK_SUCCESS) { ok = false; break; }
+
+		VkCommandBufferAllocateInfo xferAlloc = snapAlloc;
+		xferAlloc.commandPool = m_dumpXferCmdPool;
+		if (vkAllocateCommandBuffers(m_device, &xferAlloc, &m_dumpStagingCmdBuf[i]) != VK_SUCCESS) { ok = false; break; }
+
+		VkFenceCreateInfo fenceInfo{};
+		fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled: slot is initially idle
+		if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_dumpSnapshotFence[i]) != VK_SUCCESS) { ok = false; break; }
+		if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_dumpStagingFence[i]) != VK_SUCCESS) { ok = false; break; }
+
+		VkSemaphoreCreateInfo semInfo{};
+		semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		if (vkCreateSemaphore(m_device, &semInfo, nullptr, &m_dumpSnapshotSem[i]) != VK_SUCCESS) { ok = false; break; }
+	}
+
+	if (!ok)
+	{
+		cerr << "Engine_Vulkan: dump-queue buffer setup failed, falling back to "
+		        "synchronous field-dump downloads." << endl;
+		CleanupDumpAsync();
+		m_hasDumpQueue = false;
+		return;
+	}
+	m_dumpBuffersReady = true;
+}
+
+void Engine_Vulkan::BeginAsyncFieldDownload()
+{
+	// Flush any request from a previous call that nothing has consumed yet,
+	// so the data SyncFieldsToHost() eventually returns is never more than
+	// one BeginAsyncFieldDownload() cycle stale.
+	if (m_dumpAsyncPending)
+		FinishAsyncFieldDownload();
+
+	if (!m_hostDirty) return;              // nothing new on the GPU side
+	if (!m_hasDumpQueue) return;            // no independent queue -- caller falls back
+	EnsureDumpBuffers();
+	if (!m_dumpBuffersReady) return;
+
+	DrainGPU();  // must see the fully-committed state before snapshotting it
+
+	const int idx = m_dumpNextIdx;
+	m_dumpNextIdx = (m_dumpNextIdx + 1) % DUMP_RING;
+
+	// Slot reuse safety: with the flush-before-new-request rule above, at
+	// most one slot is ever genuinely in flight, but wait defensively in
+	// case a caller ever bypasses BeginAsyncFieldDownload's own pending flush.
+	vkWaitForFences(m_device, 1, &m_dumpSnapshotFence[idx], VK_TRUE, UINT64_MAX);
+	vkWaitForFences(m_device, 1, &m_dumpStagingFence[idx], VK_TRUE, UINT64_MAX);
+	vkResetFences(m_device, 1, &m_dumpSnapshotFence[idx]);
+	vkResetFences(m_device, 1, &m_dumpStagingFence[idx]);
+
+	// --- Stage 1 (compute queue, family == field buffers' family): ---
+	// live volt/curr -> device-local snapshot. Fast, VRAM-bandwidth bound.
+	// Signals m_dumpSnapshotSem[idx] so stage 2 can start without a CPU wait.
+	VkCommandBuffer snapCmd = m_dumpSnapshotCmdBuf[idx];
+	VkCommandBufferBeginInfo bi{};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkResetCommandBuffer(snapCmd, 0);
+	VK_CHECK(vkBeginCommandBuffer(snapCmd, &bi));
+	VkBufferCopy region = {0, 0, m_fieldBufSize};
+	vkCmdCopyBuffer(snapCmd, m_voltBuf, m_dumpSnapVolt[idx].buffer, 1, &region);
+	vkCmdCopyBuffer(snapCmd, m_currBuf, m_dumpSnapCurr[idx].buffer, 1, &region);
+	VK_CHECK(vkEndCommandBuffer(snapCmd));
+
+	VkSubmitInfo snapSubmit{};
+	snapSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	snapSubmit.commandBufferCount = 1;
+	snapSubmit.pCommandBuffers = &snapCmd;
+	snapSubmit.signalSemaphoreCount = 1;
+	snapSubmit.pSignalSemaphores = &m_dumpSnapshotSem[idx];
+	VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &snapSubmit, m_dumpSnapshotFence[idx]));
+
+	// --- Stage 2 (independent dump queue): snapshot -> host-visible staging. ---
+	// Slow (PCIe-bound) but runs fully concurrently with whatever the caller
+	// submits to m_computeQueue next, since the source is already frozen.
+	VkCommandBuffer xferCmd = m_dumpStagingCmdBuf[idx];
+	vkResetCommandBuffer(xferCmd, 0);
+	VK_CHECK(vkBeginCommandBuffer(xferCmd, &bi));
+	vkCmdCopyBuffer(xferCmd, m_dumpSnapVolt[idx].buffer, m_dumpStageVolt[idx].buffer, 1, &region);
+	vkCmdCopyBuffer(xferCmd, m_dumpSnapCurr[idx].buffer, m_dumpStageCurr[idx].buffer, 1, &region);
+	VK_CHECK(vkEndCommandBuffer(xferCmd));
+
+	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo xferSubmit{};
+	xferSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	xferSubmit.waitSemaphoreCount = 1;
+	xferSubmit.pWaitSemaphores = &m_dumpSnapshotSem[idx];
+	xferSubmit.pWaitDstStageMask = &waitStage;
+	xferSubmit.commandBufferCount = 1;
+	xferSubmit.pCommandBuffers = &xferCmd;
+	VK_CHECK(vkQueueSubmit(m_dumpQueue, 1, &xferSubmit, m_dumpStagingFence[idx]));
+
+	m_dumpSlotInFlight[idx] = true;
+	m_dumpAsyncPending = true;
+	m_dumpAsyncIdx = idx;
+}
+
+void Engine_Vulkan::FinishAsyncFieldDownload()
+{
+	if (!m_dumpAsyncPending)
+	{
+		// Nothing was pre-fetched (e.g. HasDumpTransferQueue() was false) --
+		// fall back to the original fully-synchronous path.
+		DrainGPU();
+		if (!m_hostDirty) return;
+		if (m_voltMapped && m_currMapped)
+		{
+			std::memcpy(volt_ptr->data(), m_voltMapped, m_fieldBufSize);
+			std::memcpy(curr_ptr->data(), m_currMapped, m_fieldBufSize);
+		}
+		else
+		{
+			DownloadFromDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+			DownloadFromDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
+		}
+		m_hostDirty = false;
+		return;
+	}
+
+	const int idx = m_dumpAsyncIdx;
+	vkWaitForFences(m_device, 1, &m_dumpStagingFence[idx], VK_TRUE, UINT64_MAX);
+	m_dumpSlotInFlight[idx] = false;
+	std::memcpy(volt_ptr->data(), m_dumpStageVoltMapped[idx], m_fieldBufSize);
+	std::memcpy(curr_ptr->data(), m_dumpStageCurrMapped[idx], m_fieldBufSize);
+	m_hostDirty = false;
+	m_dumpAsyncPending = false;
+}
+
+void Engine_Vulkan::CleanupDumpAsync()
+{
+	if (m_device == VK_NULL_HANDLE) return;
+	for (int i = 0; i < DUMP_RING; ++i)
+	{
+		if (m_dumpSlotInFlight[i])
+			vkWaitForFences(m_device, 1, &m_dumpStagingFence[i], VK_TRUE, UINT64_MAX);
+		if (m_dumpStageVoltMapped[i]) { vkUnmapMemory(m_device, m_dumpStageVolt[i].memory); m_dumpStageVoltMapped[i] = nullptr; }
+		if (m_dumpStageCurrMapped[i]) { vkUnmapMemory(m_device, m_dumpStageCurr[i].memory); m_dumpStageCurrMapped[i] = nullptr; }
+		DestroyGpuBuf(m_dumpSnapVolt[i]);
+		DestroyGpuBuf(m_dumpSnapCurr[i]);
+		DestroyGpuBuf(m_dumpStageVolt[i]);
+		DestroyGpuBuf(m_dumpStageCurr[i]);
+		if (m_dumpSnapshotSem[i]) { vkDestroySemaphore(m_device, m_dumpSnapshotSem[i], nullptr); m_dumpSnapshotSem[i] = VK_NULL_HANDLE; }
+		if (m_dumpSnapshotFence[i]) { vkDestroyFence(m_device, m_dumpSnapshotFence[i], nullptr); m_dumpSnapshotFence[i] = VK_NULL_HANDLE; }
+		if (m_dumpStagingFence[i]) { vkDestroyFence(m_device, m_dumpStagingFence[i], nullptr); m_dumpStagingFence[i] = VK_NULL_HANDLE; }
+		m_dumpSnapshotCmdBuf[i] = VK_NULL_HANDLE; // freed with their pool below
+		m_dumpStagingCmdBuf[i]  = VK_NULL_HANDLE;
+	}
+	if (m_dumpCmdPool) { vkDestroyCommandPool(m_device, m_dumpCmdPool, nullptr); m_dumpCmdPool = VK_NULL_HANDLE; }
+	if (m_dumpXferCmdPool) { vkDestroyCommandPool(m_device, m_dumpXferCmdPool, nullptr); m_dumpXferCmdPool = VK_NULL_HANDLE; }
+	m_dumpBuffersReady = false;
+	m_dumpAsyncPending = false;
 }
 
 void Engine_Vulkan::ValidateGPUFields(unsigned int timestep) const
@@ -4300,6 +4618,9 @@ void Engine_Vulkan::CleanupVulkan()
 	if (m_device == VK_NULL_HANDLE) return;
 	vkDeviceWaitIdle(m_device);
 
+	// Async field-dump download pipeline (own queue/pools/buffers)
+	CleanupDumpAsync();
+
 	// First clean up extension resources
 	CleanupExtensions();
 
@@ -5200,64 +5521,6 @@ double Engine_Vulkan::CalcCurrentIntegralGPU(const unsigned int* start, const un
 		}
 	}
 	return result;
-}
-
-// ===========================================================================
-// Async Processing Thread
-// ===========================================================================
-
-void Engine_Vulkan::StartAsyncProcessing()
-{
-	if (m_hasCPUExtensions) return;  // hybrid mode can't overlap
-
-	m_asyncShutdown  = false;
-	m_asyncWorkReady = false;
-	m_asyncWorkDone  = true;
-
-	m_asyncThread = std::thread(&Engine_Vulkan::AsyncWorkerLoop, this);
-}
-
-void Engine_Vulkan::AsyncWorkerLoop()
-{
-	while (true)
-	{
-		std::unique_lock<std::mutex> lk(m_asyncMutex);
-		m_asyncCond.wait(lk, [this] { return m_asyncWorkReady || m_asyncShutdown.load(); });
-
-		if (m_asyncShutdown) break;
-
-		m_asyncWorkReady = false;
-		lk.unlock();
-
-		// Do the actual processing work (reads field data, writes files)
-		// The GPU is concurrently running the next batch.
-		// Processing calls GetVolt/GetCurr which go through the ReBAR path
-		// or cached host data — no GPU stall since DrainGPU was already
-		// called before we were triggered.
-
-		// The processing is done by the caller via a function pointer/callback.
-		// For now, the async thread simply signals completion.
-		// The actual PA->Process() call happens in the RunFDTD integration.
-
-		lk.lock();
-		m_asyncWorkDone = true;
-		m_asyncDoneCond.notify_one();
-	}
-}
-
-void Engine_Vulkan::TriggerAsyncProcessing(int& step)
-{
-	std::lock_guard<std::mutex> lk(m_asyncMutex);
-	m_asyncStepPtr   = &step;
-	m_asyncWorkReady = true;
-	m_asyncWorkDone  = false;
-	m_asyncCond.notify_one();
-}
-
-void Engine_Vulkan::WaitAsyncProcessing()
-{
-	std::unique_lock<std::mutex> lk(m_asyncMutex);
-	m_asyncDoneCond.wait(lk, [this] { return m_asyncWorkDone; });
 }
 
 #endif // WITH_GPU

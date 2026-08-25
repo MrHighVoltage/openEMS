@@ -16,10 +16,6 @@
 #include <vulkan/vulkan.h>
 #include <vector>
 #include <functional>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
 #include <algorithm>
 #include <string>
 #include <chrono>
@@ -80,16 +76,6 @@ public:
 	//! GPU-side current line integral.
 	double CalcCurrentIntegralGPU(const unsigned int* start, const unsigned int* stop) const;
 
-	// --- Async processing support -----------------------------------------
-	//! Start the background processing thread (called once from Init).
-	void StartAsyncProcessing();
-	//! Signal the async thread to process, then return immediately.
-	void TriggerAsyncProcessing(int& step);
-	//! Wait for the async processing thread to finish its current batch.
-	void WaitAsyncProcessing();
-	//! Check if async processing is supported (pure GPU mode, no CPU extensions).
-	bool HasAsyncProcessing() const { return m_asyncThread.joinable(); }
-
 	// --- Pipelined processing support -------------------------------------
 	//! Begin recording cell accesses. Call before PA->Process().
 	void StartProbeRecording() { m_recordedCells.clear(); m_recordingProbeAccess = true; }
@@ -102,7 +88,13 @@ public:
 	//! return from the CPU-side probe cache instead of VRAM.
 	void EnablePipelinedReading(bool enable) { m_pipelinedReading = enable; }
 	//! Check if pipelined processing is active and usable.
-	bool HasPipelinedProcessing() const { return m_hasGPU_Probes && !m_hasCPUExtensions; }
+	//! Probes use the probe cache; field dumps use the async download pipeline
+	//! (BeginAsyncFieldDownload). Either alone is enough to make the
+	//! speculative-submission loop worthwhile -- it's the submit-ahead
+	//! structure (next batch queued before this state's data is consumed)
+	//! that lets both overlap with GPU compute, not just the probe cache.
+	bool HasPipelinedProcessing() const
+	{ return (m_hasGPU_Probes || m_hasFieldDumps) && !m_hasCPUExtensions; }
 	//! Submit a speculative batch that does NOT advance the public numTS.
 	void SubmitSpeculative(unsigned int nTS);
 	//! Drain the speculative batch and advance numTS.
@@ -191,6 +183,22 @@ public:
 	void SyncFieldsToHost() const;
 	//! Copy CPU shadow → GPU buffers (after CPU-side extension modifications).
 	void SyncFieldsToDevice();
+
+	// --- Async field-dump download (overlaps large dump readback with GPU compute) ---
+	//! Tell the engine whether any GPU field dumps (ProcessFields) are registered.
+	//! Gates the speculative pre-fetch below; a no-op (safe) when left false.
+	void SetHasFieldDumps(bool v) { m_hasFieldDumps = v; }
+	bool HasFieldDumps() const { return m_hasFieldDumps; }
+	//! True if a second, independent hardware queue is available for the
+	//! dump download pipeline (see SetupDumpTransferQueue()).
+	bool HasDumpTransferQueue() const { return m_hasDumpQueue; }
+	//! Kick off (non-blocking on the CPU) a snapshot + download of the
+	//! current committed field state for an upcoming dump, so the slow PCIe
+	//! leg runs concurrently with the next speculative GPU batch and with
+	//! CPU-side processing. SyncFieldsToHost() picks up the result lazily.
+	//! Safe to call even when no dump is imminent (self-flushes any stale
+	//! pending request first) or when the dump queue isn't available (no-op).
+	void BeginAsyncFieldDownload();
 
 protected:
 	Engine_Vulkan(const Operator* op);
@@ -618,17 +626,6 @@ private:
 	void ValidateGPUFields(unsigned int timestep) const; //!< Debug-only finite-value scan
 	void ReportGPUFieldValidation(unsigned int timestep) const; //!< Report staged scans
 
-	// ---- Async processing thread --------------------------------------
-	std::thread             m_asyncThread;
-	mutable std::mutex      m_asyncMutex;
-	std::condition_variable m_asyncCond;         //!< signals work available
-	std::condition_variable m_asyncDoneCond;     //!< signals work complete
-	std::atomic<bool>       m_asyncShutdown{false};
-	bool                    m_asyncWorkReady = false;
-	bool                    m_asyncWorkDone  = true;
-	int*                    m_asyncStepPtr   = nullptr; //!< pointer to step variable in RunFDTD
-	void AsyncWorkerLoop();  //!< background thread function
-
 	// ---- Extension setup methods --------------------------------------
 	void SetupGPUExtensions();     //!< Detect and setup all GPU-native extensions
 	void SetupGPU_UPML();          //!< Upload PML data and create descriptors/pipelines
@@ -649,6 +646,56 @@ private:
 	static void WriteDescriptorBuffers(VkDevice dev, VkDescriptorSet set,
 	                                   const VkBuffer* bufs, const VkDeviceSize* sizes,
 	                                   uint32_t count);
+
+	// ---- Async field-dump download --------------------------------------
+	// Full-field dumps (ProcessFields) need the *entire* volt/curr buffers,
+	// not the sparse cells the probe cache covers. On a discrete GPU that
+	// download is large (hundreds of MB) and, before this, was a single
+	// blocking copy on the compute queue: DrainGPU() + vkCmdCopyBuffer +
+	// vkWaitForFences with nothing else in flight. The pipeline below
+	// replaces that with two stages on an independent hardware queue:
+	//   1. live buffers -> device-local "snapshot" buffers (VRAM-VRAM, fast,
+	//      bandwidth-bound only; must finish before the *next* speculative
+	//      batch overwrites the live buffers in place).
+	//   2. snapshot -> host-visible staging (PCIe, slow) -- runs fully
+	//      concurrently with subsequent GPU compute and CPU-side PA::Process()
+	//      work, since stage 1 already froze the source.
+	// FinishAsyncFieldDownload() (called lazily from SyncFieldsToHost) just
+	// waits on stage 2's fence and memcpy's into the CPU shadow arrays.
+	bool     m_hasFieldDumps = false;   //!< Set via SetHasFieldDumps() by the caller
+	bool     m_hasDumpQueue  = false;   //!< True once a 2nd hw queue was found & buffers created
+	uint32_t m_dumpQueueFamily = 0;
+	VkQueue  m_dumpQueue = VK_NULL_HANDLE;
+	VkCommandPool m_dumpCmdPool     = VK_NULL_HANDLE; //!< On m_computeQueueFamily (stage 1)
+	VkCommandPool m_dumpXferCmdPool = VK_NULL_HANDLE; //!< On m_dumpQueueFamily (stage 2)
+
+	static constexpr int DUMP_RING = 2; //!< Double-buffered so a still-in-flight
+	                                     //!< previous request never blocks a new one.
+	VkCommandBuffer m_dumpSnapshotCmdBuf[DUMP_RING] = {};
+	VkCommandBuffer m_dumpStagingCmdBuf[DUMP_RING]  = {};
+	VkFence     m_dumpSnapshotFence[DUMP_RING] = {};
+	VkFence     m_dumpStagingFence[DUMP_RING]  = {};
+	VkSemaphore m_dumpSnapshotSem[DUMP_RING]   = {}; //!< stage1 signal -> stage2 wait
+	bool        m_dumpSlotInFlight[DUMP_RING]  = {}; //!< stage2 submitted, fence not yet waited
+
+	// Snapshot buffers must be readable from both queue families, so they
+	// use VK_SHARING_MODE_CONCURRENT (avoids manual ownership-transfer
+	// barriers for what is a rare, non-hot-path transfer).
+	GpuBuf m_dumpSnapVolt[DUMP_RING];
+	GpuBuf m_dumpSnapCurr[DUMP_RING];
+	GpuBuf m_dumpStageVolt[DUMP_RING]; //!< Host-visible+coherent, persistently mapped
+	GpuBuf m_dumpStageCurr[DUMP_RING];
+	FDTD_FLOAT* m_dumpStageVoltMapped[DUMP_RING] = {};
+	FDTD_FLOAT* m_dumpStageCurrMapped[DUMP_RING] = {};
+
+	bool m_dumpBuffersReady  = false; //!< Lazily created on first BeginAsyncFieldDownload()
+	bool m_dumpAsyncPending  = false;
+	int  m_dumpAsyncIdx      = 0;     //!< Slot currently holding the pending request
+	int  m_dumpNextIdx       = 0;     //!< Slot to use for the next request
+
+	void EnsureDumpBuffers();
+	void FinishAsyncFieldDownload();
+	void CleanupDumpAsync();
 };
 
 #endif // WITH_GPU
