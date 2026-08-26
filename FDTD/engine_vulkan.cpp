@@ -1109,6 +1109,39 @@ void Engine_Vulkan::CreateBuffers()
 		uint32_t rebarIdx = FindMemoryTypeSoft(memReq.memoryTypeBits, rebar);
 		vkDestroyBuffer(m_device, probeBuf, nullptr);
 
+		// A DEVICE_LOCAL|HOST_VISIBLE memory type exists on virtually every
+		// modern driver, but on a machine *without* resizable BAR it is backed
+		// by the legacy 256 MB PCI aperture. Drivers do not fail an allocation
+		// that overflows that aperture -- they silently place the surplus in
+		// system RAM while still reporting the DEVICE_LOCAL property, so the
+		// allocation-success check below cannot detect it. The update kernels
+		// then stream volt/curr across PCIe every timestep. Measured on an
+		// RX 6800 with a 256 MB BAR (256x224x224 cells, 147 MB per field):
+		// 803 MCells/s in that state vs. 5159 MCells/s with plain device-local
+		// buffers -- a 6.4x loss to buy a host-read convenience.
+		// So require the backing heap to actually hold both field buffers
+		// (plus headroom for the operator index / staging / PML allocations
+		// that also compete for it) before preferring ReBAR.
+		if (rebarIdx != UINT32_MAX)
+		{
+			VkPhysicalDeviceMemoryProperties mp;
+			vkGetPhysicalDeviceMemoryProperties(m_physDevice, &mp);
+			const VkDeviceSize heapSize =
+				mp.memoryHeaps[mp.memoryTypes[rebarIdx].heapIndex].size;
+			const VkDeviceSize needed = 2 * (VkDeviceSize)m_fieldBufSize;
+			// 12.5% headroom for the other host-visible allocations.
+			if (heapSize < needed + needed / 8)
+			{
+				if (g_settings.GetVerboseLevel() > 0)
+					cout << "  ReBAR aperture too small ("
+					     << (heapSize >> 20) << " MB) for 2x"
+					     << (m_fieldBufSize >> 20)
+					     << " MB of field buffers — using device-local memory"
+					     << endl;
+				rebarIdx = UINT32_MAX;
+			}
+		}
+
 			if (rebarIdx != UINT32_MAX)
 			{
 				// A compatible memory type does not guarantee that the aperture is
