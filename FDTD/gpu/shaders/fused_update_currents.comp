@@ -48,6 +48,27 @@ layout(push_constant) uniform PC {
     uint numPmlRegions;
 };
 
+// --- Compressed-operator index width -------------------------------------
+// opIdx is one index per cell into the compressed coefficient tables, read
+// once per cell per kernel -- on large grids it is ~10% of all memory traffic
+// (measured). The needed width is known at operator setup, so it is a
+// specialization constant: the driver folds this to a single path at pipeline
+// creation, leaving no runtime branch. The buffer stays declared `uint` and
+// narrow values are unpacked by hand, so no 8/16-bit storage feature is
+// required. Packing is little-endian within each dword: cell c occupies bits
+// [(c%k)*bits, +bits) of word c/k, matching the host-side packer.
+layout(constant_id = 0) const uint OPIDX_BITS = 32;
+
+uint fetchOpIdx(uint cell)
+{
+    if (OPIDX_BITS == 8u)
+        return bitfieldExtract(opIdx[cell >> 2], int((cell & 3u) << 3), 8);
+    if (OPIDX_BITS == 16u)
+        return bitfieldExtract(opIdx[cell >> 1], int((cell & 1u) << 4), 16);
+    return opIdx[cell];
+}
+
+
 void main()
 {
     uint gid = gl_GlobalInvocationID.x;
@@ -92,7 +113,7 @@ void main()
     uint base = x * sYZ + y * Nz + z;
 
     // Per-cell compressed coefficient index
-    uint oi = opIdx[base];
+    uint oi = fetchOpIdx(base);
 
     float ii0 = ii_comp[oi];
     float iv0 = iv_comp[oi];

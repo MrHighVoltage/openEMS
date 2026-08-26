@@ -1320,7 +1320,23 @@ void Engine_Vulkan::CreateBuffers()
 	// Compressed coefficient buffers (read-only, always device-local)
 	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
 	unsigned int numComp = opVk->GetNumCompressed();
-	m_opIndexBufSize  = N * sizeof(uint32_t);
+	// Narrow the per-cell operator index to the smallest width that can address
+	// every unique coefficient set. opIdx is read once per cell per kernel and
+	// is ~10% of all memory traffic on grids that do not fit cache (measured by
+	// stubbing the lookup out entirely: +9.7% on Coax, +10.2% on a 320x256x256
+	// synthetic grid), so narrowing it is a direct bandwidth saving. Real models
+	// span the whole range -- 6 unique sets for a uniform benchmark mesh, 113
+	// for Coax, 645/1565/6626 for the stripline and CPW tests -- so all three
+	// widths earn their place.
+	if (numComp <= 0x100u)
+		m_opIdxBits = 8;
+	else if (numComp <= 0x10000u)
+		m_opIdxBits = 16;
+	else
+		m_opIdxBits = 32;
+	const size_t opIdxPerWord = 32u / m_opIdxBits;
+	// Round up to whole dwords: fetchOpIdx() always loads a full dword.
+	m_opIndexBufSize = (VkDeviceSize)((N + opIdxPerWord - 1) / opIdxPerWord) * sizeof(uint32_t);
 	m_coeffCompBufSize = 3 * numComp * sizeof(float);
 	CreateBufferWithMemory(m_opIndexBufSize,  devRO, dLoc, m_opIndexBuf,  m_opIndexMem);
 	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_vvCompBuf, m_vvCompMem);
@@ -1472,6 +1488,19 @@ void Engine_Vulkan::CreatePipelines()
 	VkShaderModule excMod  = CreateShaderModule(gpu_spirv::apply_excitation_data,
 	                                            gpu_spirv::apply_excitation_size);
 
+	// OPIDX_BITS: the compressed-operator index width is known once the operator
+	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
+	// path at pipeline creation. Shaders declaring no such constant ignore it.
+	VkSpecializationMapEntry opIdxSpecEntry{};
+	opIdxSpecEntry.constantID = 0;
+	opIdxSpecEntry.offset     = 0;
+	opIdxSpecEntry.size       = sizeof(uint32_t);
+	VkSpecializationInfo opIdxSpec{};
+	opIdxSpec.mapEntryCount = 1;
+	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(uint32_t);
+	opIdxSpec.pData         = &m_opIdxBits;
+
 	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
 	{
 		VkPipelineShaderStageCreateInfo stage{};
@@ -1479,6 +1508,7 @@ void Engine_Vulkan::CreatePipelines()
 		stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
 		stage.module = mod;
 		stage.pName  = "main";
+		stage.pSpecializationInfo = &opIdxSpec;
 
 		VkComputePipelineCreateInfo ci{};
 		ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -1554,7 +1584,22 @@ void Engine_Vulkan::DownloadFromDeviceBuffer(VkBuffer src, void* data, VkDeviceS
 void Engine_Vulkan::UploadCoefficients()
 {
 	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
-	UploadToDeviceBuffer(m_opIndexBuf, opVk->GetOpIndex(), m_opIndexBufSize);
+	if (m_opIdxBits == 32)
+	{
+		UploadToDeviceBuffer(m_opIndexBuf, opVk->GetOpIndex(), m_opIndexBufSize);
+	}
+	else
+	{
+		// Pack little-endian within each dword, matching fetchOpIdx() in the
+		// shaders. The tail past N stays zero; no lane ever reads it.
+		const uint32_t* src = opVk->GetOpIndex();
+		const size_t nCells = (size_t)numLines[0] * numLines[1] * numLines[2];
+		const uint32_t perWord = 32u / m_opIdxBits;
+		std::vector<uint32_t> packed((size_t)m_opIndexBufSize / sizeof(uint32_t), 0u);
+		for (size_t c = 0; c < nCells; ++c)
+			packed[c / perWord] |= (src[c] << ((c % perWord) * m_opIdxBits));
+		UploadToDeviceBuffer(m_opIndexBuf, packed.data(), m_opIndexBufSize);
+	}
 	UploadToDeviceBuffer(m_vvCompBuf,  opVk->GetVVComp(),  m_coeffCompBufSize);
 	UploadToDeviceBuffer(m_viCompBuf,  opVk->GetVIComp(),  m_coeffCompBufSize);
 	UploadToDeviceBuffer(m_iiCompBuf,  opVk->GetIIComp(),  m_coeffCompBufSize);
@@ -1958,6 +2003,19 @@ void Engine_Vulkan::CreateExtensionDescriptorLayouts()
 
 void Engine_Vulkan::CreateExtensionPipelines()
 {
+	// OPIDX_BITS: the compressed-operator index width is known once the operator
+	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
+	// path at pipeline creation. Shaders declaring no such constant ignore it.
+	VkSpecializationMapEntry opIdxSpecEntry{};
+	opIdxSpecEntry.constantID = 0;
+	opIdxSpecEntry.offset     = 0;
+	opIdxSpecEntry.size       = sizeof(uint32_t);
+	VkSpecializationInfo opIdxSpec{};
+	opIdxSpec.mapEntryCount = 1;
+	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(uint32_t);
+	opIdxSpec.pData         = &m_opIdxBits;
+
 	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
 	{
 		VkPipelineShaderStageCreateInfo stage{};
@@ -1965,6 +2023,7 @@ void Engine_Vulkan::CreateExtensionPipelines()
 		stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
 		stage.module = mod;
 		stage.pName  = "main";
+		stage.pSpecializationInfo = &opIdxSpec;
 		VkComputePipelineCreateInfo ci{};
 		ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
 		ci.stage  = stage;
@@ -5255,6 +5314,19 @@ void Engine_Vulkan::SetupFusedUPML()
 	}
 
 	// --- Create compute pipelines ---
+	// OPIDX_BITS: the compressed-operator index width is known once the operator
+	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
+	// path at pipeline creation. Shaders declaring no such constant ignore it.
+	VkSpecializationMapEntry opIdxSpecEntry{};
+	opIdxSpecEntry.constantID = 0;
+	opIdxSpecEntry.offset     = 0;
+	opIdxSpecEntry.size       = sizeof(uint32_t);
+	VkSpecializationInfo opIdxSpec{};
+	opIdxSpec.mapEntryCount = 1;
+	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(uint32_t);
+	opIdxSpec.pData         = &m_opIdxBits;
+
 	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
 	{
 		VkPipelineShaderStageCreateInfo stage{};
@@ -5262,6 +5334,7 @@ void Engine_Vulkan::SetupFusedUPML()
 		stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
 		stage.module = mod;
 		stage.pName  = "main";
+		stage.pSpecializationInfo = &opIdxSpec;
 		VkComputePipelineCreateInfo ci{};
 		ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
 		ci.stage  = stage;
@@ -5445,6 +5518,19 @@ void Engine_Vulkan::SetupGPU_FieldValidation()
 	                         m_opIndexBufSize, m_coeffCompBufSize, m_coeffCompBufSize};
 	WriteDescriptorBuffers(m_device, m_validateDescSet, buffers, sizes, 6);
 
+	// OPIDX_BITS: the compressed-operator index width is known once the operator
+	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
+	// path at pipeline creation. Shaders declaring no such constant ignore it.
+	VkSpecializationMapEntry opIdxSpecEntry{};
+	opIdxSpecEntry.constantID = 0;
+	opIdxSpecEntry.offset     = 0;
+	opIdxSpecEntry.size       = sizeof(uint32_t);
+	VkSpecializationInfo opIdxSpec{};
+	opIdxSpec.mapEntryCount = 1;
+	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(uint32_t);
+	opIdxSpec.pData         = &m_opIdxBits;
+
 	VkShaderModule module = CreateShaderModule(gpu_spirv::validate_fields_data,
 	                                           gpu_spirv::validate_fields_size);
 	VkPipelineShaderStageCreateInfo stage{};
@@ -5452,6 +5538,7 @@ void Engine_Vulkan::SetupGPU_FieldValidation()
 	stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
 	stage.module = module;
 	stage.pName = "main";
+	stage.pSpecializationInfo = &opIdxSpec;
 
 	VkComputePipelineCreateInfo pipelineInfo{};
 	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;

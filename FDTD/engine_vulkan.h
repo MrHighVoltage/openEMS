@@ -72,6 +72,8 @@ public:
 		uint32_t maxSubgroupSize   = 0;
 	};
 	const DeviceCaps& GetDeviceCaps() const { return m_caps; }
+	//! Width actually chosen for the compressed-operator index (8/16/32 bits).
+	uint32_t GetOpIdxBits() const { return m_opIdxBits; }
 
 	static Engine_Vulkan* New(const Operator* op);
 	//! Prefer ReBAR HOST_VISIBLE allocations for main field buffers.
@@ -250,7 +252,8 @@ private:
 	VkDeviceMemory m_opIndexMem;
 	VkBuffer       m_vvCompBuf, m_viCompBuf, m_iiCompBuf, m_ivCompBuf;
 	VkDeviceMemory m_vvCompMem, m_viCompMem, m_iiCompMem, m_ivCompMem;
-	VkDeviceSize   m_opIndexBufSize; //!< N * sizeof(uint32_t)
+	VkDeviceSize   m_opIndexBufSize; //!< packed size of the opIdx buffer, 4-byte aligned
+	uint32_t       m_opIdxBits;      //!< 8, 16 or 32 -- width of one packed opIdx entry
 	VkDeviceSize   m_coeffCompBufSize; //!< 3 * numCompressed * sizeof(float)
 	VkBuffer       m_stagingBuf;
 	VkDeviceMemory m_stagingMem;
