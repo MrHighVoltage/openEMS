@@ -48,6 +48,31 @@ class Operator_Ext_LumpedRLC;
 class Engine_Vulkan : public Engine
 {
 public:
+	//! Single Vulkan baseline for the whole engine -- instance creation,
+	//! preflight probe, and device selection all negotiate against this one
+	//! value.  1.3 is the lowest version that provides, as core, everything
+	//! the engine's performance work needs: subgroup size control and
+	//! synchronization2 (1.3), timeline semaphores and 8-bit storage (1.2),
+	//! subgroup arithmetic and 16-bit storage (1.1).
+	static constexpr uint32_t API_VERSION = VK_API_VERSION_1_3;
+
+	//! Optional device capabilities negotiated at device creation.  Each flag
+	//! is only true when the feature was reported supported *and* enabled.
+	struct DeviceCaps
+	{
+		bool subgroupSizeControl   = false;
+		bool computeFullSubgroups  = false;
+		bool synchronization2      = false;
+		bool timelineSemaphore     = false;
+		bool storageBuffer16       = false;
+		bool storageBuffer8        = false;
+		bool shaderInt16           = false;
+		bool shaderInt8            = false;
+		uint32_t minSubgroupSize   = 0;
+		uint32_t maxSubgroupSize   = 0;
+	};
+	const DeviceCaps& GetDeviceCaps() const { return m_caps; }
+
 	static Engine_Vulkan* New(const Operator* op);
 	//! Prefer ReBAR HOST_VISIBLE allocations for main field buffers.
 	//! When false, volt/curr stay device-local for maximum dGPU bandwidth.
@@ -215,6 +240,7 @@ private:
 	VkQueue          m_transferQueue;
 	uint32_t         m_transferQueueFamily;
 	bool             m_hasDedicatedTransferQueue;
+	DeviceCaps       m_caps;
 
 	// ---- GPU buffers --------------------------------------------------
 	VkBuffer       m_voltBuf, m_currBuf;

@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
+#include <sstream>
 
 using std::cerr;
 using std::cout;
@@ -103,6 +104,50 @@ Engine_Vulkan* Engine_Vulkan::New(const Operator* op)
 	return e;
 }
 
+// ---------------------------------------------------------------------------
+// Vulkan version negotiation
+//
+// The engine has a single baseline (Engine_Vulkan::API_VERSION).  Requesting
+// an apiVersion the *loader* does not understand makes vkCreateInstance fail
+// with VK_ERROR_INCOMPATIBLE_DRIVER on a 1.0 loader, so clamp the request to
+// what the loader reports before asking for it, then reject individual
+// physical devices whose own apiVersion is below the baseline.
+// ---------------------------------------------------------------------------
+static uint32_t VulkanLoaderVersion()
+{
+	auto fn = (PFN_vkEnumerateInstanceVersion)
+		vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+	if (!fn)
+		return VK_API_VERSION_1_0;   // 1.0 loader: the symbol does not exist
+	uint32_t ver = VK_API_VERSION_1_0;
+	if (fn(&ver) != VK_SUCCESS)
+		return VK_API_VERSION_1_0;
+	return ver;
+}
+
+//! apiVersion to put in VkApplicationInfo: never above what the loader supports.
+static uint32_t VulkanRequestedApiVersion()
+{
+	const uint32_t loader = VulkanLoaderVersion();
+	return (loader < Engine_Vulkan::API_VERSION) ? loader : Engine_Vulkan::API_VERSION;
+}
+
+//! True when this physical device itself implements the engine baseline.
+static bool VulkanDeviceMeetsBaseline(VkPhysicalDevice dev)
+{
+	VkPhysicalDeviceProperties props{};
+	vkGetPhysicalDeviceProperties(dev, &props);
+	return props.apiVersion >= Engine_Vulkan::API_VERSION;
+}
+
+static std::string VulkanVersionString(uint32_t v)
+{
+	std::ostringstream os;
+	os << VK_API_VERSION_MAJOR(v) << '.' << VK_API_VERSION_MINOR(v)
+	   << '.' << VK_API_VERSION_PATCH(v);
+	return os.str();
+}
+
 bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny, unsigned int Nz,
                                                bool strictCoeffReserve, std::string* errMsg)
 {
@@ -137,7 +182,7 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 		VkApplicationInfo app{};
 		app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 		app.pApplicationName = "openEMS Vulkan preflight";
-		app.apiVersion = VK_API_VERSION_1_1;
+		app.apiVersion = VulkanRequestedApiVersion();
 
 		VkInstanceCreateInfo ici{};
 		ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -154,8 +199,10 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 
 		struct Candidate { VkPhysicalDevice dev; uint32_t qf; VkPhysicalDeviceProperties props; };
 		std::vector<Candidate> cands;
+		bool sawBelowBaseline = false;
 		for (auto& d : devs)
 		{
+			if (!VulkanDeviceMeetsBaseline(d)) { sawBelowBaseline = true; continue; }
 			uint32_t qfCount = 0;
 			vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, nullptr);
 			if (qfCount == 0) continue;
@@ -175,7 +222,14 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 			}
 		}
 		if (cands.empty())
+		{
+			if (sawBelowBaseline)
+				return fail("Vulkan preflight: no GPU implementing Vulkan " +
+				            VulkanVersionString(Engine_Vulkan::API_VERSION) +
+				            " found (a Vulkan-capable device is present but reports an "
+				            "older version -- update the graphics driver)");
 			return fail("Vulkan preflight: no compute-capable GPU found");
+		}
 
 		int forcedIndex = -1;
 		if (const char* envGpuIndex = std::getenv("OPENEMS_GPU_INDEX"))
@@ -537,7 +591,23 @@ void Engine_Vulkan::Init()
 	// Print GPU info
 	VkPhysicalDeviceProperties props;
 	vkGetPhysicalDeviceProperties(m_physDevice, &props);
-	cout << "Engine_Vulkan: using " << props.deviceName << endl;
+	cout << "Engine_Vulkan: using " << props.deviceName
+	     << " (Vulkan " << VulkanVersionString(props.apiVersion)
+	     << ", engine baseline " << VulkanVersionString(Engine_Vulkan::API_VERSION)
+	     << ")" << endl;
+	if (g_settings.GetVerboseLevel() > 0)
+	{
+		cout << "  Device features: "
+		     << (m_caps.subgroupSizeControl ? "subgroupSizeControl " : "")
+		     << (m_caps.computeFullSubgroups ? "computeFullSubgroups " : "")
+		     << (m_caps.synchronization2 ? "sync2 " : "")
+		     << (m_caps.timelineSemaphore ? "timelineSemaphore " : "")
+		     << (m_caps.storageBuffer16 ? "storage16 " : "")
+		     << (m_caps.storageBuffer8 ? "storage8 " : "")
+		     << endl;
+		cout << "  Subgroup size: " << m_caps.minSubgroupSize
+		     << ".." << m_caps.maxSubgroupSize << endl;
+	}
 	cout << "  Field buffer size: " << (m_fieldBufSize / (1024*1024)) << " MB per field" << endl;
 	{
 		const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
@@ -609,7 +679,7 @@ void Engine_Vulkan::InitVulkan()
 	VkApplicationInfo appInfo{};
 	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 	appInfo.pApplicationName = "openEMS";
-	appInfo.apiVersion = VK_API_VERSION_1_0;
+	appInfo.apiVersion = VulkanRequestedApiVersion();
 
 	VkInstanceCreateInfo instInfo{};
 	instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -634,8 +704,12 @@ void Engine_Vulkan::InitVulkan()
 	std::vector<GpuCandidate> candidates;
 	candidates.reserve(devs.size());
 
+	bool sawBelowBaseline = false;
 	for (auto& dev : devs)
 	{
+		// Enforce the single engine baseline here rather than discovering a
+		// missing 1.3 feature later, halfway through pipeline creation.
+		if (!VulkanDeviceMeetsBaseline(dev)) { sawBelowBaseline = true; continue; }
 		uint32_t qfCount = 0;
 		vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, nullptr);
 		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
@@ -656,7 +730,15 @@ void Engine_Vulkan::InitVulkan()
 	}
 
 	if (candidates.empty())
+	{
+		if (sawBelowBaseline)
+			throw std::runtime_error(
+				"Engine_Vulkan: no GPU implementing Vulkan " +
+				VulkanVersionString(Engine_Vulkan::API_VERSION) +
+				" found (a Vulkan device is present but reports an older version "
+				"-- update the graphics driver, or build without WITH_GPU)");
 		throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
+	}
 
 	// Optional override: OPENEMS_GPU_INDEX=<n> selects the n-th compute-capable
 	// Vulkan device from vkEnumeratePhysicalDevices() order.
@@ -786,10 +868,70 @@ void Engine_Vulkan::InitVulkan()
 		queueInfos.push_back(dumpQueueInfo);
 	}
 
+	// --- Negotiate optional features ---------------------------------------
+	// Query what the device supports, then enable exactly the subset the engine
+	// can make use of.  Everything here is core in the 1.3 baseline, so this is
+	// a supported/not-supported question, not an extension-string question.
+	// Enabling nothing else keeps driver-side validation cost and the chance of
+	// hitting a buggy optional path to a minimum.
+	VkPhysicalDeviceVulkan13Features have13{};
+	have13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+	VkPhysicalDeviceVulkan12Features have12{};
+	have12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+	have12.pNext = &have13;
+	VkPhysicalDeviceVulkan11Features have11{};
+	have11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+	have11.pNext = &have12;
+	VkPhysicalDeviceFeatures2 have2{};
+	have2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	have2.pNext = &have11;
+	vkGetPhysicalDeviceFeatures2(m_physDevice, &have2);
+
+	VkPhysicalDeviceVulkan13Properties props13{};
+	props13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES;
+	VkPhysicalDeviceProperties2 props2{};
+	props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+	props2.pNext = &props13;
+	vkGetPhysicalDeviceProperties2(m_physDevice, &props2);
+
+	m_caps = DeviceCaps{};
+	m_caps.subgroupSizeControl  = have13.subgroupSizeControl;
+	m_caps.computeFullSubgroups = have13.computeFullSubgroups;
+	m_caps.synchronization2     = have13.synchronization2;
+	m_caps.timelineSemaphore    = have12.timelineSemaphore;
+	m_caps.storageBuffer8       = have12.storageBuffer8BitAccess;
+	m_caps.shaderInt8           = have12.shaderInt8;
+	m_caps.storageBuffer16      = have11.storageBuffer16BitAccess;
+	m_caps.shaderInt16          = have2.features.shaderInt16;
+	m_caps.minSubgroupSize      = props13.minSubgroupSize;
+	m_caps.maxSubgroupSize      = props13.maxSubgroupSize;
+
+	VkPhysicalDeviceVulkan13Features en13{};
+	en13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+	en13.subgroupSizeControl  = m_caps.subgroupSizeControl;
+	en13.computeFullSubgroups = m_caps.computeFullSubgroups;
+	en13.synchronization2     = m_caps.synchronization2;
+	VkPhysicalDeviceVulkan12Features en12{};
+	en12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+	en12.pNext = &en13;
+	en12.timelineSemaphore      = m_caps.timelineSemaphore;
+	en12.storageBuffer8BitAccess = m_caps.storageBuffer8;
+	en12.shaderInt8             = m_caps.shaderInt8;
+	VkPhysicalDeviceVulkan11Features en11{};
+	en11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+	en11.pNext = &en12;
+	en11.storageBuffer16BitAccess = m_caps.storageBuffer16;
+	VkPhysicalDeviceFeatures2 en2{};
+	en2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	en2.pNext = &en11;
+	en2.features.shaderInt16 = m_caps.shaderInt16;
+
 	VkDeviceCreateInfo devInfo{};
 	devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 	devInfo.queueCreateInfoCount = (uint32_t)queueInfos.size();
 	devInfo.pQueueCreateInfos = queueInfos.data();
+	// pEnabledFeatures must stay null when a VkPhysicalDeviceFeatures2 is chained.
+	devInfo.pNext = &en2;
 	VK_CHECK(vkCreateDevice(m_physDevice, &devInfo, nullptr, &m_device));
 
 	vkGetDeviceQueue(m_device, m_computeQueueFamily, 0, &m_computeQueue);
