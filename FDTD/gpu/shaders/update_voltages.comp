@@ -58,25 +58,32 @@ void main()
     float vv2 = vv_comp[2u * numComp + oi];
     float vi2 = vi_comp[2u * numComp + oi];
 
-    // --- Component 0 (x) ---
-    // curl_x = curr_z(x,y,z) - curr_z(x,ym,z) - curr_y(x,y,z) + curr_y(x,y,zm)
     uint base = x * sYZ;
-    uint idx0 = base + y * Nz + z;
-    float curl0 = curr[2u*N + base + y*Nz + z ] - curr[2u*N + base + ym*Nz + z ]
-                - curr[   N + base + y*Nz + z ] + curr[   N + base + y*Nz  + zm];
-    volt[idx0] = fma(vv0, volt[idx0], vi0 * curl0);
+    uint here = base + y * Nz + z;
 
-    // --- Component 1 (y) ---
+    // H at "here": each of the three components feeds two of the three curls
+    // below.  Load each once -- see the header note on load reuse.
+    float cx = curr[       here];
+    float cy = curr[   N + here];
+    float cz = curr[2u*N + here];
+
+    // All three curls are formed before the first store: a store to volt[]
+    // would otherwise force a reload of curr[] on any compiler that cannot
+    // prove the two storage buffers do not alias.
+    // curl_x = curr_z(x,y,z) - curr_z(x,ym,z) - curr_y(x,y,z) + curr_y(x,y,zm)
+    float curl0 = cz - curr[2u*N + base + ym*Nz + z ]
+                - cy + curr[   N + base + y*Nz  + zm];
     // curl_y = curr_x(x,y,z) - curr_x(x,y,zm) - curr_z(x,y,z) + curr_z(xm,y,z)
-    uint idx1 = N + base + y * Nz + z;
-    float curl1 = curr[          base + y*Nz + z ] - curr[          base + y*Nz + zm]
-                - curr[2u*N    + base + y*Nz + z ] + curr[2u*N + xm*sYZ + y*Nz + z ];
-    volt[idx1] = fma(vv1, volt[idx1], vi1 * curl1);
-
-    // --- Component 2 (z) ---
+    float curl1 = cx - curr[          base + y*Nz + zm]
+                - cz + curr[2u*N + xm*sYZ + y*Nz + z ];
     // curl_z = curr_y(x,y,z) - curr_y(xm,y,z) - curr_x(x,y,z) + curr_x(x,ym,z)
-    uint idx2 = 2u*N + base + y * Nz + z;
-    float curl2 = curr[   N + base + y*Nz + z ] - curr[   N + xm*sYZ + y*Nz + z ]
-                - curr[        base + y*Nz + z ] + curr[        base + ym*Nz + z];
+    float curl2 = cy - curr[   N + xm*sYZ + y*Nz + z ]
+                - cx + curr[        base + ym*Nz + z];
+
+    uint idx0 = here;
+    uint idx1 = N + here;
+    uint idx2 = 2u*N + here;
+    volt[idx0] = fma(vv0, volt[idx0], vi0 * curl0);
+    volt[idx1] = fma(vv1, volt[idx1], vi1 * curl1);
     volt[idx2] = fma(vv2, volt[idx2], vi2 * curl2);
 }

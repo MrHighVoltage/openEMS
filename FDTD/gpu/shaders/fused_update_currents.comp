@@ -101,6 +101,25 @@ void main()
     float ii2 = ii_comp[2u * numComp + oi];
     float iv2 = iv_comp[2u * numComp + oi];
 
+    // E at "here": each component feeds two of the three curls, and the curl
+    // expressions were previously spelled out twice per component (PML and
+    // non-PML branch).  Compute all three once, guarded by inYeeDomain so the
+    // +Nz / +sYZ / +1 neighbour taps are never read outside the Yee domain.
+    float curl0 = 0.0, curl1 = 0.0, curl2 = 0.0;
+    if (inYeeDomain)
+    {
+        float vx = volt[       base];
+        float vy = volt[   N + base];
+        float vz = volt[2u*N + base];
+
+        curl0 = vz - volt[2u*N + base + Nz  ]
+              - vy + volt[   N + base + 1   ];
+        curl1 = vx - volt[        base + 1   ]
+              - vz + volt[2u*N  + base + sYZ];
+        curl2 = vy - volt[   N + base + sYZ]
+              - vx + volt[        base + Nz ];
+    }
+
     // ====================================================================
     // Component 0 (x)
     // ====================================================================
@@ -123,8 +142,6 @@ void main()
             float yee_result;
             if (inYeeDomain)
             {
-                float curl0 = volt[2u*N + base      ] - volt[2u*N + base + Nz    ]
-                             - volt[   N + base      ] + volt[   N + base + 1     ];
                 yee_result = fma(ii0, temp, iv0 * curl0);
             }
             else
@@ -138,8 +155,6 @@ void main()
         }
         else if (inYeeDomain)
         {
-            float curl0 = volt[2u*N + base      ] - volt[2u*N + base + Nz    ]
-                         - volt[   N + base      ] + volt[   N + base + 1     ];
             curr[gi] = fma(ii0, curr[gi], iv0 * curl0);
         }
     }
@@ -164,8 +179,6 @@ void main()
             float yee_result;
             if (inYeeDomain)
             {
-                float curl1 = volt[        base      ] - volt[        base + 1     ]
-                             - volt[2u*N  + base      ] + volt[2u*N  + base + sYZ  ];
                 yee_result = fma(ii1, temp, iv1 * curl1);
             }
             else
@@ -178,8 +191,6 @@ void main()
         }
         else if (inYeeDomain)
         {
-            float curl1 = volt[        base      ] - volt[        base + 1     ]
-                         - volt[2u*N  + base      ] + volt[2u*N  + base + sYZ  ];
             curr[gi] = fma(ii1, curr[gi], iv1 * curl1);
         }
     }
@@ -204,8 +215,6 @@ void main()
             float yee_result;
             if (inYeeDomain)
             {
-                float curl2 = volt[   N + base      ] - volt[   N + base + sYZ  ]
-                             - volt[        base      ] + volt[        base + Nz   ];
                 yee_result = fma(ii2, temp, iv2 * curl2);
             }
             else
@@ -218,8 +227,6 @@ void main()
         }
         else if (inYeeDomain)
         {
-            float curl2 = volt[   N + base      ] - volt[   N + base + sYZ  ]
-                         - volt[        base      ] + volt[        base + Nz   ];
             curr[gi] = fma(ii2, curr[gi], iv2 * curl2);
         }
     }

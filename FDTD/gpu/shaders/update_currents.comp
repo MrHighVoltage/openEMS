@@ -60,24 +60,27 @@ void main()
     float ii2 = ii_comp[2u * numComp + oi];
     float iv2 = iv_comp[2u * numComp + oi];
 
-    // --- Component 0 (x) ---
+    // E at "here": each of the three components feeds two of the three curls
+    // below.  Load each once, and form all three curls before the first store
+    // so no compiler has to reload volt[] across a store to curr[].
+    float vx = volt[       base];
+    float vy = volt[   N + base];
+    float vz = volt[2u*N + base];
+
     // curl_x = volt_z(x,y,z) - volt_z(x,y+1,z) - volt_y(x,y,z) + volt_y(x,y,z+1)
-    uint idx0 = base;
-    float curl0 = volt[2u*N + base      ] - volt[2u*N + base + Nz    ]
-                - volt[   N + base      ] + volt[   N + base + 1     ];
-    curr[idx0] = fma(ii0, curr[idx0], iv0 * curl0);
-
-    // --- Component 1 (y) ---
+    float curl0 = vz - volt[2u*N + base + Nz  ]
+                - vy + volt[   N + base + 1   ];
     // curl_y = volt_x(x,y,z) - volt_x(x,y,z+1) - volt_z(x,y,z) + volt_z(x+1,y,z)
-    uint idx1 = N + base;
-    float curl1 = volt[        base      ] - volt[        base + 1     ]
-                - volt[2u*N  + base      ] + volt[2u*N  + base + sYZ  ];
-    curr[idx1] = fma(ii1, curr[idx1], iv1 * curl1);
-
-    // --- Component 2 (z) ---
+    float curl1 = vx - volt[        base + 1   ]
+                - vz + volt[2u*N  + base + sYZ];
     // curl_z = volt_y(x,y,z) - volt_y(x+1,y,z) - volt_x(x,y,z) + volt_x(x,y+1,z)
+    float curl2 = vy - volt[   N + base + sYZ]
+                - vx + volt[        base + Nz ];
+
+    uint idx0 = base;
+    uint idx1 = N + base;
     uint idx2 = 2u*N + base;
-    float curl2 = volt[   N + base      ] - volt[   N + base + sYZ  ]
-                - volt[        base      ] + volt[        base + Nz   ];
+    curr[idx0] = fma(ii0, curr[idx0], iv0 * curl0);
+    curr[idx1] = fma(ii1, curr[idx1], iv1 * curl1);
     curr[idx2] = fma(ii2, curr[idx2], iv2 * curl2);
 }

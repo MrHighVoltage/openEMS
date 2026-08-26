@@ -109,16 +109,28 @@ void main()
     uint ym = max(y, 1u) - 1u;
     uint zm = max(z, 1u) - 1u;
     uint base = x * sYZ;
+    uint here = base + y * Nz + z;
+
+    // H at "here": each component feeds two of the three curls.  Load once,
+    // and form all three curls up front -- the per-component blocks below
+    // store to volt[] and volt_flux[], and a compiler that cannot prove those
+    // do not alias curr[] would otherwise reload these taps after every store.
+    float cx = curr[       here];
+    float cy = curr[   N + here];
+    float cz = curr[2u*N + here];
+
+    float curl0 = cz - curr[2u*N + base + ym*Nz + z ]
+                - cy + curr[   N + base + y*Nz  + zm];
+    float curl1 = cx - curr[          base + y*Nz + zm]
+                - cz + curr[2u*N + xm*sYZ + y*Nz + z ];
+    float curl2 = cy - curr[   N + xm*sYZ + y*Nz + z ]
+                - cx + curr[        base + ym*Nz + z];
 
     // ====================================================================
     // Component 0 (x)
     // ====================================================================
     {
-        uint gi = base + y * Nz + z;  // global field index (component 0)
-
-        // Curl of H for x-component
-        float curl0 = curr[2u*N + base + y*Nz + z ] - curr[2u*N + base + ym*Nz + z ]
-                     - curr[   N + base + y*Nz + z ] + curr[   N + base + y*Nz  + zm];
+        uint gi = here;  // global field index (component 0)
 
         if (pmlIdx >= 0)
         {
@@ -147,10 +159,7 @@ void main()
     // Component 1 (y)
     // ====================================================================
     {
-        uint gi = N + base + y * Nz + z;
-
-        float curl1 = curr[          base + y*Nz + z ] - curr[          base + y*Nz + zm]
-                     - curr[2u*N    + base + y*Nz + z ] + curr[2u*N + xm*sYZ + y*Nz + z ];
+        uint gi = N + here;
 
         if (pmlIdx >= 0)
         {
@@ -175,10 +184,7 @@ void main()
     // Component 2 (z)
     // ====================================================================
     {
-        uint gi = 2u*N + base + y * Nz + z;
-
-        float curl2 = curr[   N + base + y*Nz + z ] - curr[   N + xm*sYZ + y*Nz + z ]
-                     - curr[        base + y*Nz + z ] + curr[        base + ym*Nz + z];
+        uint gi = 2u*N + here;
 
         if (pmlIdx >= 0)
         {
