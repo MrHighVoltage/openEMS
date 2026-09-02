@@ -69,6 +69,16 @@ public:
 
 	virtual Engine_Extension* CreateEngineExtention();
 
+	//! Free the six coefficient arrays after an engine has taken ownership.
+	/*!
+		Engine_Ext_UPML's AVX2 path repacks these into the engine's f8vector
+		z-lane layout, which is a permutation of the same values. Releasing the
+		originals keeps the memory footprint unchanged. Once released, this
+		extension can no longer create a second engine extension -- rebuild the
+		operator instead.
+	*/
+	void ReleaseCoeffArrays();
+
 	virtual std::string GetExtensionName() const
 	{
 		return std::string("Uniaxial PML Extension");
@@ -94,6 +104,8 @@ protected:
 
 	std::string m_GradFunc;
 	FunctionParser* m_GradingFunction;
+
+	bool m_CoeffReleased;
 
 	void CalcGradingKappa(int ny, unsigned int pos[3], double Zm, double kappa_v[3], double kappa_i[3], FunctionParser* gradingFunction);
 	bool BuildExtension_Range(unsigned int xStart, unsigned int xStop, FunctionParser* gradingFunction);

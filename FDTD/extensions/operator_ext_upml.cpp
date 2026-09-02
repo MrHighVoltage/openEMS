@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <stdexcept>
 #include <thread>
 
 using namespace std;
@@ -30,6 +31,7 @@ using namespace std;
 Operator_Ext_UPML::Operator_Ext_UPML(Operator* op) : Operator_Extension(op)
 {
 	setlocale(LC_NUMERIC, "en_US.UTF-8");
+	m_CoeffReleased = false;
 	m_GradingFunction = new FunctionParser();
 	//default grading function
 	SetGradingFunction(" -log(1e-6)*log(2.5)/(2*dl*Z*(pow(2.5,W/dl)-1)) * pow(2.5, D/dl) ");
@@ -445,6 +447,8 @@ bool Operator_Ext_UPML::BuildExtension()
 	if (m_Op==NULL)
 		return false;
 
+	m_CoeffReleased = false;
+
 	vv.Init("vv", m_numLines);
 	vvfo.Init("vvfo", m_numLines);
 	vvfn.Init("vvfn", m_numLines);
@@ -498,8 +502,25 @@ bool Operator_Ext_UPML::BuildExtension()
 	return success;
 }
 
+void Operator_Ext_UPML::ReleaseCoeffArrays()
+{
+	vv.Reset();
+	vvfo.Reset();
+	vvfn.Reset();
+	ii.Reset();
+	iifo.Reset();
+	iifn.Reset();
+	m_CoeffReleased = true;
+}
+
 Engine_Extension* Operator_Ext_UPML::CreateEngineExtention()
 {
+	if (m_CoeffReleased)
+		throw runtime_error(
+		    "Operator_Ext_UPML: the coefficient arrays were handed over to an "
+		    "earlier engine; rebuild the operator before creating another one."
+		);
+
 	Engine_Ext_UPML* eng_ext = new Engine_Ext_UPML(this);
 	return eng_ext;
 }

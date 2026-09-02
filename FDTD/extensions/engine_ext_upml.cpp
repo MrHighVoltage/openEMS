@@ -28,6 +28,18 @@ Engine_Ext_UPML::Engine_Ext_UPML(Operator_Ext_UPML* op_ext) : Engine_Extension(o
 	//this ABC extension should be executed first!
 	m_Priority = ENG_EXT_PRIO_UPML;
 
+#if OPENEMS_ENABLE_AVX2
+	m_avx2_packed = false;
+	m_v_numVectors = 0;
+	m_v_pNy = 0;
+	m_v_sx = m_v_sy = 0;
+	m_v_vs_y = m_v_vs_x = 0;
+	m_v_e_vs_y = m_v_e_vs_x = 0;
+	m_v_vv = m_v_vvfo = m_v_vvfn = NULL;
+	m_v_ii = m_v_iifo = m_v_iifn = NULL;
+	m_v_volt_flux = m_v_curr_flux = NULL;
+#endif
+
 	volt_flux.Init("volt_flux", m_Op_UPML->m_numLines);
 	curr_flux.Init("curr_flux", m_Op_UPML->m_numLines);
 
@@ -36,6 +48,19 @@ Engine_Ext_UPML::Engine_Ext_UPML(Operator_Ext_UPML* op_ext) : Engine_Extension(o
 
 Engine_Ext_UPML::~Engine_Ext_UPML()
 {
+#if OPENEMS_ENABLE_AVX2
+	ReleaseAVX2Layout();
+#endif
+}
+
+void Engine_Ext_UPML::SetEngine(Engine* eng)
+{
+	Engine_Extension::SetEngine(eng);
+#if OPENEMS_ENABLE_AVX2
+	// Repack into the engine's f8vector layout where the box allows it.
+	// Failure is not fatal -- the scalar path stays valid.
+	m_avx2_packed = BuildAVX2Layout();
+#endif
 }
 
 void Engine_Ext_UPML::SetNumberOfThreads(int nrThread)
@@ -94,6 +119,13 @@ void Engine_Ext_UPML::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPreVoltageUpdates(int threadID)
 {
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPreVoltageUpdatesAVX2(threadID);
+		return;
+	}
+#endif
 	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, threadID);
 }
 
@@ -138,6 +170,13 @@ void Engine_Ext_UPML::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPostVoltageUpdates(int threadID)
 {
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPostVoltageUpdatesAVX2(threadID);
+		return;
+	}
+#endif
 	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, threadID);
 }
 
@@ -186,6 +225,13 @@ void Engine_Ext_UPML::DoPreCurrentUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPreCurrentUpdates(int threadID)
 {
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPreCurrentUpdatesAVX2(threadID);
+		return;
+	}
+#endif
 	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, threadID);
 }
 
@@ -230,5 +276,12 @@ void Engine_Ext_UPML::DoPostCurrentUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPostCurrentUpdates(int threadID)
 {
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPostCurrentUpdatesAVX2(threadID);
+		return;
+	}
+#endif
 	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, threadID);
 }
