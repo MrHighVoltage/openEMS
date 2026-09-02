@@ -20,6 +20,7 @@ whole module is skipped otherwise (see gpu_test_utils.gpu_engine_available).
 
 import os
 import sys
+import re
 import tempfile
 import unittest
 
@@ -82,6 +83,51 @@ def _new_domain(NrTS, boundary, excite_freq=None, sinus_freq=None):
     mesh.AddLine("y", list(range(N + 1)))
     mesh.AddLine("z", list(range(N + 1)))
     return FDTD, CSX, mesh
+
+
+def _new_graded_domain(NrTS, boundary, excite_freq, ratio=1.02):
+    """Same cube, but with geometrically graded cell sizes.
+
+    Each cell is `ratio` times its predecessor, which makes the per-cell
+    operator coefficients (they scale with the local edge length and area)
+    almost all distinct. That is what drives Operator_Vulkan::CompressOperator
+    into its one-entry-per-cell mode, so these are the meshes that exercise the
+    OPIDX_BITS == 0 shader path. The grading is geometric rather than a power
+    law so no cell is degenerately thin -- that would shrink the timestep to
+    the point where nothing propagates in the timesteps we run.
+    """
+    FDTD = openEMS(NrTS=NrTS, EndCriteria=1e-300)
+    f0, fc = excite_freq
+    FDTD.SetGaussExcite(f0, fc)
+    FDTD.SetBoundaryCond(boundary)
+
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(UNIT)
+    steps = np.cumsum(np.concatenate([[0.0], ratio ** np.arange(N)]))
+    for axis in ("x", "y", "z"):
+        mesh.AddLine(axis, list(steps))
+    return FDTD, CSX, mesh, steps
+
+
+def _exc_box(steps):
+    """Source spanning one cell in z, centred in the grid.
+
+    It has to span a cell rather than being a single point: on a graded mesh
+    the coordinates are floats, and a zero-volume box does not reliably snap to
+    a mesh line -- openEMS then reports "Unused primitive" and excites nothing,
+    which would make every comparison below pass vacuously.
+    """
+    mid = N // 2
+    return ([steps[mid]] * 3, [steps[mid], steps[mid], steps[mid + 1]])
+
+
+def _probe_box(steps):
+    """Voltage probe two cells from the source, where the signal is strong."""
+    mid = N // 2
+    return ([steps[mid], steps[mid], steps[mid + 1]],
+            [steps[mid], steps[mid], steps[mid + 3]])
 
 
 def _run_and_read_probe(engine, sim_tag, build_fn, probe_name):
@@ -188,6 +234,160 @@ class Test_GPU_vs_CPU(unittest.TestCase):
             probe.AddBox([N // 2 - 1, N // 2, N // 2], [N // 2 + 1, N // 2, N // 2])
             return FDTD, CSX, mesh
         self._compare("condsheet", build, "probe_i.dat")
+
+
+    def test_graded_mesh_pml(self):
+        """Graded mesh + PML: the one-entry-per-cell operator path, vs CPU."""
+        def build():
+            FDTD, CSX, mesh, steps = _new_graded_domain(
+                NrTS=250, boundary=["PML_8"] * 6, excite_freq=(2e9, 1e9))
+            exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox(_exc_box(steps)[0], _exc_box(steps)[1])
+            probe = CSX.AddProbe("probe_v.dat", p_type=0)
+            probe.AddBox(_probe_box(steps)[0], _probe_box(steps)[1])
+            return FDTD, CSX, mesh
+        self._compare("graded_pml", build, "probe_v.dat")
+
+    def test_graded_mesh_pec(self):
+        """Graded mesh in a closed PEC box, vs CPU."""
+        def build():
+            FDTD, CSX, mesh, steps = _new_graded_domain(
+                NrTS=250, boundary=[0] * 6, excite_freq=(2e9, 1e9))
+            exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox(_exc_box(steps)[0], _exc_box(steps)[1])
+            probe = CSX.AddProbe("probe_v.dat", p_type=0)
+            probe.AddBox(_probe_box(steps)[0], _probe_box(steps)[1])
+            return FDTD, CSX, mesh
+        self._compare("graded_pec", build, "probe_v.dat")
+
+@unittest.skipUnless(gtu.gpu_engine_available(), "GPU engine not available in this build")
+class Test_GPU_OperatorCompression(unittest.TestCase):
+    """Operator_Vulkan::CompressOperator picks between two storage modes.
+
+    Deduplicating the per-cell coefficients is a large win while the unique
+    table stays cache-resident, and a large loss once it does not: the shaders
+    reach the coefficients through six independent gathers per cell, so an
+    oversized table turns each cell into six scattered cache lines. Graded
+    meshes make nearly every cell unique and used to hit exactly that case.
+    The operator therefore falls back to storing one entry per cell, with the
+    per-cell index dropped entirely (OPIDX_BITS == 0).
+
+    Which mode is chosen must never change the numbers -- the two hold the same
+    coefficients in different order -- so these tests force each mode via
+    OPENEMS_GPU_COMPRESS_MAX_TABLE_KB and require bit-identical results.
+    """
+
+    def _build_graded(self, boundary):
+        FDTD, CSX, mesh, steps = _new_graded_domain(
+            NrTS=250, boundary=boundary, excite_freq=(2e9, 1e9))
+        exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+        exc.AddBox(_exc_box(steps)[0], _exc_box(steps)[1])
+        probe = CSX.AddProbe("probe_v.dat", p_type=0)
+        probe.AddBox(_probe_box(steps)[0], _probe_box(steps)[1])
+        return FDTD, CSX, mesh
+
+    def _run(self, tag, boundary, max_table_kb):
+        """Run on the GPU with the table budget forced, returning (values, log)."""
+        prev = os.environ.get("OPENEMS_GPU_COMPRESS_MAX_TABLE_KB")
+        os.environ["OPENEMS_GPU_COMPRESS_MAX_TABLE_KB"] = str(max_table_kb)
+        try:
+            with gtu.capture_c_stdout() as captured:
+                vals = _run_and_read_probe(
+                    "gpu", tag, lambda: self._build_graded(boundary), "probe_v.dat")
+            return vals, captured.read().decode("utf-8", errors="replace")
+        finally:
+            if prev is None:
+                os.environ.pop("OPENEMS_GPU_COMPRESS_MAX_TABLE_KB", None)
+            else:
+                os.environ["OPENEMS_GPU_COMPRESS_MAX_TABLE_KB"] = prev
+
+    def _assert_modes_agree(self, tag, boundary):
+        # 0 KB forces per-cell storage; a huge budget forces deduplication.
+        percell, percell_log = self._run(tag + "_percell", boundary, 0)
+        dedup, dedup_log = self._run(tag + "_dedup", boundary, 1 << 30)
+
+        # Guard the guard: if the plumbing ever stopped honouring the budget,
+        # both runs would take the same path and agree for the wrong reason.
+        self.assertIn("Uncompressed operator", percell_log,
+                      "expected the per-cell operator path to be selected")
+        self.assertIn("Compressed operator", dedup_log,
+                      "expected the deduplicated operator path to be selected")
+
+        self.assertEqual(percell.shape, dedup.shape)
+        self.assertGreater(float(np.abs(dedup).max()), 0.0,
+                           "probe recorded nothing; the comparison would be vacuous")
+        # Same coefficients, only a different storage order -> bit-identical.
+        self.assertTrue(
+            np.array_equal(percell, dedup),
+            "{}: per-cell and deduplicated operators disagree (max abs diff {:.3g})".format(
+                tag, float(np.abs(percell - dedup).max())))
+
+    def test_modes_agree_pml(self):
+        self._assert_modes_agree("cmp_pml", ["PML_8"] * 6)
+
+    def test_modes_agree_pec(self):
+        self._assert_modes_agree("cmp_pec", [0] * 6)
+
+    def test_graded_mesh_defeats_deduplication(self):
+        """The premise of the fallback: grading makes coefficients near-unique.
+
+        This is the property that decides the storage mode, and unlike the mode
+        itself it does not depend on grid size -- the 20^3 grid used here is far
+        too small for any table to exceed the budget, while the production grids
+        that motivated the fallback are not.
+        """
+        def uniques(build_fn, tag):
+            prev = os.environ.pop("OPENEMS_GPU_COMPRESS_MAX_TABLE_KB", None)
+            try:
+                with gtu.capture_c_stdout() as captured:
+                    _run_and_read_probe("gpu", tag, build_fn, "probe_v.dat")
+                log = captured.read().decode("utf-8", errors="replace")
+            finally:
+                if prev is not None:
+                    os.environ["OPENEMS_GPU_COMPRESS_MAX_TABLE_KB"] = prev
+            match = re.search(r"Compressed operator: (\d+) unique", log)
+            self.assertIsNotNone(match, "no compression line in output for " + tag)
+            return int(match.group(1))
+
+        def uniform_build():
+            FDTD, CSX, mesh = _new_domain(NrTS=100, boundary=[0] * 6,
+                                          excite_freq=(2e9, 1e9))
+            exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox([N // 2, N // 2, N // 2], [N // 2, N // 2, N // 2 + 1])
+            probe = CSX.AddProbe("probe_v.dat", p_type=0)
+            probe.AddBox([N // 2, N // 2, N // 2 + 1], [N // 2, N // 2, N // 2 + 3])
+            return FDTD, CSX, mesh
+
+        cells = (N + 1) ** 3
+        graded = uniques(lambda: self._build_graded([0] * 6), "uniq_graded")
+        uniform = uniques(uniform_build, "uniq_uniform")
+
+        self.assertGreater(graded, 0.5 * cells,
+                           "graded mesh deduplicated to {} of {} cells; the "
+                           "per-cell fallback would never be needed".format(graded, cells))
+        self.assertLess(uniform, 64,
+                        "uniform mesh produced {} unique sets".format(uniform))
+
+    def test_uniform_mesh_keeps_deduplication(self):
+        """A uniform mesh collapses to a handful of sets and must stay compressed."""
+        def build():
+            FDTD, CSX, mesh = _new_domain(NrTS=100, boundary=[0] * 6,
+                                          excite_freq=(2e9, 1e9))
+            exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox([N // 2, N // 2, N // 2], [N // 2, N // 2, N // 2])
+            probe = CSX.AddProbe("probe_v.dat", p_type=0)
+            probe.AddBox([N // 2, N // 2, 2], [N // 2, N // 2, 4])
+            return FDTD, CSX, mesh
+
+        prev = os.environ.pop("OPENEMS_GPU_COMPRESS_MAX_TABLE_KB", None)
+        try:
+            with gtu.capture_c_stdout() as captured:
+                _run_and_read_probe("gpu", "cmp_uniform", build, "probe_v.dat")
+            log = captured.read().decode("utf-8", errors="replace")
+        finally:
+            if prev is not None:
+                os.environ["OPENEMS_GPU_COMPRESS_MAX_TABLE_KB"] = prev
+        self.assertIn("Compressed operator", log)
 
 
 if __name__ == "__main__":

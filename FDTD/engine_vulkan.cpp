@@ -611,9 +611,13 @@ void Engine_Vulkan::Init()
 	cout << "  Field buffer size: " << (m_fieldBufSize / (1024*1024)) << " MB per field" << endl;
 	{
 		const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
-		cout << "  Compressed operator: " << opVk->GetNumCompressed() << " unique coeff sets"
-		     << " (index: " << (m_opIndexBufSize / 1024) << " KB, tables: "
-		     << (4 * m_coeffCompBufSize / 1024) << " KB)" << endl;
+		if (opVk->IsCompressed())
+			cout << "  Compressed operator: " << opVk->GetNumCompressed() << " unique coeff sets"
+			     << " (index: " << (m_opIndexBufSize / 1024) << " KB, tables: "
+			     << (4 * m_coeffCompBufSize / 1024) << " KB)" << endl;
+		else
+			cout << "  Uncompressed operator: one coeff set per cell, no index"
+			     << " (tables: " << (4 * m_coeffCompBufSize / 1024) << " KB)" << endl;
 	}
 	if (m_voltMapped)
 		cout << "  ReBAR active — zero-copy CPU field reads from VRAM" << endl;
@@ -1328,15 +1332,28 @@ void Engine_Vulkan::CreateBuffers()
 	// span the whole range -- 6 unique sets for a uniform benchmark mesh, 113
 	// for Coax, 645/1565/6626 for the stripline and CPW tests -- so all three
 	// widths earn their place.
-	if (numComp <= 0x100u)
+	// Width 0 is the operator's "deduplication did not pay" mode: the tables
+	// hold one entry per cell, the index is the identity, and nothing is
+	// uploaded for it -- fetchOpIdx() returns the cell number. The buffer is
+	// still created at minimum size so the descriptor set stays valid.
+	if (!opVk->IsCompressed())
+		m_opIdxBits = 0;
+	else if (numComp <= 0x100u)
 		m_opIdxBits = 8;
 	else if (numComp <= 0x10000u)
 		m_opIdxBits = 16;
 	else
 		m_opIdxBits = 32;
-	const size_t opIdxPerWord = 32u / m_opIdxBits;
-	// Round up to whole dwords: fetchOpIdx() always loads a full dword.
-	m_opIndexBufSize = (VkDeviceSize)((N + opIdxPerWord - 1) / opIdxPerWord) * sizeof(uint32_t);
+	if (m_opIdxBits == 0)
+	{
+		m_opIndexBufSize = sizeof(uint32_t);
+	}
+	else
+	{
+		const size_t opIdxPerWord = 32u / m_opIdxBits;
+		// Round up to whole dwords: fetchOpIdx() always loads a full dword.
+		m_opIndexBufSize = (VkDeviceSize)((N + opIdxPerWord - 1) / opIdxPerWord) * sizeof(uint32_t);
+	}
 	m_coeffCompBufSize = 3 * numComp * sizeof(float);
 	CreateBufferWithMemory(m_opIndexBufSize,  devRO, dLoc, m_opIndexBuf,  m_opIndexMem);
 	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_vvCompBuf, m_vvCompMem);
@@ -1584,7 +1601,11 @@ void Engine_Vulkan::DownloadFromDeviceBuffer(VkBuffer src, void* data, VkDeviceS
 void Engine_Vulkan::UploadCoefficients()
 {
 	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
-	if (m_opIdxBits == 32)
+	if (m_opIdxBits == 0)
+	{
+		// Identity index: the shaders never read the buffer.
+	}
+	else if (m_opIdxBits == 32)
 	{
 		UploadToDeviceBuffer(m_opIndexBuf, opVk->GetOpIndex(), m_opIndexBufSize);
 	}
