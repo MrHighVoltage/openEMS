@@ -130,7 +130,7 @@ def _probe_box(steps):
             [steps[mid], steps[mid], steps[mid + 3]])
 
 
-def _run_and_read_probe(engine, sim_tag, build_fn, probe_name):
+def _run_and_read_probe(engine, sim_tag, build_fn, probe_name, extra_opts=None):
     """build_fn(FDTD, CSX, mesh) -> None; adds excitation/extension/probe.
 
     Returns the probe's recorded columns (time excluded) as a flat float array.
@@ -140,6 +140,8 @@ def _run_and_read_probe(engine, sim_tag, build_fn, probe_name):
     run_opts = {"cleanup": True, "engine": engine}
     if engine == "gpu":
         run_opts["gpu_no_rebar_fields"] = False
+    if extra_opts:
+        run_opts.update(extra_opts)
     FDTD.Run(sim_path, **run_opts)
 
     _, data = gtu.load_probe_file(os.path.join(sim_path, probe_name))
@@ -388,6 +390,95 @@ class Test_GPU_OperatorCompression(unittest.TestCase):
             if prev is not None:
                 os.environ["OPENEMS_GPU_COMPRESS_MAX_TABLE_KB"] = prev
         self.assertIn("Compressed operator", log)
+
+
+@unittest.skipUnless(gtu.gpu_engine_available(), "GPU engine not available in this build")
+class Test_GPU_UPMLCoefficientTables(unittest.TestCase):
+    """The UPML coefficients are deduplicated into shared tables + a narrow index.
+
+    They follow the grading profile (a function of depth into the PML) and the
+    local material, so they hardly vary across the transverse plane: an 80^3
+    PML_8 grid has 821016 coefficient entries and a few hundred distinct
+    tuples, and mesh grading barely changes that -- unlike the Yee operator
+    table (see Test_GPU_OperatorCompression). Deduplicating them turns ~19 MB
+    of per-timestep coefficient traffic into ~1.6 MB of index.
+
+    The same tables and index feed both the fused Yee+UPML kernels and the
+    separate-dispatch fallback, so the two must still agree exactly.
+    """
+
+    def _build(self, boundary, graded):
+        if graded:
+            FDTD, CSX, mesh, steps = _new_graded_domain(
+                NrTS=250, boundary=boundary, excite_freq=(2e9, 1e9))
+            exc_lo, exc_hi = _exc_box(steps)
+            pr_lo, pr_hi = _probe_box(steps)
+        else:
+            FDTD, CSX, mesh = _new_domain(NrTS=250, boundary=boundary,
+                                          excite_freq=(2e9, 1e9))
+            mid = N // 2
+            exc_lo, exc_hi = [mid] * 3, [mid, mid, mid + 1]
+            pr_lo, pr_hi = [mid, mid, mid + 1], [mid, mid, mid + 3]
+        exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+        exc.AddBox(exc_lo, exc_hi)
+        probe = CSX.AddProbe("probe_v.dat", p_type=0)
+        probe.AddBox(pr_lo, pr_hi)
+        return FDTD, CSX, mesh
+
+    def _run(self, tag, boundary, graded, fused, extra_opts=None):
+        prev = os.environ.get("OPENEMS_GPU_DISABLE_FUSED_UPML")
+        if fused:
+            os.environ.pop("OPENEMS_GPU_DISABLE_FUSED_UPML", None)
+        else:
+            os.environ["OPENEMS_GPU_DISABLE_FUSED_UPML"] = "1"
+        try:
+            with gtu.capture_c_stdout() as captured:
+                vals = _run_and_read_probe(
+                    "gpu", tag, lambda: self._build(boundary, graded),
+                    "probe_v.dat", extra_opts=extra_opts)
+            return vals, captured.read().decode("utf-8", errors="replace")
+        finally:
+            os.environ.pop("OPENEMS_GPU_DISABLE_FUSED_UPML", None)
+            if prev is not None:
+                os.environ["OPENEMS_GPU_DISABLE_FUSED_UPML"] = prev
+
+    def _assert_paths_agree(self, tag, graded):
+        fused, fused_log = self._run(tag + "_fused", ["PML_8"] * 6, graded, fused=True)
+        sep, sep_log = self._run(tag + "_sep", ["PML_8"] * 6, graded, fused=False)
+
+        # Guard the guard: without this, a change that silently stopped
+        # honouring the switch would make both runs the same run.
+        self.assertIn("Fused Yee+UPML kernels active", fused_log)
+        self.assertIn("fused UPML disabled by environment", sep_log)
+
+        self.assertEqual(fused.shape, sep.shape)
+        self.assertGreater(float(np.abs(fused).max()), 0.0,
+                           "probe recorded nothing; the comparison would be vacuous")
+        # Same tables, same index, same arithmetic -> bit-identical.
+        self.assertTrue(
+            np.array_equal(fused, sep),
+            "{}: fused and separate-dispatch UPML disagree (max abs diff {:.3g})".format(
+                tag, float(np.abs(fused - sep).max())))
+
+    def test_fused_matches_separate_dispatch_uniform(self):
+        self._assert_paths_agree("upmltab_uniform", graded=False)
+
+    def test_fused_matches_separate_dispatch_graded(self):
+        self._assert_paths_agree("upmltab_graded", graded=True)
+
+    def test_coefficients_are_deduplicated(self):
+        """The premise: PML coefficients collapse to a small shared table."""
+        _, log = self._run("upmltab_stats", ["PML_8"] * 6, graded=True,
+                           fused=True, extra_opts={"verbose": 1})
+        match = re.search(r"UPML coefficients: (\d+) entries -> (\d+) unique", log)
+        self.assertIsNotNone(match, "no UPML coefficient table line in output")
+        entries, unique = int(match.group(1)), int(match.group(2))
+        self.assertGreater(entries, 0)
+        # Even this 20^3 grid should collapse by well over an order of
+        # magnitude; production grids reach several hundred times.
+        self.assertLess(unique * 10, entries,
+                        "UPML coefficients barely deduplicated: {} entries -> {} unique".format(
+                            entries, unique))
 
 
 if __name__ == "__main__":

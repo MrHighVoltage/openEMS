@@ -14,14 +14,37 @@ layout(local_size_x = 256) in;
 
 layout(set=0, binding=0) buffer CurrBuf     { float curr[];      };
 layout(set=0, binding=1) buffer CurrFluxBuf { float curr_flux[];  };
-layout(set=0, binding=2) buffer IIBuf       { float pml_ii[];    };
-layout(set=0, binding=3) buffer IIFOBuf     { float pml_iifo[];  };
+layout(set=0, binding=2) buffer PmlIdxBuf   { uint  pmlCoefIdx[]; };
+layout(set=0, binding=3) buffer IIBuf       { float pml_ii[];    };
+layout(set=0, binding=4) buffer IIFOBuf     { float pml_iifo[];  };
 
 layout(push_constant) uniform PC {
     uint Nx, Ny, Nz;
     uint pNx, pNy, pNz;
     uint pStartX, pStartY, pStartZ;
 };
+
+// --- PML coefficient index -----------------------------------------------
+// The UPML coefficients depend on the grading profile (a function of depth
+// into the PML) and the local material, so they are enormously redundant
+// across the transverse plane: an 80^3 grid with PML_8 on all six sides has
+// 821016 coefficient entries but only ~1100 distinct (vv,vvfo,vvfn,ii,iifo,
+// iifn) tuples, and a graded mesh barely changes that. They are therefore
+// deduplicated into small tables -- small enough to stay cache-resident,
+// unlike the Yee operator table -- with one narrow index per entry. The
+// width is a specialization constant so the driver folds this to a single
+// path at pipeline creation. Packing is little-endian within each dword,
+// matching the host-side packer.
+layout(constant_id = 1) const uint PMLIDX_BITS = 32;
+
+uint fetchPmlIdx(uint cell)
+{
+    if (PMLIDX_BITS == 8u)
+        return bitfieldExtract(pmlCoefIdx[cell >> 2], int((cell & 3u) << 3), 8);
+    if (PMLIDX_BITS == 16u)
+        return bitfieldExtract(pmlCoefIdx[cell >> 1], int((cell & 1u) << 4), 16);
+    return pmlCoefIdx[cell];
+}
 
 void main()
 {
@@ -46,9 +69,10 @@ void main()
     {
         uint gi = g_base;
         uint li = l_base;
+        uint ci = fetchPmlIdx(li);
         float I   = curr[gi];
         float F   = curr_flux[li];
-        float fh  = pml_ii[li] * I - pml_iifo[li] * F;
+        float fh  = pml_ii[ci] * I - pml_iifo[ci] * F;
         curr[gi]      = F;
         curr_flux[li] = fh;
     }
@@ -57,9 +81,10 @@ void main()
     {
         uint gi = N + g_base;
         uint li = pN + l_base;
+        uint ci = fetchPmlIdx(li);
         float I   = curr[gi];
         float F   = curr_flux[li];
-        float fh  = pml_ii[li] * I - pml_iifo[li] * F;
+        float fh  = pml_ii[ci] * I - pml_iifo[ci] * F;
         curr[gi]      = F;
         curr_flux[li] = fh;
     }
@@ -68,9 +93,10 @@ void main()
     {
         uint gi = 2*N + g_base;
         uint li = 2*pN + l_base;
+        uint ci = fetchPmlIdx(li);
         float I   = curr[gi];
         float F   = curr_flux[li];
-        float fh  = pml_ii[li] * I - pml_iifo[li] * F;
+        float fh  = pml_ii[ci] * I - pml_iifo[ci] * F;
         curr[gi]      = F;
         curr_flux[li] = fh;
     }

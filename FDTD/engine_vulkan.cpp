@@ -35,6 +35,7 @@
 
 #include <iostream>
 #include <cstring>
+#include <unordered_map>
 #include <stdexcept>
 #include <functional>
 #include <algorithm>
@@ -91,6 +92,62 @@ static const char* VkResultName(VkResult result)
 			throw std::runtime_error("Vulkan call failed"); \
 		} \
 	} while(0)
+
+// ===========================================================================
+// Narrow index packing
+// ===========================================================================
+
+//! Pack indices into `bits`-wide fields, little-endian within each dword.
+//! Mirrors fetchOpIdx()/fetchPmlIdx() in the shaders, which always load a full
+//! dword, so the buffer is rounded up to whole dwords and the tail stays zero.
+static std::vector<uint32_t> PackNarrowIndices(const uint32_t* src, size_t count,
+                                               uint32_t bits)
+{
+	if (bits == 32)
+		return std::vector<uint32_t>(src, src + count);
+	const uint32_t perWord = 32u / bits;
+	std::vector<uint32_t> packed((count + perWord - 1) / perWord, 0u);
+	for (size_t c = 0; c < count; ++c)
+		packed[c / perWord] |= (src[c] << ((c % perWord) * bits));
+	return packed;
+}
+
+//! Byte size of a `count`-entry index buffer at `bits` per entry, rounded up to
+//! whole dwords. Never zero: a descriptor may not point at an empty range.
+static VkDeviceSize NarrowIndexBufSize(size_t count, uint32_t bits)
+{
+	const size_t perWord = 32u / bits;
+	VkDeviceSize words = (count + perWord - 1) / perWord;
+	if (words == 0) words = 1;
+	return words * sizeof(uint32_t);
+}
+
+//! Deduplication key for one UPML coefficient entry: the six coefficients that
+//! the pre/post voltage and current passes read for a single cell-component.
+//! Compared by bit pattern -- the values are validated finite before this runs.
+namespace {
+struct PmlCoeffKey
+{
+	uint32_t w[6];
+	bool operator==(const PmlCoeffKey& o) const
+	{
+		return std::memcmp(w, o.w, sizeof(w)) == 0;
+	}
+};
+struct PmlCoeffKeyHash
+{
+	size_t operator()(const PmlCoeffKey& k) const
+	{
+		size_t h = 1469598103934665603ull;
+		for (int i = 0; i < 6; ++i)
+		{
+			h ^= k.w[i];
+			h *= 1099511628211ull;
+		}
+		return h;
+	}
+};
+} // namespace
 
 // ===========================================================================
 // Construction / Destruction
@@ -1508,15 +1565,20 @@ void Engine_Vulkan::CreatePipelines()
 	// OPIDX_BITS: the compressed-operator index width is known once the operator
 	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
 	// path at pipeline creation. Shaders declaring no such constant ignore it.
-	VkSpecializationMapEntry opIdxSpecEntry{};
-	opIdxSpecEntry.constantID = 0;
-	opIdxSpecEntry.offset     = 0;
-	opIdxSpecEntry.size       = sizeof(uint32_t);
+	// Index widths are known once the operator and the PML tables exist, so
+	// specialize both here; the driver folds fetchOpIdx()/fetchPmlIdx() to a
+	// single path at pipeline creation. A shader that declares neither, or only
+	// one, simply ignores the entries it does not use.
+	const uint32_t idxBits[2] = {m_opIdxBits, m_pmlIdxBits};
+	VkSpecializationMapEntry opIdxSpecEntry[2] = {
+		{0, 0 * sizeof(uint32_t), sizeof(uint32_t)},
+		{1, 1 * sizeof(uint32_t), sizeof(uint32_t)},
+	};
 	VkSpecializationInfo opIdxSpec{};
-	opIdxSpec.mapEntryCount = 1;
-	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
-	opIdxSpec.dataSize      = sizeof(uint32_t);
-	opIdxSpec.pData         = &m_opIdxBits;
+	opIdxSpec.mapEntryCount = 2;
+	opIdxSpec.pMapEntries   = opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(idxBits);
+	opIdxSpec.pData         = idxBits;
 
 	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
 	{
@@ -1611,14 +1673,10 @@ void Engine_Vulkan::UploadCoefficients()
 	}
 	else
 	{
-		// Pack little-endian within each dword, matching fetchOpIdx() in the
-		// shaders. The tail past N stays zero; no lane ever reads it.
-		const uint32_t* src = opVk->GetOpIndex();
 		const size_t nCells = (size_t)numLines[0] * numLines[1] * numLines[2];
-		const uint32_t perWord = 32u / m_opIdxBits;
-		std::vector<uint32_t> packed((size_t)m_opIndexBufSize / sizeof(uint32_t), 0u);
-		for (size_t c = 0; c < nCells; ++c)
-			packed[c / perWord] |= (src[c] << ((c % perWord) * m_opIdxBits));
+		std::vector<uint32_t> packed =
+			PackNarrowIndices(opVk->GetOpIndex(), nCells, m_opIdxBits);
+		packed.resize((size_t)m_opIndexBufSize / sizeof(uint32_t), 0u);
 		UploadToDeviceBuffer(m_opIndexBuf, packed.data(), m_opIndexBufSize);
 	}
 	UploadToDeviceBuffer(m_vvCompBuf,  opVk->GetVVComp(),  m_coeffCompBufSize);
@@ -1866,7 +1924,7 @@ void Engine_Vulkan::SetupGPUExtensions()
 		{
 			numUPML++;
 			totalDescSets += 4;
-			totalStorageBindings += 14;  // 4+3+4+3
+			totalStorageBindings += 18;  // 5+4+5+4
 		}
 		else if (auto* lor = dynamic_cast<Operator_Ext_LorentzMaterial*>(ext))
 		{
@@ -1996,11 +2054,12 @@ void Engine_Vulkan::CreateExtensionDescriptorLayouts()
 		return layout;
 	};
 
-	// UPML: preVolt=4, postVolt=3, preCurr=4, postCurr=3
-	m_upmlPreVoltDescLayout  = makeLayout(4);
-	m_upmlPostVoltDescLayout = makeLayout(3);
-	m_upmlPreCurrDescLayout  = makeLayout(4);
-	m_upmlPostCurrDescLayout = makeLayout(3);
+	// UPML: preVolt=5, postVolt=4, preCurr=5, postCurr=4
+	// (field, flux, coefficient index, then the coefficient tables that pass reads)
+	m_upmlPreVoltDescLayout  = makeLayout(5);
+	m_upmlPostVoltDescLayout = makeLayout(4);
+	m_upmlPreCurrDescLayout  = makeLayout(5);
+	m_upmlPostCurrDescLayout = makeLayout(4);
 
 	// Dispersive: pre=7 (field, ADE, LorADE, posIdx, int, ext, Lor), apply=3
 	m_dispPreDescLayout   = makeLayout(7);
@@ -2027,15 +2086,20 @@ void Engine_Vulkan::CreateExtensionPipelines()
 	// OPIDX_BITS: the compressed-operator index width is known once the operator
 	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
 	// path at pipeline creation. Shaders declaring no such constant ignore it.
-	VkSpecializationMapEntry opIdxSpecEntry{};
-	opIdxSpecEntry.constantID = 0;
-	opIdxSpecEntry.offset     = 0;
-	opIdxSpecEntry.size       = sizeof(uint32_t);
+	// Index widths are known once the operator and the PML tables exist, so
+	// specialize both here; the driver folds fetchOpIdx()/fetchPmlIdx() to a
+	// single path at pipeline creation. A shader that declares neither, or only
+	// one, simply ignores the entries it does not use.
+	const uint32_t idxBits[2] = {m_opIdxBits, m_pmlIdxBits};
+	VkSpecializationMapEntry opIdxSpecEntry[2] = {
+		{0, 0 * sizeof(uint32_t), sizeof(uint32_t)},
+		{1, 1 * sizeof(uint32_t), sizeof(uint32_t)},
+	};
 	VkSpecializationInfo opIdxSpec{};
-	opIdxSpec.mapEntryCount = 1;
-	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
-	opIdxSpec.dataSize      = sizeof(uint32_t);
-	opIdxSpec.pData         = &m_opIdxBits;
+	opIdxSpec.mapEntryCount = 2;
+	opIdxSpec.pMapEntries   = opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(idxBits);
+	opIdxSpec.pData         = idxBits;
 
 	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
 	{
@@ -2182,6 +2246,12 @@ void Engine_Vulkan::SetupGPU_UPML()
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
+	// One table shared by every region, so an index means the same entry
+	// wherever it is fetched -- the fused path concatenates the regions and
+	// would otherwise need per-region table offsets.
+	std::vector<float> tabVv, tabVvfo, tabVvfn, tabIi, tabIifo, tabIifn;
+	std::unordered_map<PmlCoeffKey, uint32_t, PmlCoeffKeyHash> coeffLookup;
+
 	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
 	{
 		Operator_Extension* ext = Op->GetExtension(eIdx);
@@ -2231,21 +2301,85 @@ void Engine_Vulkan::SetupGPU_UPML()
 			UploadGpuBuf(data.currFlux, zeros.data(), pmlBufSize);
 		}
 
-		// Upload PML coefficient arrays (contiguous [3][pNx][pNy][pNz])
-		CreateGpuBuf(data.pmlVv,   pmlBufSize, usage, dLoc);
-		CreateGpuBuf(data.pmlVvfo, pmlBufSize, usage, dLoc);
-		CreateGpuBuf(data.pmlVvfn, pmlBufSize, usage, dLoc);
-		CreateGpuBuf(data.pmlIi,   pmlBufSize, usage, dLoc);
-		CreateGpuBuf(data.pmlIifo, pmlBufSize, usage, dLoc);
-		CreateGpuBuf(data.pmlIifn, pmlBufSize, usage, dLoc);
-		UploadGpuBuf(data.pmlVv,   upml->vv.data(),   pmlBufSize);
-		UploadGpuBuf(data.pmlVvfo, upml->vvfo.data(), pmlBufSize);
-		UploadGpuBuf(data.pmlVvfn, upml->vvfn.data(), pmlBufSize);
-		UploadGpuBuf(data.pmlIi,   upml->ii.data(),   pmlBufSize);
-		UploadGpuBuf(data.pmlIifo, upml->iifo.data(), pmlBufSize);
-		UploadGpuBuf(data.pmlIifn, upml->iifn.data(), pmlBufSize);
+		// Deduplicate this region's coefficients into the shared table.
+		// The tuple is the six values one cell-component needs across all four
+		// passes, so a single index serves the voltage and current shaders
+		// alike. Redundancy is large and robust: the coefficients follow the
+		// grading profile (a function of depth into the PML) and the local
+		// material, so they barely vary across the transverse plane. Measured
+		// over all six regions of an 80^3 PML_8 grid, 821016 entries collapse
+		// to ~1100 distinct tuples, and geometric mesh grading only takes that
+		// to ~1400 -- unlike the Yee operator table, which grading destroys.
+		data.coefIdx.resize(3u * pN);
+		for (uint32_t c = 0; c < 3u * pN; ++c)
+		{
+			PmlCoeffKey key;
+			const float vals[6] = {upml->vv.data(c),   upml->vvfo.data(c), upml->vvfn.data(c),
+			                       upml->ii.data(c),   upml->iifo.data(c), upml->iifn.data(c)};
+			std::memcpy(key.w, vals, sizeof(key.w));
 
-		// Allocate descriptor sets
+			auto it = coeffLookup.find(key);
+			if (it == coeffLookup.end())
+			{
+				uint32_t idx = (uint32_t)tabVv.size();
+				tabVv.push_back(vals[0]);   tabVvfo.push_back(vals[1]); tabVvfn.push_back(vals[2]);
+				tabIi.push_back(vals[3]);   tabIifo.push_back(vals[4]); tabIifn.push_back(vals[5]);
+				coeffLookup.emplace(key, idx);
+				data.coefIdx[c] = idx;
+			}
+			else
+			{
+				data.coefIdx[c] = it->second;
+			}
+		}
+
+		m_gpuUPML.push_back(std::move(data));
+	}
+
+	m_hasGPU_UPML = !m_gpuUPML.empty();
+	if (!m_hasGPU_UPML)
+		return;
+
+	// ---- Shared coefficient tables -------------------------------------
+	m_pmlTabCount = (uint32_t)tabVv.size();
+	// Narrow the index to the smallest width that can address the table; it is
+	// read once per coefficient entry per pass, so its width is most of the
+	// remaining PML traffic once the coefficients themselves are deduplicated.
+	if (m_pmlTabCount <= 0x100u)
+		m_pmlIdxBits = 8;
+	else if (m_pmlTabCount <= 0x10000u)
+		m_pmlIdxBits = 16;
+	else
+		m_pmlIdxBits = 32;
+
+	m_pmlTabBufSize = (VkDeviceSize)m_pmlTabCount * sizeof(float);
+	auto makeTable = [&](GpuBuf& gb, const std::vector<float>& src)
+	{
+		CreateGpuBuf(gb, m_pmlTabBufSize, usage, dLoc);
+		UploadGpuBuf(gb, src.data(), m_pmlTabBufSize);
+	};
+	makeTable(m_pmlTabVv,   tabVv);
+	makeTable(m_pmlTabVvfo, tabVvfo);
+	makeTable(m_pmlTabVvfn, tabVvfn);
+	makeTable(m_pmlTabIi,   tabIi);
+	makeTable(m_pmlTabIifo, tabIifo);
+	makeTable(m_pmlTabIifn, tabIifn);
+
+	// ---- Per-region index buffers and descriptors ----------------------
+	for (auto& data : m_gpuUPML)
+	{
+		const size_t entries = data.coefIdx.size();
+		data.pmlIdxBufSize = NarrowIndexBufSize(entries, m_pmlIdxBits);
+		CreateGpuBuf(data.pmlIdx, data.pmlIdxBufSize, usage, dLoc);
+		{
+			std::vector<uint32_t> packed =
+				PackNarrowIndices(data.coefIdx.data(), entries, m_pmlIdxBits);
+			packed.resize((size_t)data.pmlIdxBufSize / sizeof(uint32_t), 0u);
+			UploadGpuBuf(data.pmlIdx, packed.data(), data.pmlIdxBufSize);
+		}
+
+		const VkDeviceSize fluxSize = 3 * (VkDeviceSize)data.totalCells * sizeof(FDTD_FLOAT);
+
 		auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
 		{
 			VkDescriptorSetAllocateInfo ai{};
@@ -2263,35 +2397,49 @@ void Engine_Vulkan::SetupGPU_UPML()
 		data.preCurrDesc  = allocDescSet(m_upmlPreCurrDescLayout);
 		data.postCurrDesc = allocDescSet(m_upmlPostCurrDescLayout);
 
-		// Write descriptors: preVolt = [volt, volt_flux, pml_vv, pml_vvfo]
+		// preVolt = [volt, volt_flux, pml_idx, tab_vv, tab_vvfo]
 		{
-			VkBuffer bufs[4]      = {m_voltBuf, data.voltFlux.buffer, data.pmlVv.buffer, data.pmlVvfo.buffer};
-			VkDeviceSize sizes[4] = {m_fieldBufSize, pmlBufSize, pmlBufSize, pmlBufSize};
-			WriteDescriptorBuffers(m_device, data.preVoltDesc, bufs, sizes, 4);
+			VkBuffer bufs[5]      = {m_voltBuf, data.voltFlux.buffer, data.pmlIdx.buffer,
+			                         m_pmlTabVv.buffer, m_pmlTabVvfo.buffer};
+			VkDeviceSize sizes[5] = {m_fieldBufSize, fluxSize, data.pmlIdxBufSize,
+			                         m_pmlTabBufSize, m_pmlTabBufSize};
+			WriteDescriptorBuffers(m_device, data.preVoltDesc, bufs, sizes, 5);
 		}
-		// postVolt = [volt, volt_flux, pml_vvfn]
+		// postVolt = [volt, volt_flux, pml_idx, tab_vvfn]
 		{
-			VkBuffer bufs[3]      = {m_voltBuf, data.voltFlux.buffer, data.pmlVvfn.buffer};
-			VkDeviceSize sizes[3] = {m_fieldBufSize, pmlBufSize, pmlBufSize};
-			WriteDescriptorBuffers(m_device, data.postVoltDesc, bufs, sizes, 3);
+			VkBuffer bufs[4]      = {m_voltBuf, data.voltFlux.buffer, data.pmlIdx.buffer,
+			                         m_pmlTabVvfn.buffer};
+			VkDeviceSize sizes[4] = {m_fieldBufSize, fluxSize, data.pmlIdxBufSize, m_pmlTabBufSize};
+			WriteDescriptorBuffers(m_device, data.postVoltDesc, bufs, sizes, 4);
 		}
-		// preCurr = [curr, curr_flux, pml_ii, pml_iifo]
+		// preCurr = [curr, curr_flux, pml_idx, tab_ii, tab_iifo]
 		{
-			VkBuffer bufs[4]      = {m_currBuf, data.currFlux.buffer, data.pmlIi.buffer, data.pmlIifo.buffer};
-			VkDeviceSize sizes[4] = {m_fieldBufSize, pmlBufSize, pmlBufSize, pmlBufSize};
-			WriteDescriptorBuffers(m_device, data.preCurrDesc, bufs, sizes, 4);
+			VkBuffer bufs[5]      = {m_currBuf, data.currFlux.buffer, data.pmlIdx.buffer,
+			                         m_pmlTabIi.buffer, m_pmlTabIifo.buffer};
+			VkDeviceSize sizes[5] = {m_fieldBufSize, fluxSize, data.pmlIdxBufSize,
+			                         m_pmlTabBufSize, m_pmlTabBufSize};
+			WriteDescriptorBuffers(m_device, data.preCurrDesc, bufs, sizes, 5);
 		}
-		// postCurr = [curr, curr_flux, pml_iifn]
+		// postCurr = [curr, curr_flux, pml_idx, tab_iifn]
 		{
-			VkBuffer bufs[3]      = {m_currBuf, data.currFlux.buffer, data.pmlIifn.buffer};
-			VkDeviceSize sizes[3] = {m_fieldBufSize, pmlBufSize, pmlBufSize};
-			WriteDescriptorBuffers(m_device, data.postCurrDesc, bufs, sizes, 3);
+			VkBuffer bufs[4]      = {m_currBuf, data.currFlux.buffer, data.pmlIdx.buffer,
+			                         m_pmlTabIifn.buffer};
+			VkDeviceSize sizes[4] = {m_fieldBufSize, fluxSize, data.pmlIdxBufSize, m_pmlTabBufSize};
+			WriteDescriptorBuffers(m_device, data.postCurrDesc, bufs, sizes, 4);
 		}
-
-		m_gpuUPML.push_back(std::move(data));
 	}
 
-	m_hasGPU_UPML = !m_gpuUPML.empty();
+	if (g_settings.GetVerboseLevel() > 0)
+	{
+		size_t entries = 0;
+		for (const auto& u : m_gpuUPML) entries += u.coefIdx.size();
+		size_t before = entries * 6 * sizeof(float);
+		size_t after  = (size_t)m_pmlTabCount * 6 * sizeof(float)
+		              + entries * m_pmlIdxBits / 8;
+		cout << "  UPML coefficients: " << entries << " entries -> " << m_pmlTabCount
+		     << " unique (" << (before / 1024) << " KB -> " << (after / 1024)
+		     << " KB, " << m_pmlIdxBits << "-bit index)" << endl;
+	}
 }
 
 void Engine_Vulkan::SetupGPU_Dispersive()
@@ -5070,10 +5218,13 @@ void Engine_Vulkan::CleanupExtensions()
 	for (auto& u : m_gpuUPML)
 	{
 		DestroyGpuBuf(u.voltFlux); DestroyGpuBuf(u.currFlux);
-		DestroyGpuBuf(u.pmlVv);   DestroyGpuBuf(u.pmlVvfo); DestroyGpuBuf(u.pmlVvfn);
-		DestroyGpuBuf(u.pmlIi);   DestroyGpuBuf(u.pmlIifo); DestroyGpuBuf(u.pmlIifn);
+		DestroyGpuBuf(u.pmlIdx);
+		// The coefficient tables are shared with the fused path, not per-region.
 	}
 	m_gpuUPML.clear();
+	DestroyGpuBuf(m_pmlTabVv);   DestroyGpuBuf(m_pmlTabVvfo); DestroyGpuBuf(m_pmlTabVvfn);
+	DestroyGpuBuf(m_pmlTabIi);   DestroyGpuBuf(m_pmlTabIifo); DestroyGpuBuf(m_pmlTabIifn);
+	m_pmlTabCount = 0;
 
 	// --- Destroy dispersive GPU data ---
 	for (auto& d : m_gpuDisp)
@@ -5220,12 +5371,24 @@ void Engine_Vulkan::SetupFusedUPML()
 	// --- Create concatenated buffers ---
 	CreateGpuBuf(m_fusedVoltFlux, fluxBufSize, rwUsage, dLoc);
 	CreateGpuBuf(m_fusedCurrFlux, fluxBufSize, rwUsage, dLoc);
-	CreateGpuBuf(m_fusedPmlVv,    fluxBufSize, usage, dLoc);
-	CreateGpuBuf(m_fusedPmlVvfo,  fluxBufSize, usage, dLoc);
-	CreateGpuBuf(m_fusedPmlVvfn,  fluxBufSize, usage, dLoc);
-	CreateGpuBuf(m_fusedPmlIi,    fluxBufSize, usage, dLoc);
-	CreateGpuBuf(m_fusedPmlIifo,  fluxBufSize, usage, dLoc);
-	CreateGpuBuf(m_fusedPmlIifn,  fluxBufSize, usage, dLoc);
+
+	// The coefficient tables are shared with the separate-dispatch path and
+	// hold global indices, so only the index needs concatenating here.
+	{
+		std::vector<uint32_t> allIdx;
+		allIdx.reserve(3u * (size_t)totalPmlCells);
+		for (const auto& u : m_gpuUPML)
+			allIdx.insert(allIdx.end(), u.coefIdx.begin(), u.coefIdx.end());
+		if (allIdx.size() != 3u * (size_t)totalPmlCells)
+			throw std::runtime_error("Engine_Vulkan::SetupFusedUPML: PML index size mismatch");
+
+		m_fusedPmlIdxBufSize = NarrowIndexBufSize(allIdx.size(), m_pmlIdxBits);
+		CreateGpuBuf(m_fusedPmlIdx, m_fusedPmlIdxBufSize, usage, dLoc);
+		std::vector<uint32_t> packed =
+			PackNarrowIndices(allIdx.data(), allIdx.size(), m_pmlIdxBits);
+		packed.resize((size_t)m_fusedPmlIdxBufSize / sizeof(uint32_t), 0u);
+		UploadGpuBuf(m_fusedPmlIdx, packed.data(), m_fusedPmlIdxBufSize);
+	}
 
 	// --- Upload concatenated data (copy from per-region buffers via staging) ---
 	// Initialize flux to zero
@@ -5235,38 +5398,20 @@ void Engine_Vulkan::SetupFusedUPML()
 		UploadGpuBuf(m_fusedCurrFlux, zeros.data(), fluxBufSize);
 	}
 
-	// Copy every region in one submission; startup latency otherwise scales
-	// with the number of PML faces.
-	RunSingleCommand([&](VkCommandBuffer cmd)
-	{
-		for (size_t ri = 0; ri < m_gpuUPML.size(); ++ri)
-		{
-			const auto& u = m_gpuUPML[ri];
-			VkDeviceSize regionFluxSize = 3 * (VkDeviceSize)u.totalCells * sizeof(float);
-			VkDeviceSize dstOffset = (VkDeviceSize)regions[ri].fluxOffset * sizeof(float);
-			VkBufferCopy copyRegion = {0, dstOffset, regionFluxSize};
-			vkCmdCopyBuffer(cmd, u.pmlVv.buffer,   m_fusedPmlVv.buffer,   1, &copyRegion);
-			vkCmdCopyBuffer(cmd, u.pmlVvfo.buffer, m_fusedPmlVvfo.buffer, 1, &copyRegion);
-			vkCmdCopyBuffer(cmd, u.pmlVvfn.buffer, m_fusedPmlVvfn.buffer, 1, &copyRegion);
-			vkCmdCopyBuffer(cmd, u.pmlIi.buffer,   m_fusedPmlIi.buffer,   1, &copyRegion);
-			vkCmdCopyBuffer(cmd, u.pmlIifo.buffer, m_fusedPmlIifo.buffer, 1, &copyRegion);
-			vkCmdCopyBuffer(cmd, u.pmlIifn.buffer, m_fusedPmlIifn.buffer, 1, &copyRegion);
-		}
-	});
 
 	// --- PML region metadata SSBO ---
 	VkDeviceSize regionInfoSize = regions.size() * sizeof(PMLRegionGPU);
 	CreateGpuBuf(m_fusedPmlRegionInfo, regionInfoSize, usage, dLoc);
 	UploadGpuBuf(m_fusedPmlRegionInfo, regions.data(), regionInfoSize);
 
-	// --- Descriptor set layout (10 bindings) ---
+	// --- Descriptor set layout (11 bindings) ---
 	{
-		std::vector<VkDescriptorSetLayoutBinding> bindings(10);
-		for (uint32_t i = 0; i < 10; i++)
+		std::vector<VkDescriptorSetLayoutBinding> bindings(11);
+		for (uint32_t i = 0; i < 11; i++)
 			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 		VkDescriptorSetLayoutCreateInfo ci{};
 		ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-		ci.bindingCount = 10;
+		ci.bindingCount = 11;
 		ci.pBindings    = bindings.data();
 		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &m_fusedDescLayout));
 	}
@@ -5281,8 +5426,8 @@ void Engine_Vulkan::SetupFusedUPML()
 	pli.pPushConstantRanges    = &pcRange;
 	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_fusedPipeLayout));
 
-	// --- Descriptor pool (2 sets × 10 bindings) ---
-	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 * 2};
+	// --- Descriptor pool (2 sets × 11 bindings) ---
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11 * 2};
 	VkDescriptorPoolCreateInfo pi{};
 	pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	pi.maxSets       = 2;
@@ -5304,49 +5449,54 @@ void Engine_Vulkan::SetupFusedUPML()
 
 	// --- Write fused voltage descriptors ---
 	{
-		VkBuffer bufs[10] = {
+		VkBuffer bufs[11] = {
 			m_voltBuf, m_currBuf, m_opIndexBuf, m_vvCompBuf, m_viCompBuf,
-			m_fusedPmlRegionInfo.buffer, m_fusedVoltFlux.buffer,
-			m_fusedPmlVv.buffer, m_fusedPmlVvfo.buffer, m_fusedPmlVvfn.buffer
+			m_fusedPmlRegionInfo.buffer, m_fusedVoltFlux.buffer, m_fusedPmlIdx.buffer,
+			m_pmlTabVv.buffer, m_pmlTabVvfo.buffer, m_pmlTabVvfn.buffer
 		};
-		VkDeviceSize sizes[10] = {
+		VkDeviceSize sizes[11] = {
 			m_fieldBufSize, m_fieldBufSize, m_opIndexBufSize,
 			m_coeffCompBufSize, m_coeffCompBufSize,
-			regionInfoSize, fluxBufSize,
-			fluxBufSize, fluxBufSize, fluxBufSize
+			regionInfoSize, fluxBufSize, m_fusedPmlIdxBufSize,
+			m_pmlTabBufSize, m_pmlTabBufSize, m_pmlTabBufSize
 		};
-		WriteDescriptorBuffers(m_device, m_fusedVoltDescSet, bufs, sizes, 10);
+		WriteDescriptorBuffers(m_device, m_fusedVoltDescSet, bufs, sizes, 11);
 	}
 
 	// --- Write fused current descriptors ---
 	{
-		VkBuffer bufs[10] = {
+		VkBuffer bufs[11] = {
 			m_currBuf, m_voltBuf, m_opIndexBuf, m_iiCompBuf, m_ivCompBuf,
-			m_fusedPmlRegionInfo.buffer, m_fusedCurrFlux.buffer,
-			m_fusedPmlIi.buffer, m_fusedPmlIifo.buffer, m_fusedPmlIifn.buffer
+			m_fusedPmlRegionInfo.buffer, m_fusedCurrFlux.buffer, m_fusedPmlIdx.buffer,
+			m_pmlTabIi.buffer, m_pmlTabIifo.buffer, m_pmlTabIifn.buffer
 		};
-		VkDeviceSize sizes[10] = {
+		VkDeviceSize sizes[11] = {
 			m_fieldBufSize, m_fieldBufSize, m_opIndexBufSize,
 			m_coeffCompBufSize, m_coeffCompBufSize,
-			regionInfoSize, fluxBufSize,
-			fluxBufSize, fluxBufSize, fluxBufSize
+			regionInfoSize, fluxBufSize, m_fusedPmlIdxBufSize,
+			m_pmlTabBufSize, m_pmlTabBufSize, m_pmlTabBufSize
 		};
-		WriteDescriptorBuffers(m_device, m_fusedCurrDescSet, bufs, sizes, 10);
+		WriteDescriptorBuffers(m_device, m_fusedCurrDescSet, bufs, sizes, 11);
 	}
 
 	// --- Create compute pipelines ---
 	// OPIDX_BITS: the compressed-operator index width is known once the operator
 	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
 	// path at pipeline creation. Shaders declaring no such constant ignore it.
-	VkSpecializationMapEntry opIdxSpecEntry{};
-	opIdxSpecEntry.constantID = 0;
-	opIdxSpecEntry.offset     = 0;
-	opIdxSpecEntry.size       = sizeof(uint32_t);
+	// Index widths are known once the operator and the PML tables exist, so
+	// specialize both here; the driver folds fetchOpIdx()/fetchPmlIdx() to a
+	// single path at pipeline creation. A shader that declares neither, or only
+	// one, simply ignores the entries it does not use.
+	const uint32_t idxBits[2] = {m_opIdxBits, m_pmlIdxBits};
+	VkSpecializationMapEntry opIdxSpecEntry[2] = {
+		{0, 0 * sizeof(uint32_t), sizeof(uint32_t)},
+		{1, 1 * sizeof(uint32_t), sizeof(uint32_t)},
+	};
 	VkSpecializationInfo opIdxSpec{};
-	opIdxSpec.mapEntryCount = 1;
-	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
-	opIdxSpec.dataSize      = sizeof(uint32_t);
-	opIdxSpec.pData         = &m_opIdxBits;
+	opIdxSpec.mapEntryCount = 2;
+	opIdxSpec.pMapEntries   = opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(idxBits);
+	opIdxSpec.pData         = idxBits;
 
 	auto makePipeline = [&](VkShaderModule mod, VkPipelineLayout layout) -> VkPipeline
 	{
@@ -5382,8 +5532,8 @@ void Engine_Vulkan::SetupFusedUPML()
 	for (auto& u : m_gpuUPML)
 	{
 		DestroyGpuBuf(u.voltFlux); DestroyGpuBuf(u.currFlux);
-		DestroyGpuBuf(u.pmlVv);   DestroyGpuBuf(u.pmlVvfo); DestroyGpuBuf(u.pmlVvfn);
-		DestroyGpuBuf(u.pmlIi);   DestroyGpuBuf(u.pmlIifo); DestroyGpuBuf(u.pmlIifn);
+		DestroyGpuBuf(u.pmlIdx);
+		// The coefficient tables are shared with the fused path, not per-region.
 	}
 	cout << "Engine_Vulkan: fused Yee+UPML kernels created ("
 	     << regions.size() << " regions, " << totalPmlCells << " PML cells)" << endl;
@@ -5394,12 +5544,7 @@ void Engine_Vulkan::CleanupFusedUPML()
 	if (m_device == VK_NULL_HANDLE) return;
 	DestroyGpuBuf(m_fusedVoltFlux);
 	DestroyGpuBuf(m_fusedCurrFlux);
-	DestroyGpuBuf(m_fusedPmlVv);
-	DestroyGpuBuf(m_fusedPmlVvfo);
-	DestroyGpuBuf(m_fusedPmlVvfn);
-	DestroyGpuBuf(m_fusedPmlIi);
-	DestroyGpuBuf(m_fusedPmlIifo);
-	DestroyGpuBuf(m_fusedPmlIifn);
+	DestroyGpuBuf(m_fusedPmlIdx);
 	DestroyGpuBuf(m_fusedPmlRegionInfo);
 	if (m_fusedVoltPipeline) { vkDestroyPipeline(m_device, m_fusedVoltPipeline, nullptr); m_fusedVoltPipeline = VK_NULL_HANDLE; }
 	if (m_fusedCurrPipeline) { vkDestroyPipeline(m_device, m_fusedCurrPipeline, nullptr); m_fusedCurrPipeline = VK_NULL_HANDLE; }
@@ -5542,15 +5687,20 @@ void Engine_Vulkan::SetupGPU_FieldValidation()
 	// OPIDX_BITS: the compressed-operator index width is known once the operator
 	// exists, so specialize it here -- the driver folds fetchOpIdx() to a single
 	// path at pipeline creation. Shaders declaring no such constant ignore it.
-	VkSpecializationMapEntry opIdxSpecEntry{};
-	opIdxSpecEntry.constantID = 0;
-	opIdxSpecEntry.offset     = 0;
-	opIdxSpecEntry.size       = sizeof(uint32_t);
+	// Index widths are known once the operator and the PML tables exist, so
+	// specialize both here; the driver folds fetchOpIdx()/fetchPmlIdx() to a
+	// single path at pipeline creation. A shader that declares neither, or only
+	// one, simply ignores the entries it does not use.
+	const uint32_t idxBits[2] = {m_opIdxBits, m_pmlIdxBits};
+	VkSpecializationMapEntry opIdxSpecEntry[2] = {
+		{0, 0 * sizeof(uint32_t), sizeof(uint32_t)},
+		{1, 1 * sizeof(uint32_t), sizeof(uint32_t)},
+	};
 	VkSpecializationInfo opIdxSpec{};
-	opIdxSpec.mapEntryCount = 1;
-	opIdxSpec.pMapEntries   = &opIdxSpecEntry;
-	opIdxSpec.dataSize      = sizeof(uint32_t);
-	opIdxSpec.pData         = &m_opIdxBits;
+	opIdxSpec.mapEntryCount = 2;
+	opIdxSpec.pMapEntries   = opIdxSpecEntry;
+	opIdxSpec.dataSize      = sizeof(idxBits);
+	opIdxSpec.pData         = idxBits;
 
 	VkShaderModule module = CreateShaderModule(gpu_spirv::validate_fields_data,
 	                                           gpu_spirv::validate_fields_size);
