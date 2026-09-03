@@ -137,10 +137,17 @@ read-modify-write two state arrays across three components (~200 B), against
 the Yee update's ~80 B/cell. A dispersive cell is simply ~3× a normal cell in
 memory traffic, and those arrays are already dense and contiguous.
 
-If so this is a *traffic floor*, matching the two structural results in §1,
-and the only remaining levers change the physics (fewer ADE arrays, lower
-precision) — out of scope. **Confirm the estimate with a counter-based
-measurement before spending anything further here.**
+**Confirmed — closed.** Stubbing the scattered field read out entirely
+(wrong physics, timing only) recovers only 5 of the 74 MC/s gap, **+1.8%**:
+277.22 → 282.21 MC/s against a 351.41 MC/s non-dispersive baseline. The
+addressing is no longer the cost; ~93% of what remains is dense streaming of
+the ADE arrays. Supporting evidence: cost is linear in dispersive volume
+above ~10% of cells, and order-2 dispersion costs exactly **2.00×** order-1's
+overhead — the loop scales with the number of ADE arrays and nothing else.
+
+This is a traffic floor, matching the two structural results in §1. The only
+remaining levers change the physics (fewer ADE arrays, lower precision) and
+are out of scope. **The AVX2 side is done.**
 
 ### A3 — Cache-line-aligned AVX2 field layout
 
@@ -152,42 +159,81 @@ interesting *combined with* NT stores.
 High risk, wide blast radius (touches every engine and extension indexing
 scheme). Listed for completeness; **do not start here.**
 
-### G1 — Fuse the dispersive passes into the main GPU kernels
+### Hardware caveat — read before trusting any GPU number below
 
-Only UPML is fused (`m_hasFusedUPML`). Dispersive costs four separate
-dispatches per timestep (`dispersive_pre_voltage`, `dispersive_apply_voltage`,
-`dispersive_pre_current`, `dispersive_apply_current`) plus barriers, each
-re-reading the global field arrays.
+The RX 6800 that produced every GPU measurement in §1 **is not on the current
+machine.** The only GPU here is an Intel HD Graphics 530 (Skylake GT2,
+integrated, sharing the same DDR4 as the CPU, no large last-level cache). It
+runs the GPU engine correctly but in a completely different performance
+regime — it reaches 386 MC/s on a 96³ PEC model, i.e. *about the same as the
+AVX2 CPU engine on the same host*, because it is the same memory.
 
-Caveat that must be settled first: UPML fusion worked because PML regions are
-axis-aligned boxes testable in-register. Dispersive cells are a *sparse list*,
-so fusion needs a per-cell membership lookup in the main kernel — which may
-cost more than the saved passes when the dispersive fraction is small.
+Throughput conclusions measured here do not transfer to the discrete-GPU
+regime the GPU engine was tuned for. The findings below are therefore
+restricted to *architecture-independent* facts — dispatch and barrier counts,
+and structural arguments — which do transfer.
 
-*Cheap falsification:* measure the dispersive dispatches' share of frame time
-on a phantom model. If the four dispatches are <5% of the timestep, the
-fusion cannot pay for the lookup.
+### G1 — Fuse the dispersive passes into the main GPU kernels  ❌ closed
 
-### G2 — Dispatch and barrier count on small grids
+Measured dispatch counts (probe build, batch of 28 timesteps):
 
-At 12–14 GCells/s on cache-resident grids, a timestep is short enough that
-per-dispatch overhead may be material once several extension families are
-active. Nobody has counted dispatches per timestep or measured the floor.
+| Model | dispatches/timestep | barriers/timestep |
+|---|---|---|
+| PEC, no dispersion | 3 | 3 |
+| PEC + dispersion | 5 | 5 |
+| PML + dispersion | 5 | 6 |
 
-*Cheap falsification:* count dispatches per timestep, then time an empty-kernel
-run at the same dispatch count to establish the launch floor.
+Dispersion costs **2 extra dispatches per timestep**, not the four the shader
+list suggests, and PML adds no dispatches at all (it is already fused) — only
+barriers.
 
-### G3 — `volt_flux` traffic in the PML path
+Fusing those two away cannot pay. The dispersive dispatches cover only the
+sparse cell list, so they are small; what fusion would save is 2 barriers and
+2 launches per timestep. What it would cost is a per-cell membership test in
+the main kernel, which runs over the *entire* grid — either a full-size lookup
+array (extra traffic on every cell, including the ~87% that are not
+dispersive) or a hash. Adding whole-grid traffic to remove two barriers is
+the wrong trade on hardware that is already at its bandwidth roofline.
 
-PML cells carry an extra read-modify-write of the flux array per component.
-After `00ba1c6` the coefficients are cheap, so flux traffic is now the
-dominant PML-specific cost. Whether it can be reduced at all is unclear — the
-flux-swap trick needs the previous value.
+### G2 — Dispatch and barrier count on small grids  ❌ closed
 
-*Cheap falsification:* compute the flux array's byte traffic as a fraction of
-total PML-cell traffic. If it is small, close this out.
+Answered by the same measurement: the per-timestep pipeline is **3 dispatches
+and 3 barriers** for a plain model, rising to 5 and 6 with dispersion and PML.
+That is already minimal — there is no dispatch bloat to remove. The earlier
+suspicion that several active extension families would multiply dispatches is
+wrong, because UPML is fused and the rest are sparse-list kernels.
+
+### G3 — `volt_flux` traffic in the PML path  ❌ closed
+
+Structural, not measurable away. A UPML cell's fused voltage update reads and
+writes both `volt` and `volt_flux` (3 components each), roughly doubling
+per-cell field traffic versus a Yee cell. The flux array is inherent to the
+UPML formulation and the flux-swap needs the previous value, so the traffic
+cannot be removed without changing the algorithm. After `00ba1c6` made the
+coefficients cheap, this *is* the PML cost — it is a floor, not an
+inefficiency.
 
 ---
+
+## 3b. Status: no open candidates
+
+Every candidate raised has been either implemented or closed on evidence:
+
+- AVX2 — at the traffic floor. The update kernels (`574f714`), and now the
+  dispersive extension (§A1b), are both bandwidth-bound with no addressing
+  or arithmetic overhead left to remove.
+- GPU — the Yee kernel is at roofline (§1), the dispatch pipeline is already
+  minimal (G2), and the two remaining structural costs (PML flux traffic,
+  dispersive passes) are inherent to their algorithms (G1, G3).
+
+Further GPU work would need the discrete GPU to evaluate. Optimizing against
+the integrated GPU available here would repeat the failure already recorded in
+§2 — the "26% subgroup-uniform" win that turned out to be an artifact of an
+unrepresentative fixture.
+
+**Restarting this work is worthwhile when:** the RX 6800 host is available
+again, a profile of a real production model (rather than synthetic fixtures)
+points somewhere specific, or a new engine feature adds a hot path.
 
 ## 4. Method notes
 
