@@ -93,59 +93,54 @@ single-threaded and low-thread-count configurations still respond.
 Ordered by expected value. Each states how to *falsify* it cheaply before
 committing to an implementation.
 
-### A1 — AVX2 path for the dispersive (Lorentz/Drude) extension  ★ highest
+### A1 — AVX2 dispersive extension  ✅ **done (`2bfb77d`)**
 
-`Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl` /
-`DoPreCurrentUpdatesImpl` are scalar loops over a sparse cell list. UPML is
-currently **the only** extension with a vectorized path
-(`engine_ext_upml_avx2.cpp`); every other extension runs scalar on the AVX2
-engines.
+Priced, implemented and closed. No dispersive fixture existed, so one was
+built: 96³ grid, Drude box (`eps_plasma = 3e10`, order 1) over the central
+half of the domain — **12.5% of cells** — against an identical model with a
+plain dielectric box.
 
-Structurally this is favourable: the ADE state arrays (`volt_ADE`,
-`volt_Lor_ADE`, `v_int_ADE`, `v_ext_ADE`, `v_Lor_ADE`) are all indexed by a
-dense contiguous `i`, so six of the eight operands vectorize directly. Only
-the field term `eng->GetVolt(n, pos[0][i], pos[1][i], pos[2][i])` is a
-gather — and on `Engine_AVX2` that call carries a runtime `%`/`/` against
-`numVectors` per element, the same cost `586a8ac` removed from the field
-extraction path.
+The extension cost **33–34% of runtime**. The cause was not the arithmetic
+but the addressing: the extension reaches the field only through
+`GetVolt`/`SetVolt`, and on `Engine_AVX2` those carry an integer div and mod
+against the runtime member `numVectors` — **18 divisions and 18 moduli per
+cell per timestep** across the four passes. Precomputing the vector offset
+and lane per list entry (the list is fixed after operator build) removed all
+of them:
 
-Affects every model with frequency-dependent materials, which includes the
-bio/MRI phantom fixtures this repo ships.
-
-**Priced — confirmed worth pursuing.** No dispersive fixture existed, so one
-was built: 96³ grid, a Drude box (`eps_plasma = 3e10`, order 1) spanning the
-central half of the domain, i.e. **12.5% of cells**, against an identical
-model with a plain dielectric box of the same geometry and `epsilon`/`kappa`.
-
-| Engine | plain | Drude | cost |
+| Engine | before | after | |
 |---|---|---|---|
-| `avx2` | 360.2 MC/s | 241.9 MC/s | **−33%** |
-| `avx2-multithreaded` | 386.9 MC/s | 256.6 MC/s | **−34%** |
+| `avx2` | 239.95 MC/s | 286.54 MC/s | **+19.4%** |
+| `avx2-multithreaded` | 259.45 MC/s | 311.26 MC/s | **+20.0%** |
 
-A third of total runtime spent on an eighth of the cells — a per-cell cost
-comparable to the 4.8× UPML penalty that motivated `08fa968`. Far above the
-3% threshold that would have closed this out.
+Bit-identical on both engines; divergence from the untouched SSE engine is
+unchanged at 9.235e-03.
 
-Second finding from the same measurement: the extension contains **no
-threading at all** — no tiling, no thread partitioning, no engine thread
-awareness. On `avx2-multithreaded` it is a serial section between parallel
-Yee updates, so it is an Amdahl bottleneck whose relative cost *grows* with
-thread count. Vectorization and threading are separable pieces of work here;
-threading may well be the larger of the two.
+**A2 (sort the cell list for locality) is closed out as not worth doing.**
+93.7% of consecutive entries already land within 3 f8vector units — median
+delta is exactly 3, i.e. one cell's three polarisations — so the list is
+already effectively sequential in engine address space. Sorting would take
+that to 99.96%.
 
-Model generator kept at `scratchpad/disp/gen.py` — should be promoted into
-`python/Tests/` as a fixture regardless of what happens next, since the test
-suite currently has no dispersive-material coverage at all.
+**The threading claim is withdrawn.** The extension genuinely has no
+threading, but on this grid threading adds little to *either* model (plain
++2.5%, dispersive +8.6% ST→MT), so a serial-section cost is not demonstrated
+and would need a larger grid to assess. It was speculation and is not
+supported by the measurement.
 
-### A2 — Sort the dispersive cell list for locality
+### A1b — is anything left in the dispersive extension?
 
-Independent of A1 and cheaper. If `m_LM_pos` is not ordered to match the
-engine's memory layout, the gather is scattered. Sorting the cell list once at
-operator setup costs nothing at runtime.
+After the addressing fix the extension still costs ~22% of runtime on 12.5%
+of cells. A traffic estimate suggests this is now close to inherent: per cell
+per timestep the ADE passes stream three operator coefficient arrays and
+read-modify-write two state arrays across three components (~200 B), against
+the Yee update's ~80 B/cell. A dispersive cell is simply ~3× a normal cell in
+memory traffic, and those arrays are already dense and contiguous.
 
-*Cheap falsification:* instrument the position list and measure how far
-consecutive `i` land apart in engine address space. If already near-sequential,
-drop it.
+If so this is a *traffic floor*, matching the two structural results in §1,
+and the only remaining levers change the physics (fewer ADE arrays, lower
+precision) — out of scope. **Confirm the estimate with a counter-based
+measurement before spending anything further here.**
 
 ### A3 — Cache-line-aligned AVX2 field layout
 
