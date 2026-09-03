@@ -16,6 +16,10 @@
 */
 
 #include "engine_ext_lorentzmaterial.h"
+#if OPENEMS_ENABLE_AVX2
+#include "FDTD/engine_avx2.h"
+#include <type_traits>
+#endif
 #include "operator_ext_lorentzmaterial.h"
 #include "FDTD/engine_sse.h"
 
@@ -79,15 +83,59 @@ Engine_Ext_LorentzMaterial::~Engine_Ext_LorentzMaterial()
 template <typename EngType>
 void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 {
+#if OPENEMS_ENABLE_AVX2
+	if constexpr (std::is_same<EngType, Engine_AVX2>::value)
+		BuildAVX2Index(eng);
+#endif
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_volt_ADE_On[o]==false) continue;
 
 		unsigned int **pos = m_Op_Ext_Lor->m_LM_pos[o];
 
+		const unsigned int cnt = m_Op_Ext_Lor->m_LM_Count.at(o);
+
+#if OPENEMS_ENABLE_AVX2
+		if constexpr (std::is_same<EngType, Engine_AVX2>::value)
+		{
+			// Division-free field access; see Engine_Ext_Dispersive::BuildAVX2Index.
+			const unsigned int*  off  = m_avx2_off.data()  + m_avx2_start[o];
+			const unsigned char* lane = m_avx2_lane.data() + m_avx2_start[o];
+			f8vector* fld = eng->m_volt;
+			if (m_Op_Ext_Lor->m_volt_Lor_ADE_On[o])
+			{
+				for (unsigned int i=0; i<cnt; ++i)
+				{
+					const f8vector* c = fld + off[i];
+					const unsigned int l = lane[i];
+					for (int n=0; n<3; ++n)
+					{
+						volt_Lor_ADE[o][n][i] += m_Op_Ext_Lor->v_Lor_ADE[o][n][i] * volt_ADE[o][n][i];
+						volt_ADE[o][n][i] *= m_Op_Ext_Lor->v_int_ADE[o][n][i];
+						volt_ADE[o][n][i] += m_Op_Ext_Lor->v_ext_ADE[o][n][i] * (c[n].f[l] - volt_Lor_ADE[o][n][i]);
+					}
+				}
+			}
+			else
+			{
+				for (unsigned int i=0; i<cnt; ++i)
+				{
+					const f8vector* c = fld + off[i];
+					const unsigned int l = lane[i];
+					for (int n=0; n<3; ++n)
+					{
+						volt_ADE[o][n][i] *= m_Op_Ext_Lor->v_int_ADE[o][n][i];
+						volt_ADE[o][n][i] += m_Op_Ext_Lor->v_ext_ADE[o][n][i] * c[n].f[l];
+					}
+				}
+			}
+			continue;
+		}
+#endif
+
 		if (m_Op_Ext_Lor->m_volt_Lor_ADE_On[o])
 		{
-			for (unsigned int i=0; i<m_Op_Ext_Lor->m_LM_Count.at(o); ++i)
+			for (unsigned int i=0; i<cnt; ++i)
 			{
 				volt_Lor_ADE[o][0][i]+=m_Op_Ext_Lor->v_Lor_ADE[o][0][i]*volt_ADE[o][0][i];
 				volt_ADE[o][0][i] *= m_Op_Ext_Lor->v_int_ADE[o][0][i];
@@ -127,15 +175,59 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdates()
 template <typename EngType>
 void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
 {
+#if OPENEMS_ENABLE_AVX2
+	if constexpr (std::is_same<EngType, Engine_AVX2>::value)
+		BuildAVX2Index(eng);
+#endif
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_curr_ADE_On[o]==false) continue;
 
 		unsigned int **pos = m_Op_Ext_Lor->m_LM_pos[o];
 
+		const unsigned int cnt = m_Op_Ext_Lor->m_LM_Count.at(o);
+
+#if OPENEMS_ENABLE_AVX2
+		if constexpr (std::is_same<EngType, Engine_AVX2>::value)
+		{
+			// Division-free field access; see Engine_Ext_Dispersive::BuildAVX2Index.
+			const unsigned int*  off  = m_avx2_off.data()  + m_avx2_start[o];
+			const unsigned char* lane = m_avx2_lane.data() + m_avx2_start[o];
+			f8vector* fld = eng->m_curr;
+			if (m_Op_Ext_Lor->m_curr_Lor_ADE_On[o])
+			{
+				for (unsigned int i=0; i<cnt; ++i)
+				{
+					const f8vector* c = fld + off[i];
+					const unsigned int l = lane[i];
+					for (int n=0; n<3; ++n)
+					{
+						curr_Lor_ADE[o][n][i] += m_Op_Ext_Lor->v_Lor_ADE[o][n][i] * curr_ADE[o][n][i];
+						curr_ADE[o][n][i] *= m_Op_Ext_Lor->v_int_ADE[o][n][i];
+						curr_ADE[o][n][i] += m_Op_Ext_Lor->v_ext_ADE[o][n][i] * (c[n].f[l] - curr_Lor_ADE[o][n][i]);
+					}
+				}
+			}
+			else
+			{
+				for (unsigned int i=0; i<cnt; ++i)
+				{
+					const f8vector* c = fld + off[i];
+					const unsigned int l = lane[i];
+					for (int n=0; n<3; ++n)
+					{
+						curr_ADE[o][n][i] *= m_Op_Ext_Lor->v_int_ADE[o][n][i];
+						curr_ADE[o][n][i] += m_Op_Ext_Lor->v_ext_ADE[o][n][i] * c[n].f[l];
+					}
+				}
+			}
+			continue;
+		}
+#endif
+
 		if (m_Op_Ext_Lor->m_curr_Lor_ADE_On[o])
 		{
-			for (unsigned int i=0; i<m_Op_Ext_Lor->m_LM_Count.at(o); ++i)
+			for (unsigned int i=0; i<cnt; ++i)
 			{
 				curr_Lor_ADE[o][0][i]+=m_Op_Ext_Lor->i_Lor_ADE[o][0][i]*curr_ADE[o][0][i];
 				curr_ADE[o][0][i] *= m_Op_Ext_Lor->i_int_ADE[o][0][i];

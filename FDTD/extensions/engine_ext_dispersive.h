@@ -23,6 +23,9 @@
 #include "FDTD/operator.h"
 #include "engine_extension_dispatcher.h"
 
+#include <vector>
+#include <cstddef>
+
 class Operator_Ext_Dispersive;
 
 class Engine_Ext_Dispersive : public Engine_Extension
@@ -53,6 +56,25 @@ protected:
 	//! ADE voltages
 	// Array setup: volt_ADE[N_order][direction][mesh_pos]
 	FDTD_FLOAT ***volt_ADE;
+
+#if OPENEMS_ENABLE_AVX2
+	// --- AVX2 flat-address cache -------------------------------------------
+	// Engine_AVX2 maps a cell to m_volt[n + (z%numVectors)*m_vs_z + y*m_vs_y
+	// + x*m_vs_x].f[z/numVectors]. numVectors is a runtime member, so every
+	// GetVolt/SetVolt on that engine costs an integer div and mod that the
+	// compiler cannot strength-reduce. The dispersive cell list is fixed once
+	// the operator is built, so the vector offset and lane are precomputed
+	// per list entry and the hot loops address the field arrays directly.
+	// Concatenated over orders; m_avx2_start[o] is where order o begins.
+	std::vector<unsigned int>  m_avx2_off;
+	std::vector<unsigned char> m_avx2_lane;
+	std::vector<size_t>        m_avx2_start;
+	//! numVectors the cache was built for; 0 = not built yet.
+	unsigned int m_avx2_idx_nv = 0;
+
+	//! Build (or rebuild) the flat-address cache for this engine.
+	void BuildAVX2Index(class Engine_AVX2* eng);
+#endif
 };
 
 #endif // ENGINE_EXT_DISPERSIVE_H
