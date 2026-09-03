@@ -610,9 +610,16 @@ bool openEMS::SetupProcessing()
 				{
 					ProcessModeMatch* pmm = new ProcessModeMatch(NewEngineInterface());
 					pmm->SetFieldType(pb->GetProbeType()-10);
-					pmm->SetWeightFunction(0,pb->GetAttributeValue("ModeFunctionX"));
-					pmm->SetWeightFunction(1,pb->GetAttributeValue("ModeFunctionY"));
-					pmm->SetWeightFunction(2,pb->GetAttributeValue("ModeFunctionZ"));
+
+					if (!pb->GetModeFile().empty())
+						pmm->SetWeightFile(pb->GetModeFile());
+					else
+					{
+						pmm->SetWeightFunction(0, pb->GetModeFunction(0));
+						pmm->SetWeightFunction(1, pb->GetModeFunction(1));
+						pmm->SetWeightFunction(2, pb->GetModeFunction(2));
+					}
+					pmm->SetWeightOrigin(pb->GetModeOrigin(0), pb->GetModeOrigin(1), pb->GetModeOrigin(2));
 					proc = pmm;
 				}
 				else
