@@ -77,6 +77,12 @@ protected:
 	unsigned int numVectors; //!< number of 8-wide AVX vectors along z
 
 public: // public access for efficient extension/interface access
+	//! Number of 8-wide z-vectors, i.e. the width of one lane along z.
+	//! Global z maps to (vector = z % numVectors, lane = z / numVectors).
+	inline unsigned int GetNumVectors() const { return numVectors; }
+	//! Grid extent as seen by the engine (Operator::GetNumberOfLines(n, true)).
+	inline unsigned int GetNumLines(int n) const { return numLines[n]; }
+
 	//! Flat field arrays with interleaved polarisations.
 	//! Layout: m_volt[n + z_vec * m_vs_z + y * m_vs_y + x * m_vs_x]
 	//! where n=0,1,2 (polarisation) is the fastest dimension.

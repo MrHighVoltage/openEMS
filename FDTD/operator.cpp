@@ -960,7 +960,9 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 {
 	// Range-based coefficient generation runs concurrently. Compute the flat
 	// index directly instead of mutating the shared address operator.
-	unsigned int i = (pos[0] * numLines[1] + pos[1]) * numLines[2] + pos[2];
+	// NOTE: must match AdrOp::GetPos(), which is x-fastest:
+	//   idx = x + y*Nx + z*Nx*Ny   (that is how EC_C/EC_G/EC_L/EC_R are filled)
+	unsigned int i = pos[0] + (pos[1] + pos[2] * numLines[1]) * numLines[0];
 	double C = EC_C[n][i];
 	double G = EC_G[n][i];
 	if (C>0)

@@ -13,6 +13,7 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_ext_cylindermultigrid.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_ext_upml.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_ext_upml.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_ext_upml_avx2.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_extension.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_ext_mur_abc.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_ext_mur_abc.cpp

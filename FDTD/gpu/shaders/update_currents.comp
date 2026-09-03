@@ -40,6 +40,10 @@ layout(constant_id = 0) const uint OPIDX_BITS = 32;
 
 uint fetchOpIdx(uint cell)
 {
+    // 0 = no deduplication: the tables hold one entry per cell and no index
+    // buffer is uploaded, so the cell number indexes them directly.
+    if (OPIDX_BITS == 0u)
+        return cell;
     if (OPIDX_BITS == 8u)
         return bitfieldExtract(opIdx[cell >> 2], int((cell & 3u) << 3), 8);
     if (OPIDX_BITS == 16u)

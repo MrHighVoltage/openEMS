@@ -39,9 +39,10 @@ layout(set=0, binding=5) buffer PMLInfoBuf {
 
 // --- Concatenated PML buffers ---
 layout(set=0, binding=6) buffer CurrFluxBuf { float curr_flux[];  };
-layout(set=0, binding=7) buffer PmlIIBuf    { float pml_ii[];     };
-layout(set=0, binding=8) buffer PmlIIFOBuf  { float pml_iifo[];   };
-layout(set=0, binding=9) buffer PmlIIFNBuf  { float pml_iifn[];   };
+layout(set=0, binding=7) buffer PmlIdxBuf   { uint  pmlCoefIdx[]; };
+layout(set=0, binding=8) buffer PmlIIBuf    { float pml_ii[];     };
+layout(set=0, binding=9) buffer PmlIIFOBuf  { float pml_iifo[];   };
+layout(set=0, binding=10) buffer PmlIIFNBuf { float pml_iifn[];   };
 
 layout(push_constant) uniform PC {
     uint Nx, Ny, Nz, numComp;
@@ -61,11 +62,37 @@ layout(constant_id = 0) const uint OPIDX_BITS = 32;
 
 uint fetchOpIdx(uint cell)
 {
+    // 0 = no deduplication: the tables hold one entry per cell and no index
+    // buffer is uploaded, so the cell number indexes them directly.
+    if (OPIDX_BITS == 0u)
+        return cell;
     if (OPIDX_BITS == 8u)
         return bitfieldExtract(opIdx[cell >> 2], int((cell & 3u) << 3), 8);
     if (OPIDX_BITS == 16u)
         return bitfieldExtract(opIdx[cell >> 1], int((cell & 1u) << 4), 16);
     return opIdx[cell];
+}
+
+// --- PML coefficient index -----------------------------------------------
+// The UPML coefficients depend on the grading profile (a function of depth
+// into the PML) and the local material, so they are enormously redundant
+// across the transverse plane: an 80^3 grid with PML_8 on all six sides has
+// 821016 coefficient entries but only ~1100 distinct (vv,vvfo,vvfn,ii,iifo,
+// iifn) tuples, and a graded mesh barely changes that. They are therefore
+// deduplicated into small tables -- small enough to stay cache-resident,
+// unlike the Yee operator table -- with one narrow index per entry. The
+// width is a specialization constant so the driver folds this to a single
+// path at pipeline creation. Packing is little-endian within each dword,
+// matching the host-side packer.
+layout(constant_id = 1) const uint PMLIDX_BITS = 32;
+
+uint fetchPmlIdx(uint cell)
+{
+    if (PMLIDX_BITS == 8u)
+        return bitfieldExtract(pmlCoefIdx[cell >> 2], int((cell & 3u) << 3), 8);
+    if (PMLIDX_BITS == 16u)
+        return bitfieldExtract(pmlCoefIdx[cell >> 1], int((cell & 1u) << 4), 16);
+    return pmlCoefIdx[cell];
 }
 
 
@@ -151,12 +178,13 @@ void main()
         {
             uint fo = pmlRegions[pmlIdx].fluxOffset;
             uint li = fo + pmlLocal;
+            uint ci = fetchPmlIdx(li);
 
             float I = curr[gi];
             float F = curr_flux[li];
 
             // Pre-current
-            float f_help = pml_ii[li] * I - pml_iifo[li] * F;
+            float f_help = pml_ii[ci] * I - pml_iifo[ci] * F;
             float temp = F;  // "curr = old flux" for Yee input
 
             // Yee update (if in domain) or keep as old flux
@@ -172,7 +200,7 @@ void main()
 
             // Post-current
             curr_flux[li] = yee_result;
-            curr[gi] = f_help + pml_iifn[li] * yee_result;
+            curr[gi] = f_help + pml_iifn[ci] * yee_result;
         }
         else if (inYeeDomain)
         {
@@ -190,11 +218,12 @@ void main()
         {
             uint fo = pmlRegions[pmlIdx].fluxOffset;
             uint li = fo + pmlPN + pmlLocal;
+            uint ci = fetchPmlIdx(li);
 
             float I = curr[gi];
             float F = curr_flux[li];
 
-            float f_help = pml_ii[li] * I - pml_iifo[li] * F;
+            float f_help = pml_ii[ci] * I - pml_iifo[ci] * F;
             float temp = F;
 
             float yee_result;
@@ -208,7 +237,7 @@ void main()
             }
 
             curr_flux[li] = yee_result;
-            curr[gi] = f_help + pml_iifn[li] * yee_result;
+            curr[gi] = f_help + pml_iifn[ci] * yee_result;
         }
         else if (inYeeDomain)
         {
@@ -226,11 +255,12 @@ void main()
         {
             uint fo = pmlRegions[pmlIdx].fluxOffset;
             uint li = fo + 2u * pmlPN + pmlLocal;
+            uint ci = fetchPmlIdx(li);
 
             float I = curr[gi];
             float F = curr_flux[li];
 
-            float f_help = pml_ii[li] * I - pml_iifo[li] * F;
+            float f_help = pml_ii[ci] * I - pml_iifo[ci] * F;
             float temp = F;
 
             float yee_result;
@@ -244,7 +274,7 @@ void main()
             }
 
             curr_flux[li] = yee_result;
-            curr[gi] = f_help + pml_iifn[li] * yee_result;
+            curr[gi] = f_help + pml_iifn[ci] * yee_result;
         }
         else if (inYeeDomain)
         {

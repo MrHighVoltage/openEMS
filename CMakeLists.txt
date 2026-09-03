@@ -256,6 +256,14 @@ if(OPENEMS_ENABLE_AVX2)
     FDTD/engine_interface_avx2_fdtd.cpp
     PROPERTIES COMPILE_FLAGS "-mavx2 -mfma"
   )
+  # The UPML kernels additionally disable FP contraction: they mirror a scalar
+  # loop that compiles to plain mulss/subss, and -ffp-contract=fast (the GCC
+  # default) would fuse the intrinsics into FMAs and make the vector path
+  # disagree with the scalar one it replaces. See engine_ext_upml_avx2.cpp.
+  set_source_files_properties(
+    FDTD/extensions/engine_ext_upml_avx2.cpp
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -ffp-contract=off"
+  )
 endif()
 
 add_library( openEMS SHARED ${SOURCES})

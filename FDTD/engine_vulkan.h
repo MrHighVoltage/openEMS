@@ -432,8 +432,11 @@ private:
 	//! Per-UPML-region GPU state.
 	struct GpuUPMLData {
 		GpuBuf voltFlux, currFlux;                       // auxiliary flux fields
-		GpuBuf pmlVv, pmlVvfo, pmlVvfn;                  // voltage PML coefficients
-		GpuBuf pmlIi, pmlIifo, pmlIifn;                  // current PML coefficients
+		GpuBuf pmlIdx;                                   // narrow index into the shared coeff tables
+		VkDeviceSize pmlIdxBufSize = 0;
+		//! Table index per coefficient entry, [3][pNx][pNy][pNz], kept host-side
+		//! so SetupFusedUPML can concatenate the regions without a readback.
+		std::vector<uint32_t> coefIdx;
 		VkDescriptorSet preVoltDesc  = VK_NULL_HANDLE;
 		VkDescriptorSet postVoltDesc = VK_NULL_HANDLE;
 		VkDescriptorSet preCurrDesc  = VK_NULL_HANDLE;
@@ -502,8 +505,8 @@ private:
 	bool m_hasFusedUPML = false;
 	GpuBuf m_fusedVoltFlux;     //!< Concatenated volt flux (all PML regions)
 	GpuBuf m_fusedCurrFlux;     //!< Concatenated curr flux (all PML regions)
-	GpuBuf m_fusedPmlVv, m_fusedPmlVvfo, m_fusedPmlVvfn;   //!< Concatenated volt PML coeffs
-	GpuBuf m_fusedPmlIi, m_fusedPmlIifo, m_fusedPmlIifn;   //!< Concatenated curr PML coeffs
+	GpuBuf m_fusedPmlIdx;       //!< Concatenated per-entry PML coefficient index
+	VkDeviceSize m_fusedPmlIdxBufSize = 0;
 	GpuBuf m_fusedPmlRegionInfo; //!< PML region metadata SSBO
 	uint32_t m_fusedTotalPmlCells = 0;  //!< Sum of all PML regions' cell counts
 	VkDescriptorSetLayout m_fusedDescLayout = VK_NULL_HANDLE;
@@ -515,6 +518,16 @@ private:
 	VkDescriptorSet       m_fusedCurrDescSet = VK_NULL_HANDLE;
 	void SetupFusedUPML();       //!< Create concatenated PML buffers + fused pipeline
 	void CleanupFusedUPML();     //!< Destroy fused UPML resources
+
+	// ---- Deduplicated UPML coefficient tables -------------------------
+	// Shared by every region and by both the fused and the separate-dispatch
+	// path, so an index fetched anywhere means the same table entry.
+	GpuBuf m_pmlTabVv, m_pmlTabVvfo, m_pmlTabVvfn;
+	GpuBuf m_pmlTabIi, m_pmlTabIifo, m_pmlTabIifn;
+	VkDeviceSize m_pmlTabBufSize = 0;
+	uint32_t m_pmlTabCount = 0;      //!< number of distinct coefficient tuples
+	uint32_t m_pmlIdxBits  = 32;     //!< width of one packed table index
+	void BuildUPMLCoeffTables();     //!< Deduplicate the UPML coefficients
 
 	// ---- Extension GPU instances --------------------------------------
 	VkDescriptorPool      m_extDescPool = VK_NULL_HANDLE;

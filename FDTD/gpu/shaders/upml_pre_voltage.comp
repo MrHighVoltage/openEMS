@@ -17,14 +17,37 @@ layout(local_size_x = 256) in;
 
 layout(set=0, binding=0) buffer VoltBuf     { float volt[];      };
 layout(set=0, binding=1) buffer VoltFluxBuf { float volt_flux[];  };
-layout(set=0, binding=2) buffer VVBuf       { float pml_vv[];    };
-layout(set=0, binding=3) buffer VVFOBuf     { float pml_vvfo[];  };
+layout(set=0, binding=2) buffer PmlIdxBuf   { uint  pmlCoefIdx[];    };
+layout(set=0, binding=3) buffer VVBuf       { float pml_vv[];    };
+layout(set=0, binding=4) buffer VVFOBuf     { float pml_vvfo[];  };
 
 layout(push_constant) uniform PC {
     uint Nx, Ny, Nz;         // global grid size
     uint pNx, pNy, pNz;      // PML region size (number of PML lines)
     uint pStartX, pStartY, pStartZ; // PML region start position in global grid
 };
+
+// --- PML coefficient index -----------------------------------------------
+// The UPML coefficients depend on the grading profile (a function of depth
+// into the PML) and the local material, so they are enormously redundant
+// across the transverse plane: an 80^3 grid with PML_8 on all six sides has
+// 821016 coefficient entries but only ~1100 distinct (vv,vvfo,vvfn,ii,iifo,
+// iifn) tuples, and a graded mesh barely changes that. They are therefore
+// deduplicated into small tables -- small enough to stay cache-resident,
+// unlike the Yee operator table -- with one narrow index per entry. The
+// width is a specialization constant so the driver folds this to a single
+// path at pipeline creation. Packing is little-endian within each dword,
+// matching the host-side packer.
+layout(constant_id = 1) const uint PMLIDX_BITS = 32;
+
+uint fetchPmlIdx(uint cell)
+{
+    if (PMLIDX_BITS == 8u)
+        return bitfieldExtract(pmlCoefIdx[cell >> 2], int((cell & 3u) << 3), 8);
+    if (PMLIDX_BITS == 16u)
+        return bitfieldExtract(pmlCoefIdx[cell >> 1], int((cell & 1u) << 4), 16);
+    return pmlCoefIdx[cell];
+}
 
 void main()
 {
@@ -56,9 +79,10 @@ void main()
     {
         uint gi = g_base;          // component 0: offset 0
         uint li = l_base;          // component 0: offset 0
+        uint ci = fetchPmlIdx(li);
         float V   = volt[gi];
         float F   = volt_flux[li];
-        float fh  = pml_vv[li] * V - pml_vvfo[li] * F;
+        float fh  = pml_vv[ci] * V - pml_vvfo[ci] * F;
         volt[gi]      = F;        // save old flux as voltage
         volt_flux[li] = fh;       // store partial result
     }
@@ -67,9 +91,10 @@ void main()
     {
         uint gi = N + g_base;      // component 1
         uint li = pN + l_base;     // component 1
+        uint ci = fetchPmlIdx(li);
         float V   = volt[gi];
         float F   = volt_flux[li];
-        float fh  = pml_vv[li] * V - pml_vvfo[li] * F;
+        float fh  = pml_vv[ci] * V - pml_vvfo[ci] * F;
         volt[gi]      = F;
         volt_flux[li] = fh;
     }
@@ -78,9 +103,10 @@ void main()
     {
         uint gi = 2*N + g_base;    // component 2
         uint li = 2*pN + l_base;   // component 2
+        uint ci = fetchPmlIdx(li);
         float V   = volt[gi];
         float F   = volt_flux[li];
-        float fh  = pml_vv[li] * V - pml_vvfo[li] * F;
+        float fh  = pml_vv[ci] * V - pml_vvfo[ci] * F;
         volt[gi]      = F;
         volt_flux[li] = fh;
     }

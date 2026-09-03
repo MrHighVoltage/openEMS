@@ -37,6 +37,10 @@ public:
 	virtual void ShowStat() const;
 
 	unsigned int GetNumCompressed() const { return m_numCompressed; }
+	//! False when the coefficient tables are stored one entry per cell and the
+	//! per-cell index is the identity (see CompressOperator).  Callers must then
+	//! skip the index buffer entirely rather than uploading a 0,1,2,... ramp.
+	bool IsCompressed() const { return m_Compressed; }
 	const uint32_t* GetOpIndex() const { return m_OpIndex.data(); }
 	const float* GetVVComp() const { return m_vvComp.data(); }
 	const float* GetVIComp() const { return m_viComp.data(); }
@@ -54,6 +58,9 @@ private:
 	void CompressOperator();
 
 	unsigned int m_numCompressed;
+
+	//! Whether deduplication actually paid off; see CompressOperator.
+	bool m_Compressed;
 
 	//! Per-cell index into compressed tables.  Size: Nx*Ny*Nz.
 	std::vector<uint32_t> m_OpIndex;

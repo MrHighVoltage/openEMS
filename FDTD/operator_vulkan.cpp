@@ -118,6 +118,7 @@ void RunOperatorRanges(unsigned int xStart, unsigned int xStop, Work work)
 Operator_Vulkan::Operator_Vulkan() : Operator()
 {
 	m_numCompressed = 0;
+	m_Compressed = true;
 }
 
 Operator_Vulkan::~Operator_Vulkan()
@@ -335,7 +336,93 @@ void Operator_Vulkan::CompressOperator()
 		th.join();
 	auto tBuildEnd = std::chrono::steady_clock::now();
 
+	auto validateFinite = [](const std::vector<float>& values, const char* name)
+	{
+		for (size_t i = 0; i < values.size(); ++i)
+		{
+			if (!std::isfinite(values[i]))
+				throw std::runtime_error(std::string("Operator_Vulkan: non-finite ") +
+				                         name + " coefficient at index " + std::to_string(i));
+		}
+	};
+
+	const size_t uniqueCount = uniqueKeys.size();
 	m_numCompressed = (unsigned int)uniqueKeys.size();
+
+	// ---- Is deduplication actually worth it? --------------------------------
+	// The shaders reach the coefficients through six independent random gathers
+	// per cell (vv/vi/ii/iv, each component-major). While the unique table stays
+	// resident in GPU cache those gathers are nearly free and compression is a
+	// large win -- a uniform mesh collapses to 6 unique sets and reads only the
+	// narrow per-cell index. Once the table outgrows the cache, every gather
+	// costs a separate cache line, so a cell that would have streamed 48 bytes
+	// of contiguous coefficients instead pulls six scattered lines plus its
+	// index. That is exactly what a graded mesh produces: coefficients scale
+	// with the local edge length and area, so almost every cell is unique
+	// (measured: 493040 of 512000 on an 80^3 power-law mesh, a 23 MB table)
+	// and the engine ran 4x slower than the same grid uniformly meshed.
+	//
+	// So when the table would be too large to cache, drop the indirection and
+	// store one entry per cell. The per-cell index then degenerates to the
+	// identity and is not uploaded at all (OPIDX_BITS == 0 in the shaders),
+	// which also saves the index traffic. The tables in that mode are just the
+	// base arrays, which already use the component-major layout the shaders
+	// want, so this costs a plain copy and no rearrangement.
+	//
+	// Measured crossover (80^3 PEC, meshes built from k distinct spacings per
+	// axis so the unique count is controllable, Intel HD 530):
+	//
+	//   table    compressed   per-cell
+	//      5 KB   388.6 MC/s   256.4 MC/s
+	//    227 KB   345.3        251.3
+	//   1824 KB   288.0        257.2
+	//   4539 KB   230.6        257.6   <- compression starts losing
+	//  11712 KB   159.0        258.5
+	//  21955 KB    99.4        260.6
+	//
+	// Note the per-cell column is flat: it is the streaming bandwidth floor and
+	// does not care how varied the mesh is. The real crossover is near 3 MB; the
+	// budget sits below it because the two failure directions are not
+	// symmetric. Switching too early costs at most ~11% (the 1824 KB row),
+	// while staying compressed too long falls off a cliff -- 62% at 22 MB.
+	// Vulkan exposes no cache size, so this is a tuned constant rather than a
+	// derived one, and it can be overridden for measurement.
+	size_t maxTableKB = 2048;
+	if (const char* env = std::getenv("OPENEMS_GPU_COMPRESS_MAX_TABLE_KB"))
+	{
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if ((end != env) && (*end == '\0') && (parsed >= 0))
+			maxTableKB = (size_t)parsed;
+	}
+	const size_t tableBytes = 4 * 3 * (size_t)m_numCompressed * sizeof(float);
+	// Never expand: one entry per cell is the worst the identity mode can be.
+	m_Compressed = (m_numCompressed < N) && (tableBytes <= maxTableKB * 1024);
+
+	if (!m_Compressed)
+	{
+		std::vector<VulkanCoeffKey>().swap(uniqueKeys);
+		std::vector<ShardMap>().swap(shards);
+		std::vector<uint32_t>().swap(m_OpIndex);
+		m_numCompressed = (unsigned int)N;
+
+		m_vvComp.assign(vv_data, vv_data + 3 * N);
+		m_viComp.assign(vi_data, vi_data + 3 * N);
+		m_iiComp.assign(ii_data, ii_data + 3 * N);
+		m_ivComp.assign(iv_data, iv_data + 3 * N);
+
+		validateFinite(m_vvComp, "VV");
+		validateFinite(m_viComp, "VI");
+		validateFinite(m_iiComp, "II");
+		validateFinite(m_ivComp, "IV");
+
+		if (g_settings.GetVerboseLevel() > 0)
+			cout << "  Unique coefficient sets: " << uniqueCount << " of " << N
+			     << " -- table would be " << (tableBytes / 1024)
+			     << " KB, over the " << maxTableKB
+			     << " KB cache budget; storing one entry per cell instead" << endl;
+		return;
+	}
 
 	// Rearrange to N-major layout: comp[n * numCompressed + idx]
 	// Currently tmp_vv is packed as [vv0_0, vv1_0, vv2_0, vv0_1, vv1_1, vv2_1, ...]
@@ -380,15 +467,6 @@ void Operator_Vulkan::CompressOperator()
 		writeCompRange(0, m_numCompressed);
 	}
 
-	auto validateFinite = [](const std::vector<float>& values, const char* name)
-	{
-		for (size_t i = 0; i < values.size(); ++i)
-		{
-			if (!std::isfinite(values[i]))
-				throw std::runtime_error(std::string("Operator_Vulkan: non-finite ") +
-				                         name + " coefficient at index " + std::to_string(i));
-		}
-	};
 	validateFinite(m_vvComp, "VV");
 	validateFinite(m_viComp, "VI");
 	validateFinite(m_iiComp, "II");
@@ -421,8 +499,9 @@ void Operator_Vulkan::ShowStat() const
 {
 	Operator::ShowStat();
 
-	cout << "GPU operator compression\t: yes" << endl;
-	cout << "Unique coefficient sets\t\t: " << m_numCompressed << endl;
+	cout << "GPU operator compression\t: " << (m_Compressed ? "yes" : "no (one entry per cell)") << endl;
+	if (m_Compressed)
+		cout << "Unique coefficient sets\t\t: " << m_numCompressed << endl;
 	cout << "-----------------------------------" << endl;
 }
 
