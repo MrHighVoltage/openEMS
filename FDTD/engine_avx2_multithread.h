@@ -21,6 +21,7 @@
 #include "operator_avx2_multithread.h"
 #include "engine_avx2.h"
 
+#include <chrono>
 #include <thread>
 #include <vector>
 #include "tools/barrier.h"
@@ -85,6 +86,16 @@ public:
 protected:
 	Engine_AVX2_Multithread(const Operator_AVX2_Multithread* op);
 	void changeNumThreads(unsigned int numThreads);
+
+	//! Run \a iterTS timesteps while measuring candidate thread counts.
+	bool CalibrateIterateTS(unsigned int iterTS);
+	//! Seed the candidate list with a geometric ladder over the available cores.
+	void BuildCalibrationPlan();
+	//! Score the current candidate and move on, refine, or settle.
+	void AdvanceCalibration();
+	//! Latch the fastest measured thread count and leave calibration mode.
+	void FinishCalibration();
+
 	const Operator_AVX2_Multithread* m_Op_MT;
 	std::vector<std::thread> m_threads;
 	Barrier* m_startBarrier;
@@ -95,7 +106,15 @@ protected:
 	unsigned int m_max_numThreads;
 	volatile bool m_stopThreads;
 	bool m_opt_speed;
-	float m_last_speed;
+
+	// --- thread-count calibration (only live while m_opt_speed) ---
+	std::vector<unsigned int> m_cal_plan;    //!< candidate thread counts, in probe order
+	std::vector<double> m_cal_score;         //!< timesteps/second measured per candidate
+	size_t m_cal_index;                      //!< candidate currently being measured
+	double m_cal_time;                       //!< seconds accumulated for that candidate
+	unsigned int m_cal_steps;                //!< timesteps accumulated for that candidate
+	bool m_cal_refined;                      //!< refinement candidates already appended
+	bool m_cal_warmup;                       //!< discard the next batch (threads just respawned)
 };
 
 #endif // ENGINE_AVX2_MULTITHREAD_H

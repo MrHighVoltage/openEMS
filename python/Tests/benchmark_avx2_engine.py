@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument("--engine", choices=("avx2-multithreaded", "avx2"), default="avx2-multithreaded")
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument("--boundary", choices=("pec", "pml"), default="pec")
+    parser.add_argument("--verbose", type=int, default=0,
+                        help="openEMS verbosity level (1 shows the thread-count calibration)")
     parser.add_argument("--keep-output", action="store_true")
     return parser.parse_args()
 
@@ -88,6 +90,8 @@ def main():
     )
 
     run_options = {"cleanup": True, "engine": args.engine}
+    if args.verbose:
+        run_options["verbose"] = args.verbose
     if args.num_threads:
         run_options["numThreads"] = args.num_threads
     fdtd.Run(sim_path, **run_options)

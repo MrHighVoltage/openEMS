@@ -19,10 +19,23 @@
 #include "extensions/engine_extension.h"
 #include "tools/denormal.h"
 
+#include <algorithm>
 #include <iomanip>
 
 using std::cout;
 using std::endl;
+
+namespace
+{
+// Calibration batch granularity. Small enough that a candidate is scored
+// promptly even when the caller asks for many timesteps at once, large enough
+// that the two barrier round-trips per timestep are not what is being timed.
+const unsigned int CAL_BATCH_TS = 8;
+// A candidate is only scored once it has run at least this many timesteps and
+// this much wall time, so that a fast in-cache grid is not ranked on noise.
+const unsigned int CAL_MIN_TS = 16;
+const double CAL_MIN_SECONDS = 0.025;
+}
 
 // ============================================================================
 // Engine_AVX2_Multithread
@@ -47,9 +60,13 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	m_stopBarrier = nullptr;
 	m_max_numThreads = std::thread::hardware_concurrency();
 	m_numThreads = 0;
-	m_last_speed = 0;
 	m_opt_speed = false;
 	m_stopThreads = true;
+	m_cal_index = 0;
+	m_cal_time = 0.0;
+	m_cal_steps = 0;
+	m_cal_refined = false;
+	m_cal_warmup = true;
 }
 
 Engine_AVX2_Multithread::~Engine_AVX2_Multithread()
@@ -73,7 +90,8 @@ void Engine_AVX2_Multithread::Init()
 	if (m_numThreads == 0)
 	{
 		m_opt_speed = true;
-		m_numThreads = 1;
+		BuildCalibrationPlan();
+		m_numThreads = m_cal_plan.front();
 	}
 	else if (m_numThreads > m_max_numThreads)
 		m_numThreads = m_max_numThreads;
@@ -158,6 +176,9 @@ void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 
 bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 {
+	if (m_opt_speed)
+		return CalibrateIterateTS(iterTS);
+
 	m_iterTS = iterTS;
 
 	m_startBarrier->wait(); // start threads
@@ -166,23 +187,159 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 	return true;
 }
 
+// ----------------------------------------------------------------------------
+// Thread-count calibration
+//
+// Thread count does not affect results -- the domain decomposition is by
+// x-line and every pass is barrier-separated -- so candidates can be scored on
+// *real* timesteps rather than on a warm-up that is thrown away. Calibration is
+// therefore free apart from the timesteps that run at a suboptimal width, which
+// is why it probes a geometric ladder (a handful of candidates, ~25 ms each)
+// instead of climbing one thread at a time.
+//
+// The predecessor of this code hill-climbed from one thread inside
+// NextInterval(), which the main loop only calls every four seconds. On a
+// 4-core host that settled in a few intervals; on a 24-core host it needed 44 s
+// to reach its optimum, so any run shorter than a minute spent most of its time
+// at a fraction of peak throughput.
+// ----------------------------------------------------------------------------
+
+void Engine_AVX2_Multithread::BuildCalibrationPlan()
+{
+	m_cal_plan.clear();
+	m_cal_score.clear();
+	m_cal_index = 0;
+	m_cal_time = 0.0;
+	m_cal_steps = 0;
+	m_cal_refined = false;
+	m_cal_warmup = true;
+
+	if (m_max_numThreads < 1)
+		m_max_numThreads = 1;
+
+	for (unsigned int n = 1; n < m_max_numThreads; n *= 2)
+		m_cal_plan.push_back(n);
+	m_cal_plan.push_back(m_max_numThreads);
+}
+
+bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
+{
+	unsigned int remaining = iterTS;
+
+	while (remaining > 0 && m_opt_speed)
+	{
+		const unsigned int batch = std::min(remaining, CAL_BATCH_TS);
+
+		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+		m_iterTS = batch;
+		m_startBarrier->wait();
+		m_stopBarrier->wait();
+		const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+
+		remaining -= batch;
+
+		// The first batch at a new width runs on freshly spawned threads with
+		// cold private caches, which systematically penalises the wider
+		// configurations -- exactly the ones being judged. Throw it away.
+		if (m_cal_warmup)
+		{
+			m_cal_warmup = false;
+			continue;
+		}
+
+		m_cal_steps += batch;
+		m_cal_time += std::chrono::duration<double>(t1 - t0).count();
+
+		if (m_cal_steps >= CAL_MIN_TS && m_cal_time >= CAL_MIN_SECONDS)
+			AdvanceCalibration();
+	}
+
+	if (remaining > 0)
+	{
+		m_iterTS = remaining;
+		m_startBarrier->wait();
+		m_stopBarrier->wait();
+	}
+
+	return true;
+}
+
+void Engine_AVX2_Multithread::AdvanceCalibration()
+{
+	m_cal_score.push_back(m_cal_time > 0.0 ? m_cal_steps / m_cal_time : 0.0);
+
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "AVX2 Multithreaded Engine: " << std::setw(3) << m_cal_plan.at(m_cal_index)
+		     << " threads -> " << std::setprecision(1) << std::fixed
+		     << m_cal_score.back() << " timesteps/s" << endl;
+
+	++m_cal_index;
+
+	if (m_cal_index >= m_cal_plan.size())
+	{
+		if (m_cal_refined)
+		{
+			FinishCalibration();
+			return;
+		}
+		m_cal_refined = true;
+
+		// Bisect the two ladder gaps flanking the winner. The throughput plateau
+		// around the optimum is broad, so one refinement pass is enough to land
+		// within a couple of percent; a full linear scan would cost more in
+		// slow timesteps than it recovers.
+		const size_t best = std::max_element(m_cal_score.begin(), m_cal_score.end())
+		                    - m_cal_score.begin();
+		const unsigned int b = m_cal_plan.at(best);
+		const unsigned int lo = (best > 0) ? m_cal_plan.at(best - 1) : b;
+		const unsigned int hi = (best + 1 < m_cal_plan.size()) ? m_cal_plan.at(best + 1) : b;
+
+		const unsigned int mids[2] = { (lo + b) / 2, (b + hi) / 2 };
+		for (unsigned int i = 0; i < 2; ++i)
+		{
+			const unsigned int m = mids[i];
+			if (m == 0 || m > m_max_numThreads)
+				continue;
+			if (std::find(m_cal_plan.begin(), m_cal_plan.end(), m) != m_cal_plan.end())
+				continue;
+			m_cal_plan.push_back(m);
+		}
+
+		if (m_cal_index >= m_cal_plan.size())
+		{
+			FinishCalibration();
+			return;
+		}
+	}
+
+	m_cal_time = 0.0;
+	m_cal_steps = 0;
+	m_cal_warmup = true;
+	this->changeNumThreads(m_cal_plan.at(m_cal_index));
+}
+
+void Engine_AVX2_Multithread::FinishCalibration()
+{
+	const size_t best = std::max_element(m_cal_score.begin(), m_cal_score.end())
+	                    - m_cal_score.begin();
+	const unsigned int bestThreads = m_cal_plan.at(best);
+
+	m_opt_speed = false;
+	m_cal_time = 0.0;
+	m_cal_steps = 0;
+
+	if (bestThreads != m_numThreads)
+		this->changeNumThreads(bestThreads);
+
+	cout << "AVX2 Multithreaded Engine: Best performance found using "
+	     << m_numThreads << " threads." << endl;
+}
+
 void Engine_AVX2_Multithread::NextInterval(float curr_speed)
 {
+	// Thread-count tuning happens in CalibrateIterateTS(), which self-times on
+	// real timesteps instead of waiting for this callback's four-second cadence.
 	Engine_AVX2::NextInterval(curr_speed);
-	if (!m_opt_speed)
-		return;
-	if (curr_speed < m_last_speed)
-	{
-		this->changeNumThreads(m_numThreads - 1);
-		cout << "AVX2 Multithreaded Engine: Best performance found using "
-		     << m_numThreads << " threads." << endl;
-		m_opt_speed = false;
-	}
-	else if (m_numThreads < m_max_numThreads)
-	{
-		m_last_speed = curr_speed;
-		this->changeNumThreads(m_numThreads + 1);
-	}
 }
 
 void Engine_AVX2_Multithread::DoPreVoltageUpdates(int threadID)
