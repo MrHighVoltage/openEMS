@@ -446,6 +446,13 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 {
 	unsigned int remaining = iterTS;
 
+	// Calibrate on whichever schedule the run will actually use. Blocking
+	// changes the answer: the flat sweep's roll-off past 8 threads is DRAM
+	// contention (§4.3), and blocking removes the contention, so a thread count
+	// tuned against the flat path is tuned against a constraint that will not
+	// apply.
+	m_blk_active = (m_blk_k > 1);
+
 	while (remaining > 0 && m_opt_speed)
 	{
 		const unsigned int batch = std::min(remaining, CAL_BATCH_TS);
@@ -481,6 +488,7 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 		m_stopBarrier->wait();
 	}
 
+	m_blk_active = false;
 	return true;
 }
 

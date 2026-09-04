@@ -45,6 +45,7 @@ Benchmark drivers: `python/Tests/benchmark_avx2_engine.py`,
 | `6b571da` | Per-cell operator storage when deduplication stops paying | **1.93×–2.76×** on graded meshes; uniform meshes unchanged |
 | `00ba1c6` | Deduplicate UPML coefficients into shared tables | **1.08×–1.17×**; 19.2 MB → 1.6 MB, 53.5 MB → 4.5 MB |
 | `05ce5f0` | Stop allocating the async dump ring when the model has no dump boxes | **2.8× less GPU memory** on dump-free runs (224³: 803 → 288 MB VRAM, 657 → 142 MB host). Throughput unchanged — the buffers were never used |
+| `b87a1f7` | Give each TF/SF field index to one thread instead of racing on `+=` | Correctness, not speed: the Vulkan engine was **nondeterministic** on any TF/SF model. GPU–CPU H-field disagreement 5.62e-06 → 4.64e-07 |
 
 Two structural results worth carrying forward:
 
@@ -566,11 +567,14 @@ cache (20.25 MB of field state)"*.
   state, so blocks would have to align to the processing horizon. Until then
   the models that benefit are PEC/homogeneous ones — which is most of the
   benchmark suite but not most real simulations.
-- **Thread calibration runs on the flat path**, so with auto thread selection
-  the gain is 2.44× (865 → 2108 MC/s) rather than 3.21×: the calibration
-  timesteps themselves run unblocked, and the thread count it picks is the
-  optimum for the flat sweep. Blocking changes that optimum — §4.3's roll-off
-  past 8 threads is a DRAM-contention effect that blocking removes.
+- **Thread calibration now runs on whichever schedule the run will use.** It
+  had been calibrating on the flat path, which is the wrong constraint:
+  §4.3's roll-off past 8 threads is DRAM contention, and blocking removes it.
+  Calibrating blocked, the search picks **16 threads instead of 8** and auto
+  thread selection reaches 2412 MC/s against the flat path's 876 — **2.75×**
+  end to end, up from 2.44×. Still short of the 3.21× a hand-pinned thread
+  count gets, because the calibration timesteps are themselves spent
+  measuring.
 - **It is opt-in and prints what it decided.** Nothing changes unless the
   environment variable is set.
 
@@ -682,6 +686,15 @@ repo.
   from zero produces near-zero first cells, collapsing the timestep so nothing
   propagates and every field dump is identically zero. Use geometric grading
   and assert a non-zero peak.
+- **An intermittently failing tolerance check is a race until proven
+  otherwise.** `test_tfsf_field_probes` had been failing about one run in
+  three, which reads like a tolerance that wants loosening. It was not: six
+  runs of the same TF/SF model gave six different GPU results, while every CPU
+  engine gave one identical result across six runs each. Hashing whole probe
+  traces across repeated runs of *one* engine — rather than comparing two
+  engines to each other — is what separates "these two disagree" from "this one
+  disagrees with itself", and it took three commands. The bug was a non-atomic
+  `+=` on field elements shared by two TF/SF box faces (`b87a1f7`).
 - **A GPU A/B that silences the source measures the source, not the change.**
   This one cost most of an afternoon and nearly produced a fake 26% win. The
   first C3 experiment removed the excitation dispatch and measured
