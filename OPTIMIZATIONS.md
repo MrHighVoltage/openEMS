@@ -68,6 +68,7 @@ Two structural results worth carrying forward:
 | `574f714` | Document the MT bandwidth ceiling (comment only) | — |
 | `08fa968` | Vectorize the UPML passes | See below |
 | `fd555ee` | Calibrate the thread count on real timesteps instead of on 4 s `NextInterval` callbacks | **+50%** on a 400-timestep run (507 → 759 MC/s), **+6.4%** at 20000 timesteps. Host C only; Host A was never hurt by the old search |
+| *(prototype, opt-in)* | Trapezoidal temporal blocking of the update sweep, `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` | **3.2×–3.6×** on grids that exceed L3 (873 → 2805, 613 → 2171, 610 → 2194 MC/s). Bit-identical to the flat sweep. Engages only for the plain update path plus the excitation — see §4.7/C2 |
 
 **The multithreaded AVX2 engine is memory-bound and already at the host
 ceiling.** Measured DRAM traffic at its optimal 4-thread point is 27–38 GB/s
@@ -448,7 +449,7 @@ that is not being wasted.
 The 3.9× is simply what disappearing off DRAM buys, and reaching it needs
 traffic *elimination*, not rearrangement. That is C2.
 
-#### C2 — Temporal blocking of the AVX2 sweep  ✅ **validated at 3–4×, schedule verified, engine port pending**
+#### C2 — Temporal blocking of the AVX2 sweep  ✅ **validated, and prototyped in the engine at 3.2–3.6×**
 
 The only lever left on the CPU side, and the largest number in this document.
 A trapezoidal scheme that advances a cache-resident tile through *k*
@@ -520,20 +521,58 @@ Two geometry details cost real debugging time and are worth carrying over:
   has an optimum (k=24 at 160×128×192, k=32 already worse), and `W ≥ 2k` is a
   hard constraint of the geometry.
 
-**Why it is not in the engine yet.** Every extension is written against a
-per-thread contract of "you own this contiguous x-range, for this one
-timestep", and blocking breaks that for all of them. UPML and the dispersive
-extension are per-cell and can follow the trapezoid; the excitation must fire
-at the right *inner* timestep for the cells in the current tile, which needs an
-x-range-aware apply; probes and field dumps need globally coherent state, so
-blocks must align to the processing horizon. The engine's worker threads also
-currently own fixed x-ranges for a whole `IterateTS`, and would need to
-re-partition per sweep.
+**The engine prototype.** `Engine_AVX2_Multithread` now carries this schedule,
+opt-in via `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` (or `<k>:<W>` to set the tile
+width by hand). Measured on the real engine, 8 threads, 1200 timesteps:
 
-None of that is unreasonable, and the schedule above is now a verified
-reference to port rather than a design to invent. **Next step: a flag-gated
-prototype in `Engine_AVX2_Multithread`, engaging only for the plain update path
-plus the excitation, validated bit-identical against the flat engine.**
+| grid | flat | blocked | |
+|---|---|---|---|
+| 160×128×192 | 873 MC/s | **2805 MC/s** | 3.21× |
+| 224³ | 613 MC/s | **2171 MC/s** | 3.54× |
+| 256×224×224 | 610 MC/s | **2194 MC/s** | 3.59× |
+
+Short of the microbenchmark's 4.25×, as expected: the real kernel also streams
+a compressed operator index and is therefore not quite as purely
+bandwidth-bound as the proxy.
+
+**Bit-identical to the flat engine**, checked by dumping fields on a full-x
+slab (the axis the trapezoid tiles, so a boundary error shows there) and
+comparing every element: identical across grids 160×128×192, 224³, 256×224×224
+and a deliberately non-round 173×131×197; k ∈ {6,8,16}; 1, 4, 8 and 12 threads;
+and both auto-derived and hand-set tile widths.
+
+**The tile width is derived from the last-level cache**, not fixed. One tile of
+both field arrays should be about one L3: the measured optimum was W=64 on a
+grid with 0.56 MB x-planes and W=32 on one with 1.20 MB — 36 and 38 MB against
+this host's 36 MB. Getting this wrong is expensive rather than fatal: at 224³ a
+tile sized for the *other* grid (W=64, 77 MB) gives 1267 MC/s where W=32 gives
+2249.
+
+**It refuses rather than risks.** Blocking engages only when every active
+engine extension reports `SupportsSlabApply()`, which today means the
+excitation and nothing else — so UPML, dispersive materials, Mur, TF/SF and
+lumped elements all fall back to the flat sweep automatically, and a new
+extension is safe by omission. It also declines when the grid already fits
+cache (measured a 32% loss there) or when there are too few x-lines to tile.
+Verified: a PML run reports *"disabled, extension 'Uniaxial PML Extension'
+cannot be applied per x-range"*, and a 96³ run reports *"disabled, grid fits
+cache (20.25 MB of field state)"*.
+
+**What the prototype does not yet do**, and what full adoption needs:
+
+- **Only the excitation is slab-capable.** UPML and the dispersive extension
+  are per-cell and could follow the trapezoid with the same
+  `Apply2VoltagesSlab` interface; probes and field dumps need globally coherent
+  state, so blocks would have to align to the processing horizon. Until then
+  the models that benefit are PEC/homogeneous ones — which is most of the
+  benchmark suite but not most real simulations.
+- **Thread calibration runs on the flat path**, so with auto thread selection
+  the gain is 2.44× (865 → 2108 MC/s) rather than 3.21×: the calibration
+  timesteps themselves run unblocked, and the thread count it picks is the
+  optimum for the flat sweep. Blocking changes that optimum — §4.3's roll-off
+  past 8 threads is a DRAM-contention effect that blocking removes.
+- **It is opt-in and prints what it decided.** Nothing changes unless the
+  environment variable is set.
 
 
 #### C3 — A fixed per-timestep GPU cost  ❌ closed, the candidate was an artifact

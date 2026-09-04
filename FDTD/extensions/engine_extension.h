@@ -61,6 +61,24 @@ public:
 	virtual void Apply2Current() {}
 	virtual void Apply2Current(int threadID);
 
+	//! Can this extension be applied to a sub-range of x at an explicitly given
+	//! timestep, rather than to the whole grid at the engine's current one?
+	/*!
+	  Temporal blocking (see Engine_AVX2_Multithread's trapezoidal path) advances
+	  different parts of the grid to different timesteps, so an extension that
+	  can only be told "apply yourself to everything, now" cannot participate.
+	  Returning false -- the default -- makes the engine fall back to the flat
+	  sweep, so an extension is safe by omission.
+	*/
+	virtual bool SupportsSlabApply() const {return false;}
+
+	//! Apply to voltages for cells with x in [startX,stopX) as of timestep \a numTS.
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS)
+	{(void)startX; (void)stopX; (void)numTS;}
+	//! Apply to currents for cells with x in [startX,stopX) as of timestep \a numTS.
+	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS)
+	{(void)startX; (void)stopX; (void)numTS;}
+
 	//! Set the Engine to this extension. This will usually done automatically by Engine::AddExtension
 	virtual void SetEngine(Engine* eng) {m_Eng=eng;}
 

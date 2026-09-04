@@ -16,6 +16,7 @@
 */
 
 #include "engine_ext_excitation.h"
+#include <climits>
 #include "operator_ext_excitation.h"
 #include "FDTD/engine_sse.h"
 
@@ -30,14 +31,16 @@ Engine_Ext_Excitation::~Engine_Ext_Excitation()
 
 }
 
+// startX/stopX bound the x-range to touch and numTS is the timestep to
+// evaluate the signal at. The whole-grid entry points pass [0,UINT_MAX) and the
+// engine's current timestep, so there is one implementation, not two.
 template <typename EngType>
-void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng)
+void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS)
 {
 	//soft voltage excitation here (E-field excite)
 	int exc_pos;
 	unsigned int ny;
 	unsigned int pos[3];
-	int numTS = m_Eng->GetNumberOfTimesteps();
 	unsigned int length = m_Op_Exc->m_Exc->GetLength();
 	FDTD_FLOAT* exc_volt =  m_Op_Exc->m_Exc->GetVoltageSignal();
 
@@ -47,6 +50,8 @@ void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng)
 
 	for (unsigned int n=0; n<m_Op_Exc->Volt_Count; ++n)
 	{
+		if (m_Op_Exc->Volt_index[0][n] < startX || m_Op_Exc->Volt_index[0][n] >= stopX)
+			continue;
 		exc_pos = numTS - (int)m_Op_Exc->Volt_delay[n];
 		exc_pos *= (exc_pos>0);
 		exc_pos %= p;
@@ -61,17 +66,23 @@ void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng)
 
 void Engine_Ext_Excitation::Apply2Voltages()
 {
-	ENG_DISPATCH(Apply2VoltagesImpl);
+	const unsigned int startX = 0, stopX = UINT_MAX;
+	const int numTS = m_Eng->GetNumberOfTimesteps();
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, startX, stopX, numTS);
+}
+
+void Engine_Ext_Excitation::Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS)
+{
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, startX, stopX, numTS);
 }
 
 template <typename EngType>
-void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng)
+void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS)
 {
 	//soft current excitation here (H-field excite)
 	int exc_pos;
 	unsigned int ny;
 	unsigned int pos[3];
-	int numTS = m_Eng->GetNumberOfTimesteps();
 	unsigned int length = m_Op_Exc->m_Exc->GetLength();
 	FDTD_FLOAT* exc_curr =  m_Op_Exc->m_Exc->GetCurrentSignal();
 
@@ -81,6 +92,8 @@ void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng)
 
 	for (unsigned int n=0; n<m_Op_Exc->Curr_Count; ++n)
 	{
+		if (m_Op_Exc->Curr_index[0][n] < startX || m_Op_Exc->Curr_index[0][n] >= stopX)
+			continue;
 		exc_pos = numTS - (int)m_Op_Exc->Curr_delay[n];
 		exc_pos *= (exc_pos>0);
 		exc_pos %= p;
@@ -95,5 +108,12 @@ void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng)
 
 void Engine_Ext_Excitation::Apply2Current()
 {
-	ENG_DISPATCH(Apply2CurrentImpl);
+	const unsigned int startX = 0, stopX = UINT_MAX;
+	const int numTS = m_Eng->GetNumberOfTimesteps();
+	ENG_DISPATCH_ARGS(Apply2CurrentImpl, startX, stopX, numTS);
+}
+
+void Engine_Ext_Excitation::Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS)
+{
+	ENG_DISPATCH_ARGS(Apply2CurrentImpl, startX, stopX, numTS);
 }

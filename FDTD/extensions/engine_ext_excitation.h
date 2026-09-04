@@ -34,12 +34,19 @@ public:
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
 
+	//! The excitation is a plain per-cell add with no cross-cell coupling and no
+	//! internal state, so restricting it to an x-range at a chosen timestep is
+	//! exact -- which is what lets a temporally blocked engine carry it.
+	virtual bool SupportsSlabApply() const {return true;}
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS);
+	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS);
+
 protected:
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng);
+	void Apply2VoltagesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS);
 
 	template <typename EngType>
-	void Apply2CurrentImpl(EngType* eng);
+	void Apply2CurrentImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS);
 
 	Operator_Ext_Excitation* m_Op_Exc;
 };

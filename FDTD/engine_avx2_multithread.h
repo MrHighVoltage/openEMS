@@ -96,6 +96,17 @@ protected:
 	//! Latch the fastest measured thread count and leave calibration mode.
 	void FinishCalibration();
 
+	// --- trapezoidal temporal blocking (prototype, opt-in) ---
+	//! Decide k and the tile width, or leave blocking disabled.
+	void ConfigureTemporalBlocking();
+	//! Static contiguous split of [lo,hi) over \a nThreads, part \a id.
+	static void SplitRange(int lo, int hi, unsigned int nThreads, unsigned int id,
+	                       unsigned int& start, unsigned int& stop);
+	//! One trapezoid: k timesteps over a narrowing (dir=+1) or widening (dir=-1) x-range.
+	void TrapezoidSweep(int A0, int B0, int k, int dir, int t0, unsigned int threadID);
+	//! Worker body for the blocked schedule.
+	void BlockedWorker(unsigned int threadID);
+
 	const Operator_AVX2_Multithread* m_Op_MT;
 	std::vector<std::thread> m_threads;
 	Barrier* m_startBarrier;
@@ -115,6 +126,11 @@ protected:
 	unsigned int m_cal_steps;                //!< timesteps accumulated for that candidate
 	bool m_cal_refined;                      //!< refinement candidates already appended
 	bool m_cal_warmup;                       //!< discard the next batch (threads just respawned)
+
+	// --- temporal blocking state (read by every worker; fixed while a batch runs) ---
+	unsigned int m_blk_k;    //!< timesteps advanced per block; 0 disables blocking
+	unsigned int m_blk_W;    //!< tile width in x-planes
+	bool m_blk_active;       //!< workers take the trapezoidal path this batch
 };
 
 #endif // ENGINE_AVX2_MULTITHREAD_H
