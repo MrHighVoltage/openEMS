@@ -695,6 +695,13 @@ repo.
   engines to each other — is what separates "these two disagree" from "this one
   disagrees with itself", and it took three commands. The bug was a non-atomic
   `+=` on field elements shared by two TF/SF box faces (`b87a1f7`).
+
+  The rest of the engine was then audited the same way rather than by
+  inspection. Only three shaders accumulate into shared field memory at all
+  (`apply_excitation`, `tfsf_voltage`, `tfsf_current`), and the excitation's
+  index list has no duplicates. Repeating the hash-across-runs check on a plain
+  model and on the dispersive, lumped-RLC, conducting-sheet and local-ABC paths
+  found all of them reproducible, so TF/SF was the only one.
 - **A GPU A/B that silences the source measures the source, not the change.**
   This one cost most of an afternoon and nearly produced a fake 26% win. The
   first C3 experiment removed the excitation dispatch and measured
