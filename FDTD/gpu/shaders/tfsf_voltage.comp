@@ -49,13 +49,23 @@ void main()
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= count) return;
 
-    uint d = delay[gid];
-    int pos0 = lookupDelay(numTS, d);
-    int pos1 = lookupDelay(numTS, d + 1);
+    // Injection points on the TF/SF box's edges belong to two faces, so several
+    // entries target the same field element -- 132 of 1452 voltage entries on a
+    // 20^3 box. A plain `field[linIdx[gid]] +=` from each of them is a
+    // read-modify-write race: contributions are silently dropped and the run is
+    // not even reproducible against itself. The host sorts the entries by field
+    // index (stably, so entries sharing one keep their original relative
+    // order), and the thread that owns the start of each run applies the whole
+    // run itself.
+    uint idx = linIdx[gid];
+    if (gid > 0u && linIdx[gid - 1u] == idx) return;
 
-    float s0 = signal[pos0];
-    float s1 = signal[pos1];
-    float del = delta[gid];
-
-    field[linIdx[gid]] += ((1.0 - del) * s0 + del * s1) * amp[gid];
+    float acc = 0.0;
+    for (uint j = gid; j < count && linIdx[j] == idx; ++j)
+    {
+        int pos0 = lookupDelay(numTS, delay[j]);
+        int pos1 = lookupDelay(numTS, delay[j] + 1u);
+        acc += ((1.0 - delta[j]) * signal[pos0] + delta[j] * signal[pos1]) * amp[j];
+    }
+    field[idx] += acc;
 }

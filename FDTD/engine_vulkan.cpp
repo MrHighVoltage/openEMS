@@ -2599,6 +2599,41 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 	m_hasGPU_Dispersive = !m_gpuDisp.empty();
 }
 
+namespace
+{
+//! Sort four parallel TF/SF arrays by field index, stably.
+/*!
+  Injection points on the TF/SF box's edges belong to two faces, so several
+  entries write the same field element. The shaders own one run of equal
+  indices per thread instead of racing on a non-atomic `+=` (see the note in
+  tfsf_voltage.comp), which requires the entries to arrive grouped. The sort is
+  stable so that entries sharing an index keep the relative order the CPU
+  extension applies them in.
+*/
+void SortTFSFByFieldIndex(std::vector<uint32_t>& idx, std::vector<float>& amp,
+                          std::vector<float>& delta, std::vector<uint32_t>& delay)
+{
+	const size_t n = idx.size();
+	if (n < 2) return;
+
+	std::vector<uint32_t> order(n);
+	for (size_t i = 0; i < n; ++i) order[i] = (uint32_t)i;
+	std::stable_sort(order.begin(), order.end(),
+	                 [&idx](uint32_t a, uint32_t b) { return idx[a] < idx[b]; });
+
+	std::vector<uint32_t> sIdx(n), sDelay(n);
+	std::vector<float>    sAmp(n), sDelta(n);
+	for (size_t i = 0; i < n; ++i)
+	{
+		sIdx[i]   = idx[order[i]];
+		sAmp[i]   = amp[order[i]];
+		sDelta[i] = delta[order[i]];
+		sDelay[i] = delay[order[i]];
+	}
+	idx.swap(sIdx); amp.swap(sAmp); delta.swap(sDelta); delay.swap(sDelay);
+}
+} // namespace
+
 void Engine_Vulkan::SetupGPU_TFSF()
 {
 	// Iterate operator extensions
@@ -2725,6 +2760,9 @@ void Engine_Vulkan::SetupGPU_TFSF()
 				}
 			}
 		}
+
+		SortTFSFByFieldIndex(vIdx, vAmp, vDelta, vDelay);
+		SortTFSFByFieldIndex(cIdx, cAmp, cDelta, cDelay);
 
 		m_gpuTFSF.voltCount = voltTotal;
 		m_gpuTFSF.currCount = currTotal;
