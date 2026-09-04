@@ -8,14 +8,23 @@ Scope of this document is deliberately narrow: `Engine_Vulkan` /
 `Operator_Vulkan` and `Engine_AVX2` / `Engine_AVX2_Multithread`. The SSE and
 basic engines are out of scope.
 
-Measurements come from two hosts and are not comparable across them:
+Measurements come from three hosts and are not comparable across them:
 
-- **CPU host** — i7-6700K, 4 cores / 8 threads (SMT2), dual-channel DDR4.
-  Practical STREAM-Triad ceiling ~29 GB/s.
-- **GPU host** — Radeon RX 6800, 512 GB/s peak, 128 MB Infinity Cache,
-  **256 MB BAR** (no resizable BAR).
+- **Host A (historic, CPU)** — i7-6700K, 4 cores / 8 threads (SMT2),
+  dual-channel DDR4. Practical STREAM-Triad ceiling ~29 GB/s. Everything in
+  §1's AVX2 table was measured here. **This host is gone**; see §4.
+- **Host B (historic, GPU)** — Radeon RX 6800, 512 GB/s peak, 128 MB Infinity
+  Cache, **256 MB BAR** (no resizable BAR). Everything in §1's GPU table was
+  measured here.
+- **Host C (current, 2026-09-04)** — i9-13900K (8 P-cores + 16 E-cores,
+  32 threads), 32 GB dual-channel DDR5, STREAM-Triad ceiling **~49 GB/s** at
+  6–8 threads. Two GPUs: the same **Radeon RX 6800** — still a 256 MB BAR,
+  still no resizable BAR, so `fbd95a6` is load-bearing here too — and an
+  integrated **Intel UHD 770**. Mesa 26.2.1, RADV and ANV. §4 re-verifies
+  everything here.
 
 Benchmark drivers: `python/Tests/benchmark_avx2_engine.py`,
+`python/Tests/benchmark_gpu_engine.py` (`--gpu-index` selects the device),
 `python/Tests/test_gpu_engine.py`, `python/Tests/test_upml_engines.py`,
 `OPENEMS_RUN_STABILITY_TESTS=1 python/Tests/test_stability_testsuite.py`.
 
@@ -56,14 +65,20 @@ Two structural results worth carrying forward:
 | `586a8ac` | Add the missing AVX2 fast field-extraction path | Full-domain dump every timestep: **336 → 426 MC/s**; removes an AVX2-specific tax SSE never paid |
 | `574f714` | Document the MT bandwidth ceiling (comment only) | — |
 | `08fa968` | Vectorize the UPML passes | See below |
+| `fd555ee` | Calibrate the thread count on real timesteps instead of on 4 s `NextInterval` callbacks | **+50%** on a 400-timestep run (507 → 759 MC/s), **+6.4%** at 20000 timesteps. Host C only; Host A was never hurt by the old search |
 
 **The multithreaded AVX2 engine is memory-bound and already at the host
 ceiling.** Measured DRAM traffic at its optimal 4-thread point is 27–38 GB/s
 against a ~29 GB/s STREAM ceiling; IPC ~1.06. Thread count peaks at 4 and
-*drops* 6% at 8 — SMT siblings add no bandwidth. The runtime auto-tune
-already converges to 3–4 threads unassisted. **Do not pursue compute-side
+*drops* 6% at 8 — SMT siblings add no bandwidth. **Do not pursue compute-side
 optimizations for the multithreaded AVX2 engine on this class of host**;
 single-threaded and low-thread-count configurations still respond.
+
+> **Amended on Host C.** The bandwidth-bound conclusion survives — the engine
+> still tracks the STREAM curve, including its roll-off past 8 threads. The
+> clause *"the runtime auto-tune already converges to 3–4 threads unassisted"*
+> did not: it was true only because Host A's optimum is near the search's
+> starting point. See §4.2.
 
 ---
 
@@ -159,19 +174,23 @@ interesting *combined with* NT stores.
 High risk, wide blast radius (touches every engine and extension indexing
 scheme). Listed for completeness; **do not start here.**
 
-### Hardware caveat — read before trusting any GPU number below
+### Hardware caveat — historic, and now lifted
 
-The RX 6800 that produced every GPU measurement in §1 **is not on the current
-machine.** The only GPU here is an Intel HD Graphics 530 (Skylake GT2,
-integrated, sharing the same DDR4 as the CPU, no large last-level cache). It
-runs the GPU engine correctly but in a completely different performance
-regime — it reaches 386 MC/s on a 96³ PEC model, i.e. *about the same as the
-AVX2 CPU engine on the same host*, because it is the same memory.
+> **Superseded on 2026-09-04.** The RX 6800 is on Host C, and §4.1 reproduces
+> the headline §1 figure to within 0.2%. The caveat below is kept because G1
+> and G2 were written under it: those two were deliberately argued from
+> dispatch and barrier *counts* rather than from throughput, and that
+> reasoning is still sound. But it is why neither of them measured what the
+> minimal pipeline actually costs — which §4.5/C3 now does.
 
-Throughput conclusions measured here do not transfer to the discrete-GPU
-regime the GPU engine was tuned for. The findings below are therefore
-restricted to *architecture-independent* facts — dispatch and barrier counts,
-and structural arguments — which do transfer.
+When G1–G3 were written, the RX 6800 that produced every GPU measurement in §1
+was not on the machine. The only GPU available was an Intel HD Graphics 530
+(Skylake GT2, integrated, sharing the CPU's DDR4, no large last-level cache).
+It ran the GPU engine correctly but in a completely different performance
+regime — 386 MC/s on a 96³ PEC model, i.e. about the same as the AVX2 CPU
+engine on that host, because it was the same memory. Throughput conclusions
+drawn there would not have transferred, so the findings below were restricted
+to *architecture-independent* facts.
 
 ### G1 — Fuse the dispersive passes into the main GPU kernels  ❌ closed
 
@@ -215,27 +234,251 @@ inefficiency.
 
 ---
 
-## 3b. Status: no open candidates
+## 3b. Status of the candidates above
 
-Every candidate raised has been either implemented or closed on evidence:
+Every candidate in §3 was either implemented or closed on evidence, and none of
+those closures is reopened by the Host C re-verification:
 
-- AVX2 — at the traffic floor. The update kernels (`574f714`), and now the
+- AVX2 — at the traffic floor. The update kernels (`574f714`), and the
   dispersive extension (§A1b), are both bandwidth-bound with no addressing
   or arithmetic overhead left to remove.
-- GPU — the Yee kernel is at roofline (§1), the dispatch pipeline is already
-  minimal (G2), and the two remaining structural costs (PML flux traffic,
-  dispersive passes) are inherent to their algorithms (G1, G3).
+- GPU — the Yee kernel is at roofline (§1), the per-timestep dispatch *count*
+  is already minimal (G2), and the two remaining structural costs (PML flux
+  traffic, dispersive passes) are inherent to their algorithms (G1, G3).
 
-Further GPU work would need the discrete GPU to evaluate. Optimizing against
-the integrated GPU available here would repeat the failure already recorded in
-§2 — the "26% subgroup-uniform" win that turned out to be an artifact of an
-unrepresentative fixture.
+The one claim that did not survive was not a candidate at all but an aside in
+§1 — that the runtime thread auto-tune needs no help. It needed a lot; see
+§4.2. **New candidates opened by the Host C measurements are in §4.6.**
 
-**Restarting this work is worthwhile when:** the RX 6800 host is available
-again, a profile of a real production model (rather than synthetic fixtures)
-points somewhere specific, or a new engine feature adds a hot path.
+---
 
-## 4. Method notes
+## 4. Re-verification on Host C (2026-09-04)
+
+Host A (i7-6700K) is gone. Host C is an i9-13900K carrying **both** the RX 6800
+from Host B and an integrated UHD 770, so for the first time the GPU and CPU
+numbers come from one machine and the two GPUs are directly comparable.
+
+Every number below is a fresh measurement on Host C. Benchmark drivers are
+unchanged: `python/Tests/benchmark_avx2_engine.py` and
+`python/Tests/benchmark_gpu_engine.py`, 300–400 timesteps, PEC unless stated.
+
+### 4.1 The GPU results reproduce exactly
+
+| Grid | cells | doc value (Host B) | Host C | |
+|---|---|---|---|---|
+| 256×224×224 | 12.8 M | 5115 MC/s | **5126 MC/s** | reproduced |
+
+That is 0.2% apart on the headline `fbd95a6` figure, which retires any doubt
+that §1's GPU table describes this hardware. The roofline argument holds
+unchanged: 5126 MC/s × ~80 B/cell ≈ 410 GB/s against a 512 GB/s peak.
+
+Full sweep, both GPUs, same fixture:
+
+| cells | RX 6800 | UHD 770 | AVX2 MT (8 threads) |
+|---|---|---|---|
+| 64³ = 0.26 M | 9605 MC/s | 497 MC/s | 1851 MC/s |
+| 96³ = 0.88 M | 14397 MC/s | 591 MC/s | 3449 MC/s |
+| 128³ = 2.1 M | 16165 MC/s | 575 MC/s | 1881 MC/s |
+| 160×128×192 = 3.9 M | 16888 MC/s | 510 MC/s | 887 MC/s |
+| 224³ = 11.2 M | 5284 MC/s | 506 MC/s | 619 MC/s |
+| 256×224×224 = 12.8 M | 5181 MC/s | 506 MC/s | — |
+| 320×288×288 = 26.5 M | 5368 MC/s | 501 MC/s | — |
+
+Three things to read off it:
+
+- **The Infinity Cache cliff is between 3.9 M and 11.2 M cells**, exactly where
+  the ~24 B/cell of field state crosses 128 MB. Above it the GPU sits flat at
+  ~5.2 GC/s out to 26.5 M cells — the roofline regime, and stable there.
+- **The UHD 770 is flat at ~0.5 GC/s regardless of grid size**, i.e. it is
+  bounded by the same DDR5 the CPU uses and is beaten by the AVX2 engine on
+  every grid up to 3.9 M cells. It is useful as a portability check on a
+  second Vulkan driver (ANV rather than RADV) and for nothing else. Device
+  selection already prefers the discrete GPU, which was confirmed here.
+- **PML costs 15–20% on the RX 6800**: 4334 vs 5126 MC/s at 256×224×224, 9718
+  vs 16888 MC/s at 160×128×192. Consistent with the 2.0× per-PML-cell figure
+  in §2 once the PML's share of the volume is accounted for.
+
+### 4.2 The AVX2 thread auto-tune was badly wrong on a many-core host
+
+This is the one place the document was actively misleading. §1 asserted that
+"the runtime auto-tune already converges to 3–4 threads unassisted." On Host A
+that was true. On Host C the same code cost **43%** of throughput.
+
+The old search hill-climbed inside `NextInterval()`, which `openems.cpp` calls
+only when four seconds of wall time have elapsed, adding one thread per call
+from a start of one. Reaching Host A's optimum of 3–4 takes a few intervals.
+Reaching Host C's takes 44 s, during which the run is nowhere near peak:
+
+| run length | old auto-tune | hand-pinned best | new calibration |
+|---|---|---|---|
+| 400 TS (~8 s) | 507 MC/s | 884 MC/s | **759 MC/s** |
+| 20000 TS (~90 s) | 843 MC/s | 875 MC/s (8 thr) | **896 MC/s** |
+
+`fd555ee` replaces it with a search that scores candidates on real timesteps
+inside `IterateTS()` — legitimate because thread count cannot change results —
+walking a geometric ladder and then bisecting around the winner. It settles in
+about 250 timesteps rather than 44 s. The rewrite is worth roughly nothing on
+Host A and 1.5× on Host C, which is the whole point.
+
+One implementation detail that mattered more than expected: the first batch
+after each thread respawn must be discarded. Fresh threads start with cold
+private caches, which penalises precisely the wide configurations under
+judgement; without the warm-up the search chose anywhere between 4 and 12
+threads run to run, and with it, 8 every time.
+
+### 4.3 Thread scaling, and why it rolls off
+
+| threads | 1 | 2 | 4 | 6 | 8 | 12 | 16 | 20 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MC/s | 486 | 706 | 814 | 865 | 884 | 884 | 707 | 673 | 677 | 702 |
+
+Single-threaded `avx2` (not `avx2-multithreaded` at width 1) reaches
+**535 MC/s**, up from Host A's 365.
+
+The 20% collapse past 12 threads is *not* an engine defect and not a P-core /
+E-core scheduling artifact. A plain OpenMP STREAM-Triad on the same host has
+the same shape:
+
+| threads | 1 | 2 | 4 | 6 | 8 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|
+| GB/s | 28.8 | 33.2 | 44.8 | 48.2 | **48.9** | 45.0 | 41.8 | 39.3 | 39.3 |
+
+Both peak at 6–8 and both lose ~20% by 16. The memory controller, not the
+engine, sets this curve. There is nothing to fix — only a search that must not
+walk into the far side of it, which §4.2 now provides.
+
+### 4.4 How much a 36 MB L3 is worth
+
+At a fixed 8 threads, throughput against grid size:
+
+| cells | 0.26 M | 0.88 M | 2.1 M | 3.9 M | 4.1 M | 11.2 M |
+|---|---|---|---|---|---|---|
+| MC/s | 1851 | **3449** | 1881 | 887 | 862 | 619 |
+
+A 96³ grid runs **3.9× faster per cell** than a 160×128×192 one. The field
+state at 96³ is a few tens of MB and lives in the 36 MB L3; past that
+everything streams from DDR5. Host A's 8 MB L3 could not show this — its
+in-cache regime was too small to be interesting — which is why §1 concluded
+"memory-bound" full stop and stopped there.
+
+Read this as an upper bound on what removing DRAM traffic would buy, not as
+evidence that traffic is currently being wasted. §4.5 measures the traffic and
+shows it is not: the out-of-cache regime really is at the DRAM ceiling, so the
+3.9× is only reachable by eliminating traffic (§4.6/C2), not by rearranging
+it (§4.6/C1).
+
+### 4.5 Measured DRAM traffic — §1's 80 B/cell was too high, its conclusion was not
+
+§1 and §A1b both rest on an assumed ~80 B/cell/timestep that had never been
+measured. `perf_event_paranoid` is 2 here so the `uncore_imc` CAS counters are
+out of reach, but the *core* PMU is not, and `longest_lat_cache.miss`
+differenced between two run lengths isolates the stepping phase cleanly
+(500 vs 2500 timesteps, 8 threads pinned to the P-cores, 160×128×192):
+
+| | 500 TS | 2500 TS | difference |
+|---|---|---|---|
+| L3 misses | 1.041e9 | 4.902e9 | 3.861e9 over 2000 TS |
+| cell-timesteps | | | 7.864e9 |
+
+That is **0.491 L3 misses per cell-timestep = 31.4 B/cell of DRAM fills.** The
+ideal is 24 B/cell — read each cell's `volt` and `curr` once — so the sweep is
+already within 31% of perfect read locality, with the neighbour accesses
+absorbed by cache as intended. Add the ~24 B/cell of dirty writeback that a
+94 MB working set must eventually push to DRAM and the total is **~55 B/cell**,
+which at 873 MC/s is **~48 GB/s against the 49 GB/s STREAM ceiling.**
+
+So: the constant in §1 was wrong by ~45%, and the conclusion it was used to
+support is right anyway. The multithreaded AVX2 engine is at the DRAM roofline
+on Host C, not merely near it.
+
+### 4.6 Open candidates (new, from Host C)
+
+#### C1 — Spatial blocking of the AVX2 sweep  ❌ closed on measurement
+
+This was the obvious reading of §4.4: a 3.9× in-cache/out-of-cache gap looks
+like scattered access waiting to be tiled. §4.5 closes it. Read traffic is
+already 31.4 B/cell against a 24 B/cell floor — there is no scattered-access
+waste to recover, because the x-line decomposition and the y–z plane sweep
+already give the stencil the locality it needs. Tiling would rearrange traffic
+that is not being wasted.
+
+The 3.9× is simply what disappearing off DRAM buys, and reaching it needs
+traffic *elimination*, not rearrangement. That is C2.
+
+#### C2 — Temporal blocking of the AVX2 sweep
+
+The only lever left on the CPU side. A wavefront or trapezoidal scheme that
+advances a cache-resident tile through *k* consecutive timesteps before moving
+on divides DRAM traffic by roughly *k*. §4.4 bounds the prize: 96³ runs at
+3449 MC/s with DRAM out of the picture against 887 MC/s streaming, so a
+successful k=4 blocking would be worth somewhere between 2× and 3.5×.
+
+This is by far the largest single number anywhere in this document, and also by
+far the most invasive change in it. Every engine extension is written against
+a per-thread contract of "you own this contiguous x-range for this one
+timestep", and temporal blocking breaks that contract for all of them.
+
+**How to falsify cheaply, before touching the engine:** write a standalone
+3-point-stencil microbenchmark on a 94 MB array with the same 8-thread
+partitioning, once flat and once with a k=4 trapezoidal schedule, and measure
+whether the DRAM traffic actually falls by ~4× using the same
+`longest_lat_cache.miss` differencing as §4.5. If it does not — if the halo
+re-reads eat the saving at realistic tile sizes — the engine work cannot pay
+either, and this closes for the same reason C1 did.
+
+#### C3 — The GPU has a ~12.6 µs fixed cost per timestep
+
+New, and it does not contradict G2. G2 established that the per-timestep
+dispatch *count* is minimal (3 dispatches, 3 barriers for a plain model). It
+never measured what that fixed pipeline *costs*. Fitting the RX 6800 sweep in
+§4.1 as `time/TS = cells / rate + overhead` gives a marginal rate of
+**17.9 GC/s** and an intercept of **12.6 µs**, with the marginal rate
+consistent to within 2% across all three intervals — so the fit is real, not an
+artifact of two endpoints.
+
+That overhead is 46% of a 64³ timestep, 20% of a 96³ one, and 5% at
+160×128×192. It is *not* submission latency: `IterateTS()` already batches many
+timesteps into one command buffer and splits only at `m_maxTSPerSubmit`. It is
+in-command-buffer dispatch and full-grid barrier drain, ~4 µs apiece.
+
+**How to falsify cheaply:** record a command buffer with the same three
+dispatches over a 64³ grid but with the two intermediate barriers removed
+(wrong physics, timing only). If the timestep does not drop by roughly 8 µs the
+cost is dispatch launch rather than barrier drain, and there is nothing to
+fuse. Note that G1 already closed *dispersive* fusion on a traffic argument;
+this is the plain three-pass pipeline on small grids, where the trade goes the
+other way because there is so little work per pass.
+
+Practical caveat: even at 64³ the RX 6800 is 5× faster than the AVX2 engine, so
+this is a real inefficiency but not a competitive one.
+
+#### C4 — Is the GPU Yee kernel actually at roofline?
+
+§1 says yes, on the strength of 5126 MC/s × 80 B/cell ≈ 410 GB/s against a
+512 GB/s peak. §4.5 has just shown that 80 B/cell is too high by ~45% on the
+CPU, and the GPU stores the same `volt` and `curr` state. At the measured
+~55 B/cell the same throughput is **282 GB/s, i.e. 55% of peak** — which is not
+a roofline, it is a kernel with headroom.
+
+The counter-evidence is real too: §4.1 shows throughput flat at 5.2–5.4 GC/s
+from 11.2 M to 26.5 M cells, and flatness under growing working set is exactly
+what a bandwidth limit looks like. So one of the two readings is wrong and the
+arithmetic cannot settle it.
+
+**How to falsify cheaply:** RADV exposes memory counters — `RADV_PERFTEST`
+plus a GPU profiler, or simply `radeontop`'s memory-controller utilisation
+sampled during a 256×224×224 run. If it sits near 100%, §1 is right by luck and
+C4 closes. If it sits near 55%, the flatness has another cause (occupancy, or
+the ~12.6 µs of C3 scaling with dispatch size) and the Yee kernel has room —
+which would reopen a large part of §1's "no headroom left" conclusion.
+
+Do this before any further GPU kernel work. It is one measurement and it
+decides whether §1's central structural claim stands.
+
+
+---
+
+## 5. Method notes
 
 Hard-won test-harness lessons; all three have produced false results in this
 repo.
@@ -253,6 +496,23 @@ repo.
   from zero produces near-zero first cells, collapsing the timestep so nothing
   propagates and every field dump is identically zero. Use geometric grading
   and assert a non-zero peak.
+- **`uncore_imc` is unavailable, the core PMU is not.** `perf_event_paranoid`
+  is 2 on Host C and there is no passwordless sudo, so the memory-controller
+  CAS counters that would give DRAM traffic directly cannot be read. The core
+  PMU *does* work unprivileged for one's own process:
+  `longest_lat_cache.miss` is the usable substitute (§4.5). On this hybrid CPU
+  perf splits every event into `cpu_core/` and `cpu_atom/` variants — pin with
+  `taskset -c 0-15` and count only `cpu_core/`, otherwise the atom counter is
+  multiplexed down to a few percent enable time and silently scaled back up.
+- **Difference two run lengths instead of trusting one.** A whole-process
+  counter includes operator build, mesh setup and HDF5 writes, which on short
+  runs are a large fraction of the total. Running 500 and 2500 timesteps and
+  dividing the difference by 2000 isolates the stepping phase without needing
+  to instrument anything.
+- **Guard STREAM-style microbenchmarks against dead-code elimination.** The
+  first cut of the bandwidth benchmark in §4.3 reported 14 *million* GB/s,
+  because nothing read the output array and GCC deleted the loop. Consume the
+  result and print it.
 - **Cross-engine comparison is structurally blind to operator bugs.** Every
   engine routes through the same `Calc_ECOperatorPos`, so an indexing error
   there is invisible to all cross-engine tests (this is how the `81005f8`
