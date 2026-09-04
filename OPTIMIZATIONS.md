@@ -259,7 +259,8 @@ The one claim that did not survive was not a candidate at all but an aside in
 §1 — that the runtime thread auto-tune needs no help. It needed a lot; see
 §4.2. **New candidates opened by the Host C measurements are in §4.7. All are
 now resolved; the one that pays is C2 — temporal blocking of the AVX2 sweep,
-validated at 2–3× and awaiting implementation.**
+validated at 3–4× with a bit-identical reference schedule, and awaiting
+its engine port.**
 
 ---
 
@@ -447,74 +448,92 @@ that is not being wasted.
 The 3.9× is simply what disappearing off DRAM buys, and reaching it needs
 traffic *elimination*, not rearrangement. That is C2.
 
-#### C2 — Temporal blocking of the AVX2 sweep  ✅ **validated, not yet implemented**
+#### C2 — Temporal blocking of the AVX2 sweep  ✅ **validated at 3–4×, schedule verified, engine port pending**
 
 The only lever left on the CPU side, and the largest number in this document.
-A wavefront or trapezoidal scheme that advances a cache-resident slab through
-*k* consecutive timesteps before moving on divides DRAM traffic by roughly *k*.
-§4.4 bounded the prize at 2×–3.5×; the falsification test says it is real.
+A trapezoidal scheme that advances a cache-resident tile through *k*
+consecutive timesteps before moving on divides DRAM traffic by roughly *k*.
+§4.4 bounded the prize at 2×–3.5×; measurement beats the bound.
 
-**The test.** `python/Tests/bench_temporal_blocking.c` reproduces the *access
-pattern* of `Engine_AVX2_Multithread` — two arrays of three components in
-N-I-J-K layout with z contiguous, the E pass reading H at
+**The vehicle.** `python/Tests/bench_temporal_blocking.c` reproduces the
+*access pattern* of `Engine_AVX2_Multithread` — two arrays of three components
+in N-I-J-K layout with z contiguous, the E pass reading H at
 (x,y,z),(x−1,y,z),(x,y−1,z),(x,y,z−1) and the H pass the mirror image — but not
 its physics. Values are meaningless; only the loads, stores and their order
-matter, and those are what set cache behaviour.
+matter, and those set cache behaviour. Two things say it is faithful: its flat
+baseline is **920 MC/s** against the engine's 887, and its DRAM traffic is
+**31.0 B/cell** against the engine's measured 31.4 (§4.5). Both within ~4%.
 
-Two things say the proxy is faithful for the plain update path: its flat
-baseline is **903 MC/s** against the engine's 887, and its DRAM traffic is
-**31.2 B/cell** against the engine's measured 31.4 (§4.5). Both within ~2%.
-
-**Traffic — the falsification criterion, which asked for ~4×:**
+**Traffic — the falsification criterion asked for ~4×:**
 
 | schedule | B/cell/timestep | |
 |---|---|---|
-| flat (what the engine does today) | 31.2 | |
-| blocked, W=16 slab, k=8 | **3.4** | **9.2× less** |
-
-Halo re-reads do not eat the saving. They cannot: at W=16, k=8 the trapezoid
-re-sweeps up to 2× the planes it produces, and the schedule still wins, because
-the kernel is bandwidth-bound hard enough that redundant *compute* is nearly
-free. That asymmetry is the whole reason this works.
+| flat (what the engine does today) | 30.95 | |
+| trapezoidal, W=72, k=24 | **2.40** | **12.9× less** |
 
 **Throughput, 8 threads, best (W,k) per grid:**
 
 | grid | field state | flat | blocked | | best (W,k) |
 |---|---|---|---|---|---|
-| 96³ | 21 MB | 2915 MC/s | 1975 MC/s | **0.68× — a loss** | (16,8) |
-| 160×128×192 | 94 MB | 903 MC/s | **2558 MC/s** | 2.83× | (16,8) |
-| 224³ | 270 MB | 655 MC/s | **2012 MC/s** | 3.07× | (16,8) |
-| 320×288×288 | 637 MB | 582 MC/s | **1179 MC/s** | 2.03× | (8,8) |
+| 96³ | 21 MB | 2915 MC/s | — | **skip: already fits L3** | — |
+| 160×128×192 | 94 MB | 864 MC/s | **3675 MC/s** | 4.25× | (72,24) |
+| 224³ | 270 MB | 652 MC/s | **2270 MC/s** | 3.48× | (32,8) |
+| 320×288×288 | 637 MB | 586 MC/s | **1679 MC/s** | 2.86× | (18,8) |
 
-Throughput gains (2–3×) are much smaller than the traffic reduction (9×)
-because once traffic falls that far the kernel stops being bandwidth-bound and
-the redundant halo work starts to dominate. That is also why k has an optimum:
-at W=48, k=2/4/8/16/32 gives 1.28×/2.09×/2.57×/2.29×/1.76×. **k=8 is the knee**
-on this host, and going deeper costs more than it saves.
+It helps at every thread count, and it removes the roll-off past 8 threads that
+§4.3 traced to the memory controller — once the sweep is not DRAM-bound, extra
+threads stop fighting each other:
 
-**Two guards any implementation needs, both measured:**
+| threads | 1 | 2 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| flat | 562 | 753 | 846 | 925 | 756 | 687 |
+| trapezoidal (72,24) | 824 | 1402 | 2410 | **3642** | 2866 | 2812 |
+| gain | 1.47× | 1.86× | 2.85× | 3.94× | 3.79× | 4.09× |
 
-- **Turn it off when the grid already fits L3.** At 96³ blocking is a 32% *loss*
-  — there is no traffic to remove and the halo work is pure overhead. The
-  crossover is where field state (24 B/cell) exceeds ~36 MB.
-- **Derive the slab width from the cross-section, do not fix it.** The thing
-  that must fit cache is `W × Ny × Nz × 24 B`, and the optimum lands at
-  **~9–19 MB**, i.e. L3/4 to L3/2 — not L3, because the trapezoid keeps halos
-  live too. A fixed W=16 is right at 224³ (18.4 MB) and wrong at 320×288×288
-  (30.4 MB), where it drops to 866 MC/s against W=8's 1179.
+**The schedule is verified, not just plausible.** `bench_tb verify` runs the
+trapezoid and the flat sweep from the same pseudorandom initial state and
+compares every element: **bit-identical** across W ∈ {24,26,32,72},
+k ∈ {4,8,12,24}, threads ∈ {1,4,8}, and tile widths that do not divide the
+domain. That property is what the engine port has to preserve, and the
+benchmark is the reference implementation for it.
 
-**Why this is not already done.** Every engine extension is written against a
+Two geometry details cost real debugging time and are worth carrying over:
+
+- **Domain edges must be held, not sloped.** The trapezoid narrows because data
+  outside the tile is at the wrong time; at x=0 and x=NX−1 there is no outside
+  (the update clamps), so sloping there leaves edge cells un-advanced.
+- **The wedge's E range is not symmetric with the core's.** The two passes must
+  partition the domain — every cell updated exactly once per timestep. A
+  narrowing core leaves gaps of width 2t+1 in E but 2t+2 in H, so the widening
+  wedge sweeps E on `[An+1, Bn)`, one cell narrower per side than the
+  natural-looking `[An, Bn+1)`. The symmetric choice double-updates those cells
+  and was the first version's bug.
+
+**Guards any implementation needs, both measured:**
+
+- **Turn it off when the grid already fits L3.** At 96³ there is no traffic to
+  remove; the overlapped-tiling prototype lost 32% there. The crossover is
+  where field state (24 B/cell) exceeds ~36 MB.
+- **Derive the tile width from the cross-section.** What must fit cache is
+  `W × Ny × Nz × 24 B`; the optimum lands at L3/4–L3/2, so a fixed W is wrong.
+  W=32 is right at 224³ and 27% off at 320×288×288, where W=18 wins. `k` also
+  has an optimum (k=24 at 160×128×192, k=32 already worse), and `W ≥ 2k` is a
+  hard constraint of the geometry.
+
+**Why it is not in the engine yet.** Every extension is written against a
 per-thread contract of "you own this contiguous x-range, for this one
-timestep", and temporal blocking breaks that contract for all of them. UPML and
-the dispersive extension are per-cell and could follow the trapezoid; the
-excitation must fire at the right *inner* timestep for each cell in the slab;
-probes and field dumps need globally coherent state at specific timesteps, so
-blocks would have to align to the processing horizon. None of that is
-unreasonable, but it is a structural change to the engine and to every
-extension, not a kernel tweak — which is exactly why it was worth spending a
-microbenchmark to find out whether the prize is real before starting.
+timestep", and blocking breaks that for all of them. UPML and the dispersive
+extension are per-cell and can follow the trapezoid; the excitation must fire
+at the right *inner* timestep for the cells in the current tile, which needs an
+x-range-aware apply; probes and field dumps need globally coherent state, so
+blocks must align to the processing horizon. The engine's worker threads also
+currently own fixed x-ranges for a whole `IterateTS`, and would need to
+re-partition per sweep.
 
-It is real: **2–3× on any grid that does not fit L3.**
+None of that is unreasonable, and the schedule above is now a verified
+reference to port rather than a design to invent. **Next step: a flag-gated
+prototype in `Engine_AVX2_Multithread`, engaging only for the plain update path
+plus the excitation, validated bit-identical against the flat engine.**
 
 
 #### C3 — A fixed per-timestep GPU cost  ❌ closed, the candidate was an artifact
