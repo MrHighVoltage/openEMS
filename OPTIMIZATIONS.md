@@ -181,8 +181,10 @@ scheme). Listed for completeness; **do not start here.**
 > the headline §1 figure to within 0.2%. The caveat below is kept because G1
 > and G2 were written under it: those two were deliberately argued from
 > dispatch and barrier *counts* rather than from throughput, and that
-> reasoning is still sound. But it is why neither of them measured what the
-> minimal pipeline actually costs — which §4.7/C3 now does.
+> reasoning is still sound. §4.7/C3 has since measured what the minimal
+> pipeline actually costs on the real hardware — nothing — so the
+> count-based argument turns out to have been conservative rather than
+> merely careful.
 
 When G1–G3 were written, the RX 6800 that produced every GPU measurement in §1
 was not on the machine. The only GPU available was an Intel HD Graphics 530
@@ -247,9 +249,15 @@ those closures is reopened by the Host C re-verification:
   is already minimal (G2), and the two remaining structural costs (PML flux
   traffic, dispersive passes) are inherent to their algorithms (G1, G3).
 
+Both GPU closures were re-tested directly on Host C rather than taken on
+trust, and both hold: the Yee kernel runs at 89% of a *measured* bandwidth
+ceiling (§4.7/C4), and an extra dispatch plus barrier is free to within noise,
+so dispatch count is not merely minimal but not a lever at all (§4.7/C3).
+
 The one claim that did not survive was not a candidate at all but an aside in
 §1 — that the runtime thread auto-tune needs no help. It needed a lot; see
-§4.2. **New candidates opened by the Host C measurements are in §4.7.**
+§4.2. **New candidates opened by the Host C measurements are in §4.7. Of
+those, only C2 (temporal blocking of the AVX2 sweep) remains open.**
 
 ---
 
@@ -458,66 +466,91 @@ whether the DRAM traffic actually falls by ~4× using the same
 re-reads eat the saving at realistic tile sizes — the engine work cannot pay
 either, and this closes for the same reason C1 did.
 
-#### C3 — The GPU has a ~12.6 µs fixed cost per timestep
+#### C3 — A fixed per-timestep GPU cost  ❌ closed, the candidate was an artifact
 
-New, and it does not contradict G2. G2 established that the per-timestep
-dispatch *count* is minimal (3 dispatches, 3 barriers for a plain model). It
-never measured what that fixed pipeline *costs*. Fitting the RX 6800 sweep in
-§4.1 as `time/TS = cells / rate + overhead` gives a marginal rate of
-**17.9 GC/s** and an intercept of **12.6 µs**, with the marginal rate
-consistent to within 2% across all three intervals — so the fit is real, not an
-artifact of two endpoints.
+**Withdrawn.** The claim was a marginal rate of 17.9 GC/s and a 12.6 µs
+intercept, fitted from the §4.1 sweep. Both the fit and the data were bad.
 
-That overhead is 46% of a 64³ timestep, 20% of a 96³ one, and 5% at
-160×128×192. It is *not* submission latency: `IterateTS()` already batches many
-timesteps into one command buffer and splits only at `m_maxTSPerSubmit`. It is
-in-command-buffer dispatch and full-grid barrier drain, ~4 µs apiece.
+The data: that sweep used 300-timestep runs, short enough that startup is a
+visible share of the total. Re-measured at 4000 timesteps the 64³ point moves
+from 9605 to 13380 MC/s — a 39% difference from run length alone.
 
-**How to falsify cheaply:** record a command buffer with the same three
-dispatches over a 64³ grid but with the two intermediate barriers removed
-(wrong physics, timing only). If the timestep does not drop by roughly 8 µs the
-cost is dispatch launch rather than barrier drain, and there is nothing to
-fuse. Note that G1 already closed *dispersive* fusion on a traffic argument;
-this is the plain three-pass pipeline on small grids, where the trade goes the
-other way because there is so little work per pass.
+The fit: a single line was fitted across what turn out to be **three** distinct
+cache regimes, so the "consistent marginal rate" was an average over regimes
+that do not share one. Clean sweep, 4000 timesteps, GPU timestamps:
 
-Practical caveat: even at 64³ the RX 6800 is 5× faster than the AVX2 engine, so
-this is a real inefficiency but not a competitive one.
+| grid | cells | µs/TS | throughput | marginal rate vs previous |
+|---|---|---|---|---|
+| 48³ | 0.11 M | 12.19 | 9.1 GC/s | — |
+| 64³ | 0.26 M | 19.59 | 13.4 GC/s | 20.5 GC/s |
+| 80³ | 0.51 M | 32.65 | 15.7 GC/s | 19.1 GC/s |
+| 96³ | 0.88 M | 60.36 | 14.7 GC/s | 13.4 GC/s |
+| 128³ | 2.1 M | 162.89 | 12.9 GC/s | 11.8 GC/s |
+| 160×128×192 | 3.9 M | 309.71 | 12.7 GC/s | 12.5 GC/s |
 
-#### C4 — Is the GPU Yee kernel actually at roofline?
+The marginal rate falls from 20.5 to 12.5 GC/s — it is not one line. Below
+~0.5 M cells the 24 B/cell of field state fits the 4 MB L2; from there to
+~4 M it is Infinity-Cache-resident; past ~5 M it is DRAM (§4.1). Each regime is
+bandwidth-limited by its own cache level. Extrapolating a line through all
+three back to zero produces an "intercept" that is an artifact of the regime
+change, and fitting only the Infinity-Cache points gives an intercept of
+**−10 µs** — small grids are faster than the asymptote, not slower.
 
-§1 says yes, on the strength of 5126 MC/s × 80 B/cell ≈ 410 GB/s against a
-512 GB/s peak. §4.5 has just shown that 80 B/cell is too high by ~45% on the
-CPU, and the GPU stores the same `volt` and `curr` state. At the measured
-~55 B/cell the same throughput is **282 GB/s, i.e. 55% of peak** — which is not
-a roofline, it is a kernel with headroom.
+**Measured directly instead.** An extra pipeline barrier plus an extra dispatch
+were recorded into the per-timestep command buffer, using the excitation
+pipeline with `excCount=0` so every invocation returns immediately and writes
+nothing. Field evolution is bit-identical to the baseline, so the delta is the
+pure marginal cost of a dispatch boundary:
 
-The counter-evidence is real too: §4.1 shows throughput flat at 5.2–5.4 GC/s
-from 11.2 M to 26.5 M cells, and flatness under growing working set is exactly
-what a bandwidth limit looks like. So one of the two readings is wrong and the
-arithmetic cannot settle it.
+| grid | baseline | +1 dispatch +1 barrier | delta |
+|---|---|---|---|
+| 64³ | 19.53 µs/TS | 19.51 µs/TS | −0.1% |
+| 96³ | 60.58 µs/TS | 59.73 µs/TS | −1.4% |
+| 160×128×192 | 311.73 µs/TS | 317.37 µs/TS | +1.8% |
 
-**Attempted and inconclusive.** Two utilisation sources were tried and neither
-separates "saturated" from "busy waiting on memory":
+A whole extra dispatch and barrier is **free to within run-to-run noise**.
+There is no fixed per-timestep overhead to remove at any grid size, and G2's
+conclusion is strengthened rather than qualified: not only is the dispatch
+count minimal, dispatch count is not a lever on this hardware at all.
 
-- `mem_busy_percent` and `gpu_busy_percent` in amdgpu sysfs return *identical*
-  values to the digit (97/97 in-cache, 63/63 out-of-cache). Whatever
-  `mem_busy_percent` reports on Navi21, it is not an independent
-  memory-controller figure.
-- `radeontop` during a 320×288×288 run shows `gpu 100%`, `ta 100%`,
-  `mclk 100% (1.0 GHz)`. But a bandwidth-bound kernel and a
-  latency-bound one both show 100% shader busy, because waves stalled on
-  memory still count as busy. It confirms the GPU is not idling and nothing
-  more.
+#### C4 — Is the GPU Yee kernel at roofline?  ✅ closed, yes
 
-**Still to do:** a real counter read — `RADV_PERFTEST` with an RGP capture, or
-`amdgpu_top`'s per-block figures — giving actual bytes moved. Until then §1's
-"at roofline" claim rests on an 80 B/cell constant that §4.5 showed to be ~45%
-high on the CPU, and on the flatness in §4.1, which is suggestive but not
-decisive.
+§1 is right; the doubt raised here was mine and it was wrong. It came from
+importing the CPU's measured ~55 B/cell (§4.5) to the GPU, where it does not
+apply: the CPU's two passes share a 36 MB L3 and get cross-pass reuse, the
+GPU's do not at these grid sizes.
 
-Do this before any further GPU kernel work. It decides whether §1's central
-structural claim stands.
+Counting the traffic from `update_voltages.comp` instead of assuming it — one
+thread per cell, all three components:
+
+| per cell, per pass | bytes |
+|---|---|
+| read `curr` (3 components; the six neighbour taps hit cache) | 12 |
+| read `volt` (read-modify-write) | 12 |
+| write `volt` | 12 |
+| `opIdx` (8-bit specialization constant on this fixture) | 1 |
+| compressed coefficients (6 unique sets, L2-resident) | ~0 |
+| **per pass** | **37** |
+
+The current pass is symmetric, so **74 B/cell/timestep**. Against a measured
+ceiling — `clpeak --bandwidth` on this RX 6800 reports **477 GB/s** global
+memory (float4; 459 GB/s for float) — the out-of-cache figure is
+
+    5729 MC/s × 74 B = 424 GB/s = **89% of achievable bandwidth**
+
+which is at roofline for a memory-bound kernel. Independent corroboration: the
+comment in `update_voltages.comp` records that a 32-bit `opIdx` was measured at
+"~10% of all memory traffic", and 2 passes × 4 B = 8 B against ~80 B/cell is
+exactly 10%.
+
+So §1's 80 B/cell was right *for the GPU* and wrong *for the CPU* — the
+document used one constant for two engines whose cache behaviour differs. §4.5
+stands for the CPU, §1 stands for the GPU, and they are not in conflict.
+
+Corollary: `clpeak` also reports **48.7 GB/s** for the UHD 770, against the
+CPU's 49 GB/s STREAM-Triad ceiling (§4.3). The iGPU and the CPU are the same
+memory system to within measurement error, which is why §4.1's iGPU column is
+flat at ~0.5 GC/s regardless of grid size.
 
 
 ---
@@ -540,6 +573,40 @@ repo.
   from zero produces near-zero first cells, collapsing the timestep so nothing
   propagates and every field dump is identically zero. Use geometric grading
   and assert a non-zero peak.
+- **A GPU A/B that silences the source measures the source, not the change.**
+  This one cost most of an afternoon and nearly produced a fake 26% win. The
+  first C3 experiment removed the excitation dispatch and measured
+  318 → 244 µs/TS, seemingly proving that one dispatch boundary was worth 26%.
+  It proved nothing of the sort: with no excitation the fields stay *exactly
+  zero*, and an all-zero grid runs ~28% faster than the identical kernel on
+  real data. Controls, all on the same 160×128×192 fixture at 4000 timesteps:
+
+  | configuration | µs/TS |
+  |---|---|
+  | dispatch present, real fields | 318.4 |
+  | dispatch present, **amplitudes zeroed** | 241.3 |
+  | dispatch absent, fields zero | 235.7 |
+
+  The dispatch is worth 5.6 µs; being zero is worth 77 µs. Ruled out as
+  explanations: iteration count (both ran exactly 4000), clock and power
+  (2174 vs 2205 MHz, 202 vs 201 W sampled through the run), excitation
+  waveform (gaussian and sinusoidal agree to 1%), excitation *size* (19,140
+  points vs 110 changes nothing), and denormals — scaling all amplitudes by
+  1e10, which pushes every value out of denormal range, leaves the time
+  unchanged at 318 µs. What is left is datapath switching activity: zero
+  operands flip almost no bits, so the same instruction stream costs far less
+  energy and sustains more throughput inside the same power envelope.
+
+  **Rule: never A/B a GPU change by disabling the excitation, and check that
+  both arms carry real field data.** To isolate a dispatch's cost, add a no-op
+  dispatch (the excitation pipeline with `excCount=0`) to the arm that lacks
+  one, so field evolution stays bit-identical on both sides.
+- **Fit within one cache regime or not at all.** The withdrawn C3 intercept
+  came from a straight line through L2-resident, Infinity-Cache-resident and
+  DRAM-resident grids at once. Check where the working set (24 B/cell) sits
+  relative to L2 (4 MB), Infinity Cache (128 MB) and VRAM before fitting
+  anything, and use run lengths long enough that startup is negligible —
+  300-timestep runs put the 64³ point 39% off its 4000-timestep value.
 - **`uncore_imc` is unavailable, the core PMU is not.** `perf_event_paranoid`
   is 2 on Host C and there is no passwordless sudo, so the memory-controller
   CAS counters that would give DRAM traffic directly cannot be read. The core
