@@ -43,6 +43,7 @@ Benchmark drivers: `python/Tests/benchmark_avx2_engine.py`,
 | `fabcaa3` | Single Vulkan 1.3 baseline, negotiate device features | Enablement, not throughput |
 | `6b571da` | Per-cell operator storage when deduplication stops paying | **1.93×–2.76×** on graded meshes; uniform meshes unchanged |
 | `00ba1c6` | Deduplicate UPML coefficients into shared tables | **1.08×–1.17×**; 19.2 MB → 1.6 MB, 53.5 MB → 4.5 MB |
+| `05ce5f0` | Stop allocating the async dump ring when the model has no dump boxes | **2.8× less GPU memory** on dump-free runs (224³: 803 → 288 MB VRAM, 657 → 142 MB host). Throughput unchanged — the buffers were never used |
 
 Two structural results worth carrying forward:
 
@@ -181,7 +182,7 @@ scheme). Listed for completeness; **do not start here.**
 > and G2 were written under it: those two were deliberately argued from
 > dispatch and barrier *counts* rather than from throughput, and that
 > reasoning is still sound. But it is why neither of them measured what the
-> minimal pipeline actually costs — which §4.5/C3 now does.
+> minimal pipeline actually costs — which §4.7/C3 now does.
 
 When G1–G3 were written, the RX 6800 that produced every GPU measurement in §1
 was not on the machine. The only GPU available was an Intel HD Graphics 530
@@ -248,7 +249,7 @@ those closures is reopened by the Host C re-verification:
 
 The one claim that did not survive was not a candidate at all but an aside in
 §1 — that the runtime thread auto-tune needs no help. It needed a lot; see
-§4.2. **New candidates opened by the Host C measurements are in §4.6.**
+§4.2. **New candidates opened by the Host C measurements are in §4.7.**
 
 ---
 
@@ -364,8 +365,8 @@ in-cache regime was too small to be interesting — which is why §1 concluded
 Read this as an upper bound on what removing DRAM traffic would buy, not as
 evidence that traffic is currently being wasted. §4.5 measures the traffic and
 shows it is not: the out-of-cache regime really is at the DRAM ceiling, so the
-3.9× is only reachable by eliminating traffic (§4.6/C2), not by rearranging
-it (§4.6/C1).
+3.9× is only reachable by eliminating traffic (§4.7/C2), not by rearranging
+it (§4.7/C1).
 
 ### 4.5 Measured DRAM traffic — §1's 80 B/cell was too high, its conclusion was not
 
@@ -391,7 +392,38 @@ So: the constant in §1 was wrong by ~45%, and the conclusion it was used to
 support is right anyway. The multithreaded AVX2 engine is at the DRAM roofline
 on Host C, not merely near it.
 
-### 4.6 Open candidates (new, from Host C)
+### 4.6 GPU memory footprint — 2.8× more than the model needs
+
+Not a throughput finding, but it sets the largest grid the card can hold, which
+is the GPU's hard limit. Sampling `mem_info_vram_used` / `mem_info_gtt_used`
+through a run with no dump boxes at all:
+
+| grid | field buffer | VRAM before | VRAM after | host before | host after |
+|---|---|---|---|---|---|
+| 224³ | 128 MB | 803 MB | **288 MB** | 657 MB | **142 MB** |
+| 320×288×288 | 303 MB | 1869 MB | **653 MB** | 1533 MB | **318 MB** |
+
+The gap was exactly `DUMP_RING × 2 × m_fieldBufSize` in each of VRAM and host
+memory — the async field-download ring from `ea82f59`, allocated for
+simulations that never download a field. `RunFDTD()` decides whether to arm
+that pipeline by scanning the `ProcessingArray` for a `ProcessFields`, and the
+scan also matched `ProcField`, the bare `ProcessFields` registered a hundred
+lines earlier purely to give the energy estimate a processing cadence. Fixed in
+`05ce5f0`.
+
+Two details worth keeping:
+
+- **It only bit grids above the BAR aperture.** Below it the field buffers are
+  host-mapped directly and `EnsureDumpBuffers()` bails out at its
+  `m_voltMapped && m_currMapped` check. So the waste scaled precisely with the
+  models where VRAM is the binding constraint, and never showed up on the
+  small fixtures.
+- **Throughput was untouched** (5633 vs 5663 MC/s at 224³). The buffers were
+  allocated and then sat idle, which is why nothing in §1's timing work ever
+  pointed at it. Footprint needs its own measurement; speed benchmarks will
+  not find this class of bug.
+
+### 4.7 Open candidates (new, from Host C)
 
 #### C1 — Spatial blocking of the AVX2 sweep  ❌ closed on measurement
 
@@ -465,15 +497,27 @@ from 11.2 M to 26.5 M cells, and flatness under growing working set is exactly
 what a bandwidth limit looks like. So one of the two readings is wrong and the
 arithmetic cannot settle it.
 
-**How to falsify cheaply:** RADV exposes memory counters — `RADV_PERFTEST`
-plus a GPU profiler, or simply `radeontop`'s memory-controller utilisation
-sampled during a 256×224×224 run. If it sits near 100%, §1 is right by luck and
-C4 closes. If it sits near 55%, the flatness has another cause (occupancy, or
-the ~12.6 µs of C3 scaling with dispatch size) and the Yee kernel has room —
-which would reopen a large part of §1's "no headroom left" conclusion.
+**Attempted and inconclusive.** Two utilisation sources were tried and neither
+separates "saturated" from "busy waiting on memory":
 
-Do this before any further GPU kernel work. It is one measurement and it
-decides whether §1's central structural claim stands.
+- `mem_busy_percent` and `gpu_busy_percent` in amdgpu sysfs return *identical*
+  values to the digit (97/97 in-cache, 63/63 out-of-cache). Whatever
+  `mem_busy_percent` reports on Navi21, it is not an independent
+  memory-controller figure.
+- `radeontop` during a 320×288×288 run shows `gpu 100%`, `ta 100%`,
+  `mclk 100% (1.0 GHz)`. But a bandwidth-bound kernel and a
+  latency-bound one both show 100% shader busy, because waves stalled on
+  memory still count as busy. It confirms the GPU is not idling and nothing
+  more.
+
+**Still to do:** a real counter read — `RADV_PERFTEST` with an RGP capture, or
+`amdgpu_top`'s per-block figures — giving actual bytes moved. Until then §1's
+"at roofline" claim rests on an 80 B/cell constant that §4.5 showed to be ~45%
+high on the CPU, and on the flatness in §4.1, which is suggestive but not
+decisive.
+
+Do this before any further GPU kernel work. It decides whether §1's central
+structural claim stands.
 
 
 ---
@@ -513,6 +557,13 @@ repo.
   first cut of the bandwidth benchmark in §4.3 reported 14 *million* GB/s,
   because nothing read the output array and GCC deleted the loop. Consume the
   result and print it.
+- **Speed benchmarks do not find footprint bugs.** §4.6 was 515 MB of VRAM
+  allocated and never touched, invisible to every timing measurement in this
+  document. Sample `mem_info_vram_used` and `mem_info_gtt_used` under
+  `/sys/class/drm/card*/device` through a whole run and compare against
+  `3 * N * sizeof(float)` per field buffer; anything unexplained is real.
+  Sample continuously rather than at one fixed delay — allocation only reaches
+  steady state after `CalcECOperator`, which takes 16 s on a 26 M-cell grid.
 - **Cross-engine comparison is structurally blind to operator bugs.** Every
   engine routes through the same `Calc_ECOperatorPos`, so an indexing error
   there is invisible to all cross-engine tests (this is how the `81005f8`
