@@ -1645,8 +1645,22 @@ void openEMS::RunFDTD()
 		// need the entire volt/curr buffers -- detect whether any exist so
 		// the pipelined loop below knows it is worth speculatively kicking
 		// off the (async, double-buffered) dump download pipeline.
+		//
+		// ProcField (added to PA above, purely so the energy estimate gets a
+		// processing cadence) is a ProcessFields too, but it only ever calls
+		// CalcTotalEnergyEstimate() -> CalcFastEnergy(), which the Vulkan
+		// engine answers from a GPU-side reduction without touching the host
+		// field mirror. Counting it made hasFieldDumps unconditionally true on
+		// every GPU run, and the resulting BeginAsyncFieldDownload() call
+		// allocated the async ring -- 2x the field buffer in VRAM plus 2x in
+		// host memory -- for simulations that never dump a field. On a
+		// 224^3 grid that was 803 MB of VRAM instead of 288 MB.
 		for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
-			if (dynamic_cast<ProcessFields*>(PA->GetProcessing(i)) != NULL) { hasFieldDumps = true; break; }
+		{
+			Processing* proc = PA->GetProcessing(i);
+			if (proc == ProcField) continue;
+			if (dynamic_cast<ProcessFields*>(proc) != NULL) { hasFieldDumps = true; break; }
+		}
 		gpuEng->SetHasFieldDumps(hasFieldDumps);
 	}
 
