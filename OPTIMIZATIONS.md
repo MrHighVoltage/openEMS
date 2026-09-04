@@ -24,6 +24,7 @@ Measurements come from three hosts and are not comparable across them:
   everything here.
 
 Benchmark drivers: `python/Tests/benchmark_avx2_engine.py`,
+`python/Tests/bench_temporal_blocking.c` (standalone, see its header),
 `python/Tests/benchmark_gpu_engine.py` (`--gpu-index` selects the device),
 `python/Tests/test_gpu_engine.py`, `python/Tests/test_upml_engines.py`,
 `OPENEMS_RUN_STABILITY_TESTS=1 python/Tests/test_stability_testsuite.py`.
@@ -256,8 +257,9 @@ so dispatch count is not merely minimal but not a lever at all (§4.7/C3).
 
 The one claim that did not survive was not a candidate at all but an aside in
 §1 — that the runtime thread auto-tune needs no help. It needed a lot; see
-§4.2. **New candidates opened by the Host C measurements are in §4.7. Of
-those, only C2 (temporal blocking of the AVX2 sweep) remains open.**
+§4.2. **New candidates opened by the Host C measurements are in §4.7. All are
+now resolved; the one that pays is C2 — temporal blocking of the AVX2 sweep,
+validated at 2–3× and awaiting implementation.**
 
 ---
 
@@ -445,26 +447,75 @@ that is not being wasted.
 The 3.9× is simply what disappearing off DRAM buys, and reaching it needs
 traffic *elimination*, not rearrangement. That is C2.
 
-#### C2 — Temporal blocking of the AVX2 sweep
+#### C2 — Temporal blocking of the AVX2 sweep  ✅ **validated, not yet implemented**
 
-The only lever left on the CPU side. A wavefront or trapezoidal scheme that
-advances a cache-resident tile through *k* consecutive timesteps before moving
-on divides DRAM traffic by roughly *k*. §4.4 bounds the prize: 96³ runs at
-3449 MC/s with DRAM out of the picture against 887 MC/s streaming, so a
-successful k=4 blocking would be worth somewhere between 2× and 3.5×.
+The only lever left on the CPU side, and the largest number in this document.
+A wavefront or trapezoidal scheme that advances a cache-resident slab through
+*k* consecutive timesteps before moving on divides DRAM traffic by roughly *k*.
+§4.4 bounded the prize at 2×–3.5×; the falsification test says it is real.
 
-This is by far the largest single number anywhere in this document, and also by
-far the most invasive change in it. Every engine extension is written against
-a per-thread contract of "you own this contiguous x-range for this one
-timestep", and temporal blocking breaks that contract for all of them.
+**The test.** `python/Tests/bench_temporal_blocking.c` reproduces the *access
+pattern* of `Engine_AVX2_Multithread` — two arrays of three components in
+N-I-J-K layout with z contiguous, the E pass reading H at
+(x,y,z),(x−1,y,z),(x,y−1,z),(x,y,z−1) and the H pass the mirror image — but not
+its physics. Values are meaningless; only the loads, stores and their order
+matter, and those are what set cache behaviour.
 
-**How to falsify cheaply, before touching the engine:** write a standalone
-3-point-stencil microbenchmark on a 94 MB array with the same 8-thread
-partitioning, once flat and once with a k=4 trapezoidal schedule, and measure
-whether the DRAM traffic actually falls by ~4× using the same
-`longest_lat_cache.miss` differencing as §4.5. If it does not — if the halo
-re-reads eat the saving at realistic tile sizes — the engine work cannot pay
-either, and this closes for the same reason C1 did.
+Two things say the proxy is faithful for the plain update path: its flat
+baseline is **903 MC/s** against the engine's 887, and its DRAM traffic is
+**31.2 B/cell** against the engine's measured 31.4 (§4.5). Both within ~2%.
+
+**Traffic — the falsification criterion, which asked for ~4×:**
+
+| schedule | B/cell/timestep | |
+|---|---|---|
+| flat (what the engine does today) | 31.2 | |
+| blocked, W=16 slab, k=8 | **3.4** | **9.2× less** |
+
+Halo re-reads do not eat the saving. They cannot: at W=16, k=8 the trapezoid
+re-sweeps up to 2× the planes it produces, and the schedule still wins, because
+the kernel is bandwidth-bound hard enough that redundant *compute* is nearly
+free. That asymmetry is the whole reason this works.
+
+**Throughput, 8 threads, best (W,k) per grid:**
+
+| grid | field state | flat | blocked | | best (W,k) |
+|---|---|---|---|---|---|
+| 96³ | 21 MB | 2915 MC/s | 1975 MC/s | **0.68× — a loss** | (16,8) |
+| 160×128×192 | 94 MB | 903 MC/s | **2558 MC/s** | 2.83× | (16,8) |
+| 224³ | 270 MB | 655 MC/s | **2012 MC/s** | 3.07× | (16,8) |
+| 320×288×288 | 637 MB | 582 MC/s | **1179 MC/s** | 2.03× | (8,8) |
+
+Throughput gains (2–3×) are much smaller than the traffic reduction (9×)
+because once traffic falls that far the kernel stops being bandwidth-bound and
+the redundant halo work starts to dominate. That is also why k has an optimum:
+at W=48, k=2/4/8/16/32 gives 1.28×/2.09×/2.57×/2.29×/1.76×. **k=8 is the knee**
+on this host, and going deeper costs more than it saves.
+
+**Two guards any implementation needs, both measured:**
+
+- **Turn it off when the grid already fits L3.** At 96³ blocking is a 32% *loss*
+  — there is no traffic to remove and the halo work is pure overhead. The
+  crossover is where field state (24 B/cell) exceeds ~36 MB.
+- **Derive the slab width from the cross-section, do not fix it.** The thing
+  that must fit cache is `W × Ny × Nz × 24 B`, and the optimum lands at
+  **~9–19 MB**, i.e. L3/4 to L3/2 — not L3, because the trapezoid keeps halos
+  live too. A fixed W=16 is right at 224³ (18.4 MB) and wrong at 320×288×288
+  (30.4 MB), where it drops to 866 MC/s against W=8's 1179.
+
+**Why this is not already done.** Every engine extension is written against a
+per-thread contract of "you own this contiguous x-range, for this one
+timestep", and temporal blocking breaks that contract for all of them. UPML and
+the dispersive extension are per-cell and could follow the trapezoid; the
+excitation must fire at the right *inner* timestep for each cell in the slab;
+probes and field dumps need globally coherent state at specific timesteps, so
+blocks would have to align to the processing horizon. None of that is
+unreasonable, but it is a structural change to the engine and to every
+extension, not a kernel tweak — which is exactly why it was worth spending a
+microbenchmark to find out whether the prize is real before starting.
+
+It is real: **2–3× on any grid that does not fit L3.**
+
 
 #### C3 — A fixed per-timestep GPU cost  ❌ closed, the candidate was an artifact
 
