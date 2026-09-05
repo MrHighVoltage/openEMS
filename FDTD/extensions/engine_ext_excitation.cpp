@@ -32,10 +32,12 @@ Engine_Ext_Excitation::~Engine_Ext_Excitation()
 }
 
 // startX/stopX bound the x-range to touch and numTS is the timestep to
-// evaluate the signal at. The whole-grid entry points pass [0,UINT_MAX) and the
-// engine's current timestep, so there is one implementation, not two.
+// evaluate the signal at; first/stride select this thread's stripe of the cell
+// list. The whole-grid entry points pass [0,UINT_MAX), the engine's current
+// timestep and the whole list, so there is one implementation, not two.
 template <typename EngType>
-void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS)
+void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS,
+                                               unsigned int first, unsigned int stride)
 {
 	//soft voltage excitation here (E-field excite)
 	int exc_pos;
@@ -48,7 +50,7 @@ void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng, unsigned int startX
 	if (m_Op_Exc->m_Exc->GetSignalPeriod()>0)
 		p = int(m_Op_Exc->m_Exc->GetSignalPeriod()/m_Op_Exc->m_Exc->GetTimestep());
 
-	for (unsigned int n=0; n<m_Op_Exc->Volt_Count; ++n)
+	for (unsigned int n=first; n<m_Op_Exc->Volt_Count; n+=stride)
 	{
 		if (m_Op_Exc->Volt_index[0][n] < startX || m_Op_Exc->Volt_index[0][n] >= stopX)
 			continue;
@@ -68,16 +70,21 @@ void Engine_Ext_Excitation::Apply2Voltages()
 {
 	const unsigned int startX = 0, stopX = UINT_MAX;
 	const int numTS = m_Eng->GetNumberOfTimesteps();
-	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, startX, stopX, numTS);
+	const unsigned int first = 0, stride = 1;
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, startX, stopX, numTS, first, stride);
 }
 
-void Engine_Ext_Excitation::Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS)
+void Engine_Ext_Excitation::Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
 {
-	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, startX, stopX, numTS);
+	if (threadID < 0 || threadID >= m_NrThreads)
+		return;
+	const unsigned int first = (unsigned int)threadID, stride = (unsigned int)m_NrThreads;
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, startX, stopX, numTS, first, stride);
 }
 
 template <typename EngType>
-void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS)
+void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS,
+                                              unsigned int first, unsigned int stride)
 {
 	//soft current excitation here (H-field excite)
 	int exc_pos;
@@ -90,7 +97,7 @@ void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng, unsigned int startX,
 	if (m_Op_Exc->m_Exc->GetSignalPeriod()>0)
 		p = int(m_Op_Exc->m_Exc->GetSignalPeriod()/m_Op_Exc->m_Exc->GetTimestep());
 
-	for (unsigned int n=0; n<m_Op_Exc->Curr_Count; ++n)
+	for (unsigned int n=first; n<m_Op_Exc->Curr_Count; n+=stride)
 	{
 		if (m_Op_Exc->Curr_index[0][n] < startX || m_Op_Exc->Curr_index[0][n] >= stopX)
 			continue;
@@ -110,10 +117,14 @@ void Engine_Ext_Excitation::Apply2Current()
 {
 	const unsigned int startX = 0, stopX = UINT_MAX;
 	const int numTS = m_Eng->GetNumberOfTimesteps();
-	ENG_DISPATCH_ARGS(Apply2CurrentImpl, startX, stopX, numTS);
+	const unsigned int first = 0, stride = 1;
+	ENG_DISPATCH_ARGS(Apply2CurrentImpl, startX, stopX, numTS, first, stride);
 }
 
-void Engine_Ext_Excitation::Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS)
+void Engine_Ext_Excitation::Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
 {
-	ENG_DISPATCH_ARGS(Apply2CurrentImpl, startX, stopX, numTS);
+	if (threadID < 0 || threadID >= m_NrThreads)
+		return;
+	const unsigned int first = (unsigned int)threadID, stride = (unsigned int)m_NrThreads;
+	ENG_DISPATCH_ARGS(Apply2CurrentImpl, startX, stopX, numTS, first, stride);
 }

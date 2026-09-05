@@ -104,6 +104,14 @@ protected:
 	                       unsigned int& start, unsigned int& stop);
 	//! One trapezoid: k timesteps over a narrowing (dir=+1) or widening (dir=-1) x-range.
 	void TrapezoidSweep(int A0, int B0, int k, int dir, int t0, unsigned int threadID);
+
+	//! The blocked counterparts of DoPreVoltageUpdates() and friends.
+	void SlabPreVoltage(unsigned int startX, unsigned int stopX, int numTS, unsigned int threadID);
+	void SlabPostVoltage(unsigned int startX, unsigned int stopX, int numTS, unsigned int threadID);
+	void SlabApply2Voltages(unsigned int startX, unsigned int stopX, int numTS, unsigned int threadID);
+	void SlabPreCurrent(unsigned int startX, unsigned int stopX, int numTS, unsigned int threadID);
+	void SlabPostCurrent(unsigned int startX, unsigned int stopX, int numTS, unsigned int threadID);
+	void SlabApply2Current(unsigned int startX, unsigned int stopX, int numTS, unsigned int threadID);
 	//! Worker body for the blocked schedule.
 	void BlockedWorker(unsigned int threadID);
 
@@ -130,6 +138,14 @@ protected:
 	// --- temporal blocking state (read by every worker; fixed while a batch runs) ---
 	unsigned int m_blk_k;    //!< timesteps advanced per block; 0 disables blocking
 	unsigned int m_blk_W;    //!< tile width in x-planes
+	//! Tile boundaries: cores are consecutive pairs, wedges the interior entries.
+	/*!
+	  Not simply multiples of m_blk_W -- a short tail tile is folded into its
+	  neighbour so that the last tile is at least k+3 lines wide, which is what
+	  lets a boundary-anchored extension reach two cells inward from x=NX-1.
+	  See ConfigureTemporalBlocking().
+	*/
+	std::vector<int> m_blk_edges;
 	bool m_blk_active;       //!< workers take the trapezoidal path this batch
 };
 

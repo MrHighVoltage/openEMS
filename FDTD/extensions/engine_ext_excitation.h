@@ -38,15 +38,25 @@ public:
 	//! internal state, so restricting it to an x-range at a chosen timestep is
 	//! exact -- which is what lets a temporally blocked engine carry it.
 	virtual bool SupportsSlabApply() const {return true;}
-	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS);
-	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS);
+	virtual unsigned int SlabHookMask() const {return SLAB_APPLY_VOLT | SLAB_APPLY_CURR;}
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 
 protected:
+	//! Slab pattern A over the excitation's cell list, striped by thread.
+	/*!
+	  The list is not sorted by x, so there is no contiguous share to hand a
+	  thread; each takes every m_NrThreads'th entry instead. The entries are
+	  independent per-cell adds, so any partition gives the same result, and a
+	  list this short does not repay an index.
+	*/
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS);
+	void Apply2VoltagesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS,
+	                        unsigned int first, unsigned int stride);
 
 	template <typename EngType>
-	void Apply2CurrentImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS);
+	void Apply2CurrentImpl(EngType* eng, unsigned int startX, unsigned int stopX, int numTS,
+	                       unsigned int first, unsigned int stride);
 
 	Operator_Ext_Excitation* m_Op_Exc;
 };

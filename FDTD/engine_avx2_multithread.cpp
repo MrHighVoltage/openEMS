@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <string>
 #include <iomanip>
 #include <unistd.h>
 
@@ -212,9 +213,15 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 //
 // Enabled by OPENEMS_AVX2_TEMPORAL_BLOCK=<k>, and only when every active
 // extension can be applied to an x-range at a chosen timestep
-// (Engine_Extension::SupportsSlabApply), which today means the excitation and
-// nothing else. Anything richer -- UPML, dispersive, probes -- falls back to
-// the flat sweep, so this is safe by omission rather than by enumeration.
+// (Engine_Extension::SupportsSlabApply). An extension that has not implemented
+// the slab hooks returns false and sends the whole run back to the flat sweep,
+// so this is safe by omission rather than by enumeration.
+//
+// The depth actually used is min(k, iterTS), and openems.cpp calls IterateTS()
+// with the number of timesteps until the next probe or field dump. So the grid
+// is globally coherent whenever a probe reads it, with no work from the
+// processing side -- but the achievable depth is capped by the probe interval,
+// which openems.cpp sets to Nyquist/oversampling, typically 5-25 timesteps.
 // ----------------------------------------------------------------------------
 
 void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
@@ -227,6 +234,15 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	const char* env = std::getenv("OPENEMS_AVX2_TEMPORAL_BLOCK");
 	if (!env)
 		return;
+
+	// The two guards below refuse grids that blocking cannot help. Both are
+	// performance guards, not correctness ones, and both keep the schedule out
+	// of reach of a test small enough to run in CI -- "grid fits cache" alone
+	// demands ~48 MB of field state. OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE=1 lifts
+	// them so bit-identity can be checked on a grid that takes seconds. It
+	// makes small runs slower, which is the point of the guards.
+	const char* forceEnv = std::getenv("OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE");
+	const bool force = forceEnv && forceEnv[0] == '1';
 	char* endPtr = nullptr;
 	long k = std::strtol(env, &endPtr, 10);
 	if (!endPtr || k < 2 || (*endPtr != '\0' && *endPtr != ':'))
@@ -268,22 +284,31 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 		return;
 	}
 
+	// Name every extension that refuses, not just the first: a user who has to
+	// remove features one at a time to find out why blocking is off learns the
+	// same thing in several runs that this tells them in one.
+	std::string refused;
 	for (size_t n = 0; n < m_Eng_exts.size(); ++n)
 	{
 		if (!m_Eng_exts.at(n)->SupportsSlabApply())
 		{
-			cout << "AVX2 temporal blocking: disabled, extension '"
-			     << m_Eng_exts.at(n)->GetExtensionName()
-			     << "' cannot be applied per x-range." << endl;
-			return;
+			if (!refused.empty())
+				refused += "', '";
+			refused += m_Eng_exts.at(n)->GetExtensionName();
 		}
+	}
+	if (!refused.empty())
+	{
+		cout << "AVX2 temporal blocking: disabled, extension '" << refused
+		     << "' cannot be applied per x-range." << endl;
+		return;
 	}
 
 	// W >= 2k is a hard constraint of the geometry, not a tuning choice: a
 	// wedge's dependencies reach k cells into each neighbouring core, so
 	// narrower tiles cannot supply them.
 	// Room for at least two cores, so there is a wedge to fill.
-	if ((long)numLines[0] < 2 * W)
+	if ((long)numLines[0] < 2 * W && !force)
 	{
 		cout << "AVX2 temporal blocking: disabled, only " << numLines[0]
 		     << " x-lines for a tile width of " << W << "." << endl;
@@ -294,7 +319,7 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	// no traffic to remove; blocking then costs the wedge work for nothing
 	// (measured -32% on a 96^3 grid), so do not engage.
 	const double fieldBytes = planeBytes * (double)numLines[0];
-	if (fieldBytes < 48.0 * 1024 * 1024)
+	if (fieldBytes < 48.0 * 1024 * 1024 && !force)
 	{
 		cout << "AVX2 temporal blocking: disabled, grid fits cache ("
 		     << (fieldBytes / (1024 * 1024)) << " MB of field state)." << endl;
@@ -303,9 +328,39 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 
 	m_blk_k = (unsigned int)k;
 	m_blk_W = (unsigned int)W;
+
+	// Tile boundaries, with one guarantee bolted on for the benefit of
+	// boundary-anchored extensions.
+	//
+	// A core tile narrows from its *left*, so the tail tile [xL,NX) has slab
+	// [xL+t+1,NX) at step t. If the tail is short, that slab reaches x=NX-1
+	// while x=NX-2 has dropped out of it -- fine for the Yee update, whose
+	// stencil wants the neighbour one timestep behind, but fatal for an
+	// extension like Mur or an absorbing sheet, which reads the line one or two
+	// cells inward at the *same* timestep it writes the edge. Requiring the
+	// tail to be at least k+3 lines keeps x=NX-1, NX-2 and NX-3 in one slab for
+	// every step of the block; the low edge already has the same property for
+	// free, since the first tile holds x=0 and is never narrower than
+	// W-k+1 >= k+1 >= 3.
+	//
+	// The remainder is folded into the previous tile rather than left as a
+	// short one, so the last tile is up to k+2 lines wider than the rest. That
+	// costs a little cache residency on one tile out of NX/W and buys Mur
+	// x-boundaries -- the most common absorbing boundary there is -- a blocked
+	// schedule at all.
+	m_blk_edges.clear();
+	for (long x = 0; x < (long)numLines[0]; x += W)
+		m_blk_edges.push_back((int)x);
+	m_blk_edges.push_back((int)numLines[0]);
+	const long minTail = k + 3;
+	if (m_blk_edges.size() >= 3 &&
+	    (long)numLines[0] - m_blk_edges.at(m_blk_edges.size() - 2) < minTail)
+		m_blk_edges.erase(m_blk_edges.end() - 2);
+
 	cout << "AVX2 temporal blocking ACTIVE (prototype): k=" << m_blk_k
 	     << ", tile width " << m_blk_W << " x-lines, "
-	     << (planeBytes * m_blk_W / (1024 * 1024)) << " MB per tile" << endl;
+	     << (planeBytes * m_blk_W / (1024 * 1024)) << " MB per tile, "
+	     << (m_blk_edges.size() - 1) << " tiles" << endl;
 }
 
 void Engine_AVX2_Multithread::SplitRange(int lo, int hi, unsigned int nThreads,
@@ -321,6 +376,57 @@ void Engine_AVX2_Multithread::SplitRange(int lo, int hi, unsigned int nThreads,
 	start = (unsigned int)lo + off;
 	stop  = start + cnt;
 }
+
+// The six slab dispatchers below mirror the flat path's DoPreVoltageUpdates()
+// and friends exactly: same extension order (pre-hooks walk m_Eng_exts
+// backwards, since it is sorted by descending priority), same barrier after
+// every single extension. Getting either wrong is not a performance bug but a
+// correctness one -- two extensions can touch the same cell, and the flat path
+// is what defines who goes first.
+// An extension that does not implement a hook is skipped along with its
+// barrier: a no-op call is free but the barrier after it is not, and the
+// blocked path pays that barrier once per timestep *per tile*. With six or
+// seven extensions -- one per boundary face is ordinary -- that is the
+// difference between 42 barriers per timestep per tile and about 20. Every
+// thread reads the same masks, so they cannot disagree on how many barriers
+// this pass has.
+#define SLAB_DISPATCH_FWD(NAME, HOOK, BIT)                                     \
+void Engine_AVX2_Multithread::NAME(unsigned int startX, unsigned int stopX,    \
+                                   int numTS, unsigned int threadID)           \
+{                                                                              \
+	for (size_t n = 0; n < m_Eng_exts.size(); ++n)                             \
+	{                                                                          \
+		Engine_Extension* ext = m_Eng_exts.at(n);                              \
+		if (!(ext->SlabHookMask() & Engine_Extension::BIT))                    \
+			continue;                                                          \
+		ext->HOOK(startX, stopX, numTS, (int)threadID);                        \
+		m_IterateBarrier->wait();                                              \
+	}                                                                          \
+}
+
+#define SLAB_DISPATCH_REV(NAME, HOOK, BIT)                                     \
+void Engine_AVX2_Multithread::NAME(unsigned int startX, unsigned int stopX,    \
+                                   int numTS, unsigned int threadID)           \
+{                                                                              \
+	for (int n = (int)m_Eng_exts.size() - 1; n >= 0; --n)                      \
+	{                                                                          \
+		Engine_Extension* ext = m_Eng_exts.at(n);                              \
+		if (!(ext->SlabHookMask() & Engine_Extension::BIT))                    \
+			continue;                                                          \
+		ext->HOOK(startX, stopX, numTS, (int)threadID);                        \
+		m_IterateBarrier->wait();                                              \
+	}                                                                          \
+}
+
+SLAB_DISPATCH_REV(SlabPreVoltage,     DoPreVoltageUpdatesSlab,  SLAB_PRE_VOLT)
+SLAB_DISPATCH_FWD(SlabPostVoltage,    DoPostVoltageUpdatesSlab, SLAB_POST_VOLT)
+SLAB_DISPATCH_FWD(SlabApply2Voltages, Apply2VoltagesSlab,       SLAB_APPLY_VOLT)
+SLAB_DISPATCH_REV(SlabPreCurrent,     DoPreCurrentUpdatesSlab,  SLAB_PRE_CURR)
+SLAB_DISPATCH_FWD(SlabPostCurrent,    DoPostCurrentUpdatesSlab, SLAB_POST_CURR)
+SLAB_DISPATCH_FWD(SlabApply2Current,  Apply2CurrentSlab,        SLAB_APPLY_CURR)
+
+#undef SLAB_DISPATCH_FWD
+#undef SLAB_DISPATCH_REV
 
 void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
                                              int t0, unsigned int threadID)
@@ -355,26 +461,27 @@ void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
 		if (eHi > NX)  eHi = NX;
 		if (eHi < eLo) eHi = eLo;
 
+		const int ts = t0 + t;
+		const unsigned int eS = (unsigned int)eLo, eE = (unsigned int)eHi;
+
 		unsigned int s, e;
+		SlabPreVoltage(eS, eE, ts, threadID);
 		SplitRange(eLo, eHi, m_numThreads, threadID, s, e);
 		if (e > s) UpdateVoltages(s, e - s);
 		m_IterateBarrier->wait();
-
-		if (threadID == 0)
-			for (size_t n = 0; n < m_Eng_exts.size(); ++n)
-				m_Eng_exts.at(n)->Apply2VoltagesSlab((unsigned int)eLo, (unsigned int)eHi, t0 + t);
-		m_IterateBarrier->wait();
+		SlabPostVoltage(eS, eE, ts, threadID);
+		SlabApply2Voltages(eS, eE, ts, threadID);
 
 		const int hHi = (Bn < NXH) ? Bn : NXH;
+		const unsigned int hS = (unsigned int)An;
+		const unsigned int hE = (unsigned int)(hHi < An ? An : hHi);
+
+		SlabPreCurrent(hS, hE, ts, threadID);
 		SplitRange(An, hHi, m_numThreads, threadID, s, e);
 		if (e > s) UpdateCurrents(s, e - s);
 		m_IterateBarrier->wait();
-
-		if (threadID == 0)
-			for (size_t n = 0; n < m_Eng_exts.size(); ++n)
-				m_Eng_exts.at(n)->Apply2CurrentSlab((unsigned int)An,
-				                                    (unsigned int)(hHi < An ? An : hHi), t0 + t);
-		m_IterateBarrier->wait();
+		SlabPostCurrent(hS, hE, ts, threadID);
+		SlabApply2Current(hS, hE, ts, threadID);
 
 		A = An;
 		B = Bn;
@@ -383,7 +490,6 @@ void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
 
 void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 {
-	const int NX = (int)numLines[0];
 	const unsigned int total = m_iterTS;
 	const int startTS = (int)numTS;
 
@@ -393,10 +499,10 @@ void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 		const int kk = (int)std::min((unsigned int)m_blk_k, total - done);
 		const int t0 = startTS + (int)done;
 
-		for (int x0 = 0; x0 < NX; x0 += (int)m_blk_W)
-			TrapezoidSweep(x0, x0 + (int)m_blk_W, kk, +1, t0, threadID);
-		for (int c = (int)m_blk_W; c < NX; c += (int)m_blk_W)
-			TrapezoidSweep(c, c, kk, -1, t0, threadID);
+		for (size_t i = 0; i + 1 < m_blk_edges.size(); ++i)
+			TrapezoidSweep(m_blk_edges[i], m_blk_edges[i + 1], kk, +1, t0, threadID);
+		for (size_t i = 1; i + 1 < m_blk_edges.size(); ++i)
+			TrapezoidSweep(m_blk_edges[i], m_blk_edges[i], kk, -1, t0, threadID);
 
 		done += (unsigned int)kk;
 	}

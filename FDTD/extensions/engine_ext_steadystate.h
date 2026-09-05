@@ -36,6 +36,15 @@ public:
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
 
+	// SupportsSlabApply() stays false, and this is the one extension where that
+	// is a conclusion rather than an omission. The per-probe sampling would slab
+	// fine, but every period this extension also calls CalcFastEnergy() over the
+	// *whole* grid and compares it with the previous period's. A blocked
+	// schedule has no moment mid-block at which the whole grid is at one
+	// timestep, so there is nothing correct to integrate. Steady-state
+	// detection therefore runs on the flat sweep, and the engine says so at
+	// startup instead of silently falling back.
+
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
 	double GetLastDiff();
 	void SetGpuUpdater(std::function<void()> updater) {m_gpuUpdater = std::move(updater);}

@@ -61,23 +61,103 @@ public:
 	virtual void Apply2Current() {}
 	virtual void Apply2Current(int threadID);
 
+	// ------------------------------------------------------------------------
+	// Slab interface -- the temporally blocked schedule
+	//
+	// Temporal blocking (Engine_AVX2_Multithread's trapezoidal path,
+	// OPTIMIZATIONS.md 4.7/C2) advances a tile of x-lines through several
+	// timesteps before moving on, so at any moment different parts of the grid
+	// are at different timesteps. An extension that can only be told "apply
+	// yourself to everything, at whatever timestep the engine says it is on"
+	// cannot participate; the engine then falls back to the flat sweep, so an
+	// extension is safe by omission.
+	//
+	// The six hooks below mirror the six flat ones one-for-one and are called
+	// in the same order at the same points, once per timestep per tile, on
+	// every worker thread, barrier-separated. Implementing them means honouring
+	// this contract:
+	//
+	//   * Write only to cells with x in [startX,stopX). Anything outside is at
+	//     a different timestep and would be corrupted.
+	//   * Read only cells in that same range, which are all at timestep numTS.
+	//     A boundary-anchored extension is the exception, and the schedule
+	//     guarantees exactly this much for it: whenever a slab contains x=0 or
+	//     x=NX-1, it also contains the two cells inward from that edge, at the
+	//     same timestep. That covers Mur (one cell in) and an absorbing sheet
+	//     (two, for its current shift). It does *not* extend to an edge-shaped
+	//     extension sitting anywhere else -- an interior sheet normal to x is
+	//     cut by a sweeping tile boundary and cannot be slabbed.
+	//   * Take the timestep from \a numTS. The engine's own counter only
+	//     advances at block boundaries and is wrong inside one.
+	//   * Partition the work across threadID in [0,GetNumberOfThreads()) and
+	//     touch nothing another thread will touch. The engine barriers between
+	//     extensions, not within one.
+	//   * Carry no state that depends on call *order*. Ring buffers rotated
+	//     once per call, scratch buffers rebuilt per call, and similar are all
+	//     broken by a schedule that visits the same timestep many times for
+	//     different slabs; index such state by numTS instead.
+	//
+	// Three shapes cover every extension in the tree:
+	//   A  volume or cell list -- intersect the extension's x-extent with
+	//      [startX,stopX), then split that intersection across threadID.
+	//   B  plane anchored at a fixed x -- do nothing unless the slab contains
+	//      the plane, else keep the extension's own thread split.
+	//   C  plane or surface spanning x -- restrict whichever loop axis is x,
+	//      split the remaining axis across threadID.
+	// ------------------------------------------------------------------------
+
 	//! Can this extension be applied to a sub-range of x at an explicitly given
 	//! timestep, rather than to the whole grid at the engine's current one?
-	/*!
-	  Temporal blocking (see Engine_AVX2_Multithread's trapezoidal path) advances
-	  different parts of the grid to different timesteps, so an extension that
-	  can only be told "apply yourself to everything, now" cannot participate.
-	  Returning false -- the default -- makes the engine fall back to the flat
-	  sweep, so an extension is safe by omission.
-	*/
 	virtual bool SupportsSlabApply() const {return false;}
 
-	//! Apply to voltages for cells with x in [startX,stopX) as of timestep \a numTS.
-	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS)
-	{(void)startX; (void)stopX; (void)numTS;}
-	//! Apply to currents for cells with x in [startX,stopX) as of timestep \a numTS.
-	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS)
-	{(void)startX; (void)stopX; (void)numTS;}
+	//! Which of the six slab hooks below this extension actually implements.
+	enum SlabHook
+	{
+		SLAB_PRE_VOLT   = 1 << 0,
+		SLAB_POST_VOLT  = 1 << 1,
+		SLAB_APPLY_VOLT = 1 << 2,
+		SLAB_PRE_CURR   = 1 << 3,
+		SLAB_POST_CURR  = 1 << 4,
+		SLAB_APPLY_CURR = 1 << 5
+	};
+
+	//! Bitwise OR of the SlabHook values this extension overrides.
+	/*!
+	  The engine barriers after every extension it calls, so an unimplemented
+	  hook is not free: it costs a barrier across all threads for a call that
+	  does nothing. That is cheap once per timestep on the flat sweep and
+	  expensive on the blocked one, which pays it once per timestep *per tile*.
+	  Most extensions implement two or three of the six -- declaring which lets
+	  the engine skip the call and the barrier together. Every thread reads the
+	  same mask, so they stay in step.
+
+	  Get this wrong by omitting a hook you do implement and it is never called,
+	  silently. It is declared next to the hooks for that reason.
+	*/
+	virtual unsigned int SlabHookMask() const {return 0;}
+
+	//! \copydoc DoPreVoltageUpdates
+	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}
+	//! \copydoc DoPostVoltageUpdates
+	virtual void DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}
+	//! \copydoc Apply2Voltages
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}
+
+	//! \copydoc DoPreCurrentUpdates
+	virtual void DoPreCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}
+	//! \copydoc DoPostCurrentUpdates
+	virtual void DoPostCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}
+	//! \copydoc Apply2Current
+	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}
+
+	//! Number of threads the slab hooks are partitioned across.
+	int GetNumberOfThreads() const {return m_NrThreads;}
 
 	//! Set the Engine to this extension. This will usually done automatically by Engine::AddExtension
 	virtual void SetEngine(Engine* eng) {m_Eng=eng;}
@@ -94,6 +174,18 @@ public:
 
 protected:
 	Engine_Extension(Operator_Extension* op_ext);
+
+	//! Intersect [lo,hi) with the slab [startX,stopX), then hand this thread its share.
+	/*!
+	  The even split every pattern-A slab hook needs, in one place: the
+	  extensions differ in what they iterate, not in how they divide it. Returns
+	  false when this thread has nothing to do, which is the common case for a
+	  slab that misses the extension's box entirely.
+	*/
+	static bool SlabShare(unsigned int lo, unsigned int hi,
+	                      unsigned int startX, unsigned int stopX,
+	                      int nThreads, int threadID,
+	                      unsigned int& start, unsigned int& stop);
 
 	Operator_Extension* m_Op_ext;
 	Engine* m_Eng;

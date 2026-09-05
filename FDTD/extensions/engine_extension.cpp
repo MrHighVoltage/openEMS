@@ -93,3 +93,25 @@ bool Engine_Extension::operator< (const Engine_Extension& other)
 {
 	return (GetPriority()<other.GetPriority());
 }
+
+bool Engine_Extension::SlabShare(unsigned int lo, unsigned int hi,
+                                 unsigned int startX, unsigned int stopX,
+                                 int nThreads, int threadID,
+                                 unsigned int& start, unsigned int& stop)
+{
+	start = stop = 0;
+	if (nThreads <= 0 || threadID < 0 || threadID >= nThreads)
+		return false;
+	if (startX > lo) lo = startX;
+	if (stopX  < hi) hi = stopX;
+	if (hi <= lo)
+		return false;
+
+	const unsigned int n    = hi - lo;
+	const unsigned int base = n / (unsigned int)nThreads;
+	const unsigned int rem  = n % (unsigned int)nThreads;
+	const unsigned int id   = (unsigned int)threadID;
+	start = lo + id * base + (id < rem ? id : rem);
+	stop  = start + base + (id < rem ? 1u : 0u);
+	return stop > start;
+}
