@@ -69,7 +69,7 @@ Two structural results worth carrying forward:
 | `574f714` | Document the MT bandwidth ceiling (comment only) | — |
 | `08fa968` | Vectorize the UPML passes | See below |
 | `fd555ee` | Calibrate the thread count on real timesteps instead of on 4 s `NextInterval` callbacks | **+50%** on a 400-timestep run (507 → 759 MC/s), **+6.4%** at 20000 timesteps. Host C only; Host A was never hurt by the old search |
-| *(prototype, opt-in)* | Trapezoidal temporal blocking of the update sweep, `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` | **3.2×–3.6×** on grids that exceed L3 (873 → 2805, 613 → 2171, 610 → 2194 MC/s). Bit-identical to the flat sweep. Engages only for the plain update path plus the excitation — see §4.7/C2 |
+| *(prototype, opt-in)* | Trapezoidal temporal blocking of the update sweep, `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` | **3.2×–3.6×** on grids that exceed L3 (873 → 2805, 613 → 2171, 610 → 2194 MC/s). Bit-identical to the flat sweep. Carries every engine extension except steady-state detection: **3.13×** PEC, **2.96×** UPML, **2.60×** Mur at 224³ — see §4.7/C2 |
 
 **The multithreaded AVX2 engine is memory-bound and already at the host
 ceiling.** Measured DRAM traffic at its optimal 4-thread point is 27–38 GB/s
@@ -450,7 +450,7 @@ that is not being wasted.
 The 3.9× is simply what disappearing off DRAM buys, and reaching it needs
 traffic *elimination*, not rearrangement. That is C2.
 
-#### C2 — Temporal blocking of the AVX2 sweep  ✅ **validated, and prototyped in the engine at 3.2–3.6×**
+#### C2 — Temporal blocking of the AVX2 sweep  ✅ **validated, in the engine, and carrying every extension**
 
 The only lever left on the CPU side, and the largest number in this document.
 A trapezoidal scheme that advances a cache-resident tile through *k*
@@ -550,23 +550,128 @@ tile sized for the *other* grid (W=64, 77 MB) gives 1267 MC/s where W=32 gives
 2249.
 
 **It refuses rather than risks.** Blocking engages only when every active
-engine extension reports `SupportsSlabApply()`, which today means the
-excitation and nothing else — so UPML, dispersive materials, Mur, TF/SF and
-lumped elements all fall back to the flat sweep automatically, and a new
-extension is safe by omission. It also declines when the grid already fits
-cache (measured a 32% loss there) or when there are too few x-lines to tile.
-Verified: a PML run reports *"disabled, extension 'Uniaxial PML Extension'
-cannot be applied per x-range"*, and a 96³ run reports *"disabled, grid fits
-cache (20.25 MB of field state)"*.
+engine extension reports `SupportsSlabApply()`. An extension that has not
+implemented the slab hooks returns false — the default — and sends the whole run
+back to the flat sweep, so a new extension is safe by omission rather than by
+enumeration, and the startup line names every extension that refused rather than
+just the first. It also declines when the grid already fits cache (measured a
+32% loss there) or when there are too few x-lines to tile. Verified: a 96³ run
+reports *"disabled, grid fits cache (20.25 MB of field state)"*, and a run with
+steady-state detection names that extension.
 
-**What the prototype does not yet do**, and what full adoption needs:
+The paragraphs above describe the prototype as first landed, when the excitation
+was the only slab-capable extension. That is no longer the state; see below.
 
-- **Only the excitation is slab-capable.** UPML and the dispersive extension
-  are per-cell and could follow the trapezoid with the same
-  `Apply2VoltagesSlab` interface; probes and field dumps need globally coherent
-  state, so blocks would have to align to the processing horizon. Until then
-  the models that benefit are PEC/homogeneous ones — which is most of the
-  benchmark suite but not most real simulations.
+##### Full adoption: every extension, and what it cost
+
+The prototype above engaged only when the excitation was the sole active
+extension, which is almost no real simulation. All of them now carry the
+schedule. Measured on the same host, 224³, 8 threads, 800 timesteps, k=8:
+
+| boundary | extensions | flat | blocked | |
+|---|---|---|---|---|
+| PEC | excitation | 618 MC/s | **1933 MC/s** | 3.13× |
+| Mur ABC | 6 × Mur + excitation | 561 MC/s | **1456 MC/s** | 2.60× |
+| UPML | 6 × UPML + excitation | 232 MC/s | **687 MC/s** | 2.96× |
+
+**The interface was missing two thirds of itself.** The blocked path called
+`Apply2VoltagesSlab` and `Apply2CurrentSlab` only, and only on thread 0. The
+flat path runs *six* hooks per timestep — `DoPre*`, `DoPost*`, `Apply2*` for
+voltages and currents — barrier-separated, on every thread. So UPML, Mur, the
+absorbing BC and Lorentz were not merely un-migrated: the hooks they use had no
+slab counterpart at all. `Engine_Extension` now declares all six, with the
+contract in the header, and `TrapezoidSweep` calls them in the flat path's
+order.
+
+**Three extensions carried state that only works if one call is one timestep.**
+That assumption is true of the flat sweep and false of a blocked one, which
+visits the same timestep once per tile:
+
+- `Engine_Ext_LumpedRLC` rotated its `v_Vdn`/`v_Jn` history rings by pointer
+  swap per call. Now indexed by absolute timestep.
+- `Engine_Ext_TFSF` rebuilt a shared `m_DelayLookup` scratch buffer per call —
+  a race between threads and the wrong timestep inside a block. Now private to
+  the call. It also read one table entry its own loop never filled, working
+  only because the voltage hook had filled it earlier in the same timestep.
+- Mur and the absorbing BC gated on `m_Eng->GetNumberOfTimesteps()`, which only
+  advances at block boundaries. They take the timestep from the argument now.
+
+**The schedule had to change for boundary extensions, and this is the part that
+was not obvious.** A core tile narrows from its *left*, so the tail tile
+`[xL,NX)` has slab `[xL+t+1,NX)` at step t. If the tail is short that slab
+reaches x=NX-1 after x=NX-2 has dropped out of it. Harmless for the Yee update,
+whose stencil wants the neighbour one timestep behind — and fatal for Mur, which
+reads the line one cell inward at the *same* timestep it writes the edge. With
+NX=100, W=30, k=15 the tail tile is `[90,100)` and at t=8 the slab owning x=99
+is `[99,100)` alone. `ConfigureTemporalBlocking` therefore folds a short tail
+into its neighbour so the last tile is at least k+3 lines, which is what makes
+the contract's guarantee — *a slab containing a domain edge also contains the
+two cells inward from it* — true at both ends. Without it, Mur x-boundaries
+could not be blocked at all, and Mur is the most common absorbing boundary
+there is.
+
+**Two extensions cannot be split across threads, for the same reason.** TF/SF
+adds into the cells along the edges where two box faces meet, once per face, so
+any partition that sends two faces to two threads has them read-modify-writing
+one cell — a lost update, and a summation order that varies. Lumped elements
+number in the tens of cells and are not worth the question. Both run their slab
+hooks on thread 0, which is parity rather than a concession: neither ever
+overrode the threadID-taking hooks, so the flat sweep already ran them there.
+
+**The dispersive cell list had to be split by x, not by index.**
+`Operator_Ext_ConductingSheet` pushes the *identical* position list into both of
+its two orders, so `Apply2*` subtracts from one engine cell once per order.
+Splitting each order's indices independently would put those two subtractions on
+two threads — a race, and `v-a-b ≠ v-b-a`. Splitting x and deriving each order's
+range from that keeps every cell on one thread in order 0,1,…, as the flat sweep
+has it. The list is indexed through an x-sorted permutation built in the engine
+extension, so the operator's parallel arrays are never reordered.
+
+**Barriers turned out to be the thing worth optimising.** The blocked path pays
+the flat path's per-extension barrier once per timestep *per tile* — 13
+trapezoids here, so a 13× multiplier. With six boundary faces plus the
+excitation that was 42 barriers per timestep per tile, and Mur was capped at
+2.28× against PEC's 3.05× purely by that. Most of them were for hooks the
+extension does not implement: a no-op call is free, the barrier after it is not.
+`SlabHookMask()` declares which of the six an extension overrides and the engine
+skips call and barrier together, cutting 42 to about 20 — worth **+14% on Mur,
++7% on UPML**, and the numbers in the table above.
+
+**Steady-state detection is the one extension that genuinely cannot be
+blocked**, and it now says so rather than falling back silently. Its per-probe
+sampling would slab fine, but every period it integrates total energy over the
+whole grid, and a blocked schedule has no moment mid-block at which the whole
+grid is at one timestep.
+
+**The block depth is capped by the probe interval.** `openems.cpp` calls
+`IterateTS(step)` with the number of timesteps until the next probe or dump, and
+`BlockedWorker` clamps `k` to it, so probes and field dumps are correct with no
+work on their side — the grid is globally coherent whenever one reads it. But
+that ceiling is real: `openems.cpp:639` sets the probe interval to
+`Nyquist/oversampling`, typically 5–25 timesteps. It happens to bracket the
+measured optimum (k=6…24), which is why this is usable at all; a run oversampled
+far past Nyquist will not reach the numbers above.
+
+**Verified by `python/Tests/test_temporal_blocking.py`**, which runs each
+configuration twice — flat and blocked — and compares E and H dumps
+element-for-element. It asserts blocking actually *engaged* first: without that
+the comparison passes vacuously every time an extension declines and the engine
+falls back to the flat sweep. Covered: PEC, UPML, Mur, Drude, lumped RLC, local
+absorbing BC, TF/SF plane wave, a combined case, and a sweep over
+(k,W) ∈ {2:8, 4:16, 3:13, 6:20} × {1,3,4} threads. `OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE=1`
+lifts the two performance guards so this runs on a CI-sized grid.
+
+**What is still not blocked**, and why:
+
+- **Steady-state detection**, as above — a property of the method, not a gap.
+- **An absorbing sheet in the interior, normal to x.** The partition boundary
+  between a core and its wedge sweeps one x-line per timestep, so it eventually
+  falls between the line the sheet writes and the line it reads. No tile sizing
+  fixes that. A sheet on a domain face is fine.
+- **The cylindrical engines**, which never reach this code path.
+
+##### Remaining notes on the prototype
+
 - **Thread calibration now runs on whichever schedule the run will use.** It
   had been calibrating on the flat path, which is the wrong constraint:
   §4.3's roll-off past 8 threads is DRAM contention, and blocking removes it.
