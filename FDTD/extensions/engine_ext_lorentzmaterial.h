@@ -32,12 +32,23 @@ public:
 
 	virtual void DoPreCurrentUpdates();
 
+	//! SupportsSlabApply() stays true: the two hooks added here are per-cell
+	//! recursions over the same list, and both have a slab form below.
+	//! Dispersive's two Apply hooks, plus the two this class adds. Inheriting
+	//! the base mask unchanged would leave these two never called.
+	virtual unsigned int SlabHookMask() const
+	{return Engine_Ext_Dispersive::SlabHookMask() | SLAB_PRE_VOLT | SLAB_PRE_CURR;}
+
+	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPreCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+
 protected:
+	//! \copydoc Engine_Ext_Dispersive::Apply2VoltagesImpl
 	template <typename EngType>
-	void DoPreVoltageUpdatesImpl(EngType* eng);
+	void DoPreVoltageUpdatesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int threadID);
 
 	template <typename EngType>
-	void DoPreCurrentUpdatesImpl(EngType* eng);
+	void DoPreCurrentUpdatesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int threadID);
 
 	Operator_Ext_LorentzMaterial* m_Op_Ext_Lor;
 

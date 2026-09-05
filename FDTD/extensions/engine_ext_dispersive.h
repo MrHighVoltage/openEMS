@@ -25,6 +25,8 @@
 
 #include <vector>
 #include <cstddef>
+#include <atomic>
+#include <mutex>
 
 class Operator_Ext_Dispersive;
 
@@ -37,12 +39,53 @@ public:
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
 
+	//! Every list entry is one cell's ADE state added back into that same cell,
+	//! with no reach into a neighbour and no dependence on the absolute
+	//! timestep, so an x-range can be applied on its own.
+	/*!
+	  Subclasses inherit this "yes". Engine_Ext_LorentzMaterial does so
+	  deliberately -- it implements the two update hooks it adds. Anything else
+	  deriving from this class must either implement its own slab hooks or
+	  override this back to false, or the blocked schedule will silently skip
+	  whatever it added.
+	*/
+	virtual bool SupportsSlabApply() const {return true;}
+	virtual unsigned int SlabHookMask() const {return SLAB_APPLY_VOLT | SLAB_APPLY_CURR;}
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+
 protected:
+	//! Slab pattern A over the dispersive cell list.
+	/*!
+	  \a threadID below zero means the whole-grid entry point: the whole list,
+	  in list order, exactly as before. From zero up it means a slab, and then
+	  only the entries with x in [startX,stopX) that fall in this thread's share
+	  of that range are touched.
+	*/
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng);
+	void Apply2VoltagesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int threadID);
 
 	template <typename EngType>
-	void Apply2CurrentImpl(EngType* eng);
+	void Apply2CurrentImpl(EngType* eng, unsigned int startX, unsigned int stopX, int threadID);
+
+	//! Build the slab index, and with it the AVX2 cache below, exactly once.
+	void BuildSlabIndex();
+
+	//! Narrow a slab to this thread's x-share; false when it has nothing to do.
+	bool SlabXShare(unsigned int startX, unsigned int stopX, int threadID,
+	                unsigned int& xLo, unsigned int& xHi) const;
+
+	//! This thread's entries of order \a o, as a range of \a perm (NULL = the
+	//! list itself, in list order, for the whole-grid entry points).
+	bool SlabEntries(int o, unsigned int xLo, unsigned int xHi, int threadID,
+	                 const unsigned int*& perm, unsigned int& j0, unsigned int& j1) const;
+
+	//! Where order \a o's entries with x >= \a x start in m_slab_perm.
+	unsigned int SlabLowerBound(int o, unsigned int x) const
+	{
+		const std::vector<unsigned int>& xoff = m_slab_xoff[o];
+		return x < xoff.size() ? xoff[x] : xoff.back();
+	}
 
 	Operator_Ext_Dispersive* m_Op_Ext_Disp;
 
@@ -56,6 +99,28 @@ protected:
 	//! ADE voltages
 	// Array setup: volt_ADE[N_order][direction][mesh_pos]
 	FDTD_FLOAT ***volt_ADE;
+
+	// --- x-ordered index for the slab hooks --------------------------------
+	// A slab wants the entries with x in [startX,stopX), and the cell list is
+	// not indexed by x, so finding them by scanning would cost a full pass over
+	// the list per slab per timestep -- and the blocked schedule calls these
+	// hooks far more often than the flat sweep does. m_slab_perm holds the list
+	// indices sorted by x (concatenated over orders, order o starting at
+	// m_slab_start[o]) and m_slab_xoff[o][x] counts the entries before x, so a
+	// slab is a contiguous run found by two lookups.
+	//
+	// The operator's arrays are shared with its subclasses and have several
+	// parallel arrays hanging off the same indices, so this permutes here
+	// rather than reordering there.
+	std::vector<unsigned int> m_slab_perm;
+	std::vector<size_t> m_slab_start;
+	std::vector<std::vector<unsigned int> > m_slab_xoff;
+	//! x-extent of the whole cell list, [lo,hi), shared by all orders.
+	unsigned int m_slab_xlo = 0;
+	unsigned int m_slab_xhi = 0;
+	//! Guards the one-shot build; the slab hooks run on all threads at once.
+	std::atomic<bool> m_slab_idx_built{false};
+	std::mutex m_slab_idx_lock;
 
 #if OPENEMS_ENABLE_AVX2
 	// --- AVX2 flat-address cache -------------------------------------------

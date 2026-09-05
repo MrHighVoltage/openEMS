@@ -16,6 +16,7 @@
 */
 
 #include "engine_ext_lorentzmaterial.h"
+#include <climits>
 #if OPENEMS_ENABLE_AVX2
 #include "FDTD/engine_avx2.h"
 #include <type_traits>
@@ -81,19 +82,28 @@ Engine_Ext_LorentzMaterial::~Engine_Ext_LorentzMaterial()
 }
 
 template <typename EngType>
-void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
+void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int threadID)
 {
 #if OPENEMS_ENABLE_AVX2
 	if constexpr (std::is_same<EngType, Engine_AVX2>::value)
-		BuildAVX2Index(eng);
+	{
+		if (threadID < 0)
+			BuildAVX2Index(eng);
+	}
 #endif
+	unsigned int xLo, xHi;
+	if (!SlabXShare(startX, stopX, threadID, xLo, xHi))
+		return;
+
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_volt_ADE_On[o]==false) continue;
 
 		unsigned int **pos = m_Op_Ext_Lor->m_LM_pos[o];
 
-		const unsigned int cnt = m_Op_Ext_Lor->m_LM_Count.at(o);
+		const unsigned int* perm;
+		unsigned int j0, j1;
+		if (!SlabEntries(o, xLo, xHi, threadID, perm, j0, j1)) continue;
 
 #if OPENEMS_ENABLE_AVX2
 		if constexpr (std::is_same<EngType, Engine_AVX2>::value)
@@ -104,8 +114,9 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 			f8vector* fld = eng->m_volt;
 			if (m_Op_Ext_Lor->m_volt_Lor_ADE_On[o])
 			{
-				for (unsigned int i=0; i<cnt; ++i)
+				for (unsigned int j=j0; j<j1; ++j)
 				{
+					const unsigned int i = perm ? perm[j] : j;
 					const f8vector* c = fld + off[i];
 					const unsigned int l = lane[i];
 					for (int n=0; n<3; ++n)
@@ -118,8 +129,9 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 			}
 			else
 			{
-				for (unsigned int i=0; i<cnt; ++i)
+				for (unsigned int j=j0; j<j1; ++j)
 				{
+					const unsigned int i = perm ? perm[j] : j;
 					const f8vector* c = fld + off[i];
 					const unsigned int l = lane[i];
 					for (int n=0; n<3; ++n)
@@ -135,8 +147,9 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 
 		if (m_Op_Ext_Lor->m_volt_Lor_ADE_On[o])
 		{
-			for (unsigned int i=0; i<cnt; ++i)
+			for (unsigned int j=j0; j<j1; ++j)
 			{
+				const unsigned int i = perm ? perm[j] : j;
 				volt_Lor_ADE[o][0][i]+=m_Op_Ext_Lor->v_Lor_ADE[o][0][i]*volt_ADE[o][0][i];
 				volt_ADE[o][0][i] *= m_Op_Ext_Lor->v_int_ADE[o][0][i];
 				volt_ADE[o][0][i] += m_Op_Ext_Lor->v_ext_ADE[o][0][i] * (eng->EngType::GetVolt(0,pos[0][i],pos[1][i],pos[2][i])-volt_Lor_ADE[o][0][i]);
@@ -152,8 +165,9 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 		}
 		else
 		{
-			for (unsigned int i=0; i<m_Op_Ext_Lor->m_LM_Count.at(o); ++i)
+			for (unsigned int j=j0; j<j1; ++j)
 			{
+				const unsigned int i = perm ? perm[j] : j;
 				volt_ADE[o][0][i] *= m_Op_Ext_Lor->v_int_ADE[o][0][i];
 				volt_ADE[o][0][i] += m_Op_Ext_Lor->v_ext_ADE[o][0][i] * eng->EngType::GetVolt(0,pos[0][i],pos[1][i],pos[2][i]);
 
@@ -169,23 +183,48 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 
 void Engine_Ext_LorentzMaterial::DoPreVoltageUpdates()
 {
-	ENG_DISPATCH(DoPreVoltageUpdatesImpl);
+	const unsigned int startX = 0, stopX = UINT_MAX;
+	const int threadID = -1;
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, startX, stopX, threadID);
+}
+
+void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	// numTS is not used: this is a per-cell recursion driven by the cell's own
+	// voltage, with no term that reads the absolute timestep. It is still
+	// timestep-correct under blocking because the schedule advances each cell
+	// exactly once per timestep, in increasing timestep order, so each cell
+	// sees the same sequence of voltages it sees under the flat sweep.
+	(void)numTS;
+	if (threadID < 0 || threadID >= m_NrThreads)
+		return;
+	BuildSlabIndex();
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, startX, stopX, threadID);
 }
 
 template <typename EngType>
-void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
+void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng, unsigned int startX, unsigned int stopX, int threadID)
 {
 #if OPENEMS_ENABLE_AVX2
 	if constexpr (std::is_same<EngType, Engine_AVX2>::value)
-		BuildAVX2Index(eng);
+	{
+		if (threadID < 0)
+			BuildAVX2Index(eng);
+	}
 #endif
+	unsigned int xLo, xHi;
+	if (!SlabXShare(startX, stopX, threadID, xLo, xHi))
+		return;
+
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_curr_ADE_On[o]==false) continue;
 
 		unsigned int **pos = m_Op_Ext_Lor->m_LM_pos[o];
 
-		const unsigned int cnt = m_Op_Ext_Lor->m_LM_Count.at(o);
+		const unsigned int* perm;
+		unsigned int j0, j1;
+		if (!SlabEntries(o, xLo, xHi, threadID, perm, j0, j1)) continue;
 
 #if OPENEMS_ENABLE_AVX2
 		if constexpr (std::is_same<EngType, Engine_AVX2>::value)
@@ -196,8 +235,9 @@ void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
 			f8vector* fld = eng->m_curr;
 			if (m_Op_Ext_Lor->m_curr_Lor_ADE_On[o])
 			{
-				for (unsigned int i=0; i<cnt; ++i)
+				for (unsigned int j=j0; j<j1; ++j)
 				{
+					const unsigned int i = perm ? perm[j] : j;
 					const f8vector* c = fld + off[i];
 					const unsigned int l = lane[i];
 					for (int n=0; n<3; ++n)
@@ -210,8 +250,9 @@ void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
 			}
 			else
 			{
-				for (unsigned int i=0; i<cnt; ++i)
+				for (unsigned int j=j0; j<j1; ++j)
 				{
+					const unsigned int i = perm ? perm[j] : j;
 					const f8vector* c = fld + off[i];
 					const unsigned int l = lane[i];
 					for (int n=0; n<3; ++n)
@@ -227,8 +268,9 @@ void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
 
 		if (m_Op_Ext_Lor->m_curr_Lor_ADE_On[o])
 		{
-			for (unsigned int i=0; i<cnt; ++i)
+			for (unsigned int j=j0; j<j1; ++j)
 			{
+				const unsigned int i = perm ? perm[j] : j;
 				curr_Lor_ADE[o][0][i]+=m_Op_Ext_Lor->i_Lor_ADE[o][0][i]*curr_ADE[o][0][i];
 				curr_ADE[o][0][i] *= m_Op_Ext_Lor->i_int_ADE[o][0][i];
 				curr_ADE[o][0][i] += m_Op_Ext_Lor->i_ext_ADE[o][0][i] * (eng->EngType::GetCurr(0,pos[0][i],pos[1][i],pos[2][i])-curr_Lor_ADE[o][0][i]);
@@ -244,8 +286,9 @@ void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
 		}
 		else
 		{
-			for (unsigned int i=0; i<m_Op_Ext_Lor->m_LM_Count.at(o); ++i)
+			for (unsigned int j=j0; j<j1; ++j)
 			{
+				const unsigned int i = perm ? perm[j] : j;
 				curr_ADE[o][0][i] *= m_Op_Ext_Lor->i_int_ADE[o][0][i];
 				curr_ADE[o][0][i] += m_Op_Ext_Lor->i_ext_ADE[o][0][i] * eng->EngType::GetCurr(0,pos[0][i],pos[1][i],pos[2][i]);
 
@@ -261,5 +304,17 @@ void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
 
 void Engine_Ext_LorentzMaterial::DoPreCurrentUpdates()
 {
-	ENG_DISPATCH(DoPreCurrentUpdatesImpl);
+	const unsigned int startX = 0, stopX = UINT_MAX;
+	const int threadID = -1;
+	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, startX, stopX, threadID);
+}
+
+//! \copydoc Engine_Ext_Dispersive::Apply2CurrentSlab
+void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	(void)numTS;
+	if (threadID < 0 || threadID >= m_NrThreads)
+		return;
+	BuildSlabIndex();
+	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, startX, stopX, threadID);
 }
