@@ -19,6 +19,7 @@
 #define ENGINE_EXT_TFSF_H
 
 #include "engine_extension.h"
+#include "tools/constants.h"
 
 class Operator_Ext_TFSF;
 
@@ -31,10 +32,40 @@ public:
 	virtual void DoPostVoltageUpdates();
 	virtual void DoPostCurrentUpdates();
 
-protected:
-	Operator_Ext_TFSF* m_Op_TFSF;
+	//! TF/SF only ever adds a precomputed, delayed excitation value to the six
+	//! faces of its box -- it reads no field, so its reach into the grid is
+	//! zero and it can be split at any x-range boundary.
+	virtual bool SupportsSlabApply() const {return true;}
+	virtual unsigned int SlabHookMask() const {return SLAB_POST_VOLT | SLAB_POST_CURR;}
+	virtual void DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPostCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 
-	unsigned int* m_DelayLookup;
+protected:
+	//! Shared body of DoPostVoltageUpdates()/-Slab(): startX/stopX bound the
+	//! x-range to touch, numTS is the timestep to evaluate the delay lookup
+	//! at, and nThreads/threadID select this thread's share of whichever axis
+	//! is not x. The whole-grid entry point passes [0,UINT_MAX), the engine's
+	//! current timestep, and a single thread, so there is one implementation.
+	void DoPostVoltageUpdatesImpl(unsigned int startX, unsigned int stopX, int numTS, int nThreads, int threadID);
+	void DoPostCurrentUpdatesImpl(unsigned int startX, unsigned int stopX, int numTS, int nThreads, int threadID);
+
+	//! One of the box's six faces (direction \a n, low/high side \a lowHigh).
+	//! \a posN is the fixed coordinate of the face along axis n (already
+	//! resolved by the caller to m_Start[n]/m_Stop[n], since the voltage and
+	//! current updates disagree on the low side by one cell). \a nP/\a nPP are
+	//! the in-plane axes; whichever of the two is axis 0 carries the global x
+	//! coordinate and gets restricted to [startX,stopX), while the other is
+	//! split across threadID. Shared between the two low/high calls per
+	//! direction so that split, and the ui_pos formula it must stay in step
+	//! with, is written once.
+	void VoltageFace(int n, int nP, int nPP, int lowHigh, unsigned int posN,
+	                  unsigned int startX, unsigned int stopX, int nThreads, int threadID,
+	                  const unsigned int* delay, FDTD_FLOAT* signal);
+	void CurrentFace(int n, int nP, int nPP, int lowHigh, unsigned int posN,
+	                  unsigned int startX, unsigned int stopX, int nThreads, int threadID,
+	                  const unsigned int* delay, FDTD_FLOAT* signal);
+
+	Operator_Ext_TFSF* m_Op_TFSF;
 };
 
 #endif // ENGINE_EXT_TFSF_H
