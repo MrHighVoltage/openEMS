@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument("--timesteps", type=int, default=2000)
     parser.add_argument("--engine", choices=("avx2-multithreaded", "avx2"), default="avx2-multithreaded")
     parser.add_argument("--num-threads", type=int, default=0)
-    parser.add_argument("--boundary", choices=("pec", "pml"), default="pec")
+    parser.add_argument("--boundary", choices=("pec", "pml", "mur"), default="pec")
     parser.add_argument("--verbose", type=int, default=0,
                         help="openEMS verbosity level (1 shows the thread-count calibration)")
     parser.add_argument("--keep-output", action="store_true")
@@ -62,6 +62,8 @@ def main():
     boundary = [0] * 6
     if args.boundary == "pml":
         boundary = ["PML_8"] * 6
+    elif args.boundary == "mur":
+        boundary = ["MUR"] * 6
 
     fdtd = openEMS(NrTS=args.timesteps, EndCriteria=1.0e-300)
     fdtd.SetGaussExcite(1.0e9, 0.5e9)
