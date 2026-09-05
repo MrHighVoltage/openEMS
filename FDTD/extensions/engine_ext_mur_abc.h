@@ -41,19 +41,41 @@ public:
 	virtual void Apply2Voltages() {Engine_Ext_Mur_ABC::Apply2Voltages(0);}
 	virtual void Apply2Voltages(int threadID);
 
+	virtual bool SupportsSlabApply() const;
+	virtual unsigned int SlabHookMask() const
+	{return SLAB_PRE_VOLT | SLAB_POST_VOLT | SLAB_APPLY_VOLT;}
+
+	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+
 protected:
 	template <typename EngType>
-	void DoPreVoltageUpdatesImpl(EngType* eng, int threadID);
+	void DoPreVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
 
 	template <typename EngType>
-	void DoPostVoltageUpdatesImpl(EngType* eng, int threadID);
+	void DoPostVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
 
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng, int threadID);
+	void Apply2VoltagesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
+
+	//! This thread's share of the whole plane: its stripe of \a i, all of \a j.
+	bool ThreadRange(int threadID,
+	                 unsigned int& iStart, unsigned int& iStop,
+	                 unsigned int& jStart, unsigned int& jStop);
+
+	//! The same, reduced to the part of the plane that lies in the x-slab.
+	bool SlabRange(unsigned int startX, unsigned int stopX, int threadID,
+	               unsigned int& iStart, unsigned int& iStop,
+	               unsigned int& jStart, unsigned int& jStop);
 
 	Operator_Ext_Mur_ABC* m_Op_mur;
 
 	inline bool IsActive() {if (m_Eng->GetNumberOfTimesteps()<m_start_TS) return false; return true;}
+	//! The engine's timestep counter only moves at block boundaries and is wrong
+	//! inside one, so the slab hooks must judge activity from the timestep they
+	//! are handed instead.
+	inline bool IsActive(int numTS) const {return (numTS>=0) && ((unsigned int)numTS>=m_start_TS);}
 	unsigned int m_start_TS;
 
 	// See detailed comments in operator_ext_mur_abc.h, not repeated here.

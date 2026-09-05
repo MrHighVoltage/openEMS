@@ -36,6 +36,7 @@
 #include "tools/array_ops.h"
 #include "tools/useful.h"
 #include "operator_ext_excitation.h"
+#include "FDTD/operator.h"
 
 Engine_Ext_Absorbing_BC::Engine_Ext_Absorbing_BC(Operator_Ext_Absorbing_BC* op_ext) :
 	Engine_Extension(op_ext),
@@ -99,6 +100,114 @@ void Engine_Ext_Absorbing_BC::SetNumberOfThreads(int nrThread)
 		m_threadStartLine.at(n) = m_threadStartLine.at(n - 1) + m_linesPerThread.at(n - 1);
 }
 
+bool Engine_Ext_Absorbing_BC::IsSuperAbsorbing() const
+{
+	return (Operator_Ext_Absorbing_BC::ABCtype)(m_ABCtype) == Operator_Ext_Absorbing_BC::MUR_1ST_SA;
+}
+
+// The sheet is indexed (i,j) along m_nyP and m_nyPP, and which of those is the
+// engine's x axis depends on m_ny: for m_ny==1 it is the inner loop j, for
+// m_ny==2 the outer loop i, and for m_ny==0 neither -- the sheet then sits on
+// the single x-line m_posStart[0]. The two helpers below are where that mapping
+// lives; the six hooks just take loop bounds and are the same code for the flat
+// sweep and for a slab. The current hooks pass counts one shorter in each
+// direction, for the dual grid.
+bool Engine_Ext_Absorbing_BC::ThreadRange(int threadID, unsigned int iCount, unsigned int jCount,
+                                          unsigned int& iStart, unsigned int& iStop,
+                                          unsigned int& jStart, unsigned int& jStop)
+{
+	iStart = iStop = jStart = jStop = 0;
+	if ((threadID < 0) || (threadID >= m_NrThreads))
+		return false;
+
+	iStart = m_threadStartLine.at(threadID);
+	iStop = std::min<unsigned int>(iStart + m_linesPerThread.at(threadID), iCount);
+	jStop = jCount;
+	return (iStop > iStart) && (jStop > jStart);
+}
+
+bool Engine_Ext_Absorbing_BC::SlabRange(unsigned int startX, unsigned int stopX, int threadID,
+                                        unsigned int iCount, unsigned int jCount,
+                                        unsigned int& iStart, unsigned int& iStop,
+                                        unsigned int& jStart, unsigned int& jStop)
+{
+	iStart = iStop = jStart = jStop = 0;
+
+	if (m_ny == 2)
+	{
+		// m_nyP is x, so the slab cuts the outer loop and the share-out across
+		// threads has to be made over what is left of it. Keeping the sheet's
+		// own split would leave a slab that covers one thread's stripe to that
+		// one thread while the rest idle.
+		const unsigned int base = m_posStart[m_nyP];
+		if (!SlabShare(base, base + iCount, startX, stopX, m_NrThreads, threadID, iStart, iStop))
+			return false;
+		iStart -= base;
+		iStop -= base;
+		jStop = jCount;
+		return jStop > jStart;
+	}
+
+	if (!ThreadRange(threadID, iCount, jCount, iStart, iStop, jStart, jStop))
+		return false;
+
+	if (m_ny == 1)
+	{
+		// m_nyPP is x: cut the inner loop and leave the split over i alone.
+		const unsigned int base = m_posStart[m_nyPP];
+		const unsigned int lo = (startX > base) ? startX - base : 0;
+		const unsigned int hi = (stopX > base) ? stopX - base : 0;
+		if (jStart < lo) jStart = lo;
+		if (jStop > hi) jStop = hi;
+		return jStop > jStart;
+	}
+
+	// m_ny==0: pattern B. The sheet writes one x-line and reads one or two lines
+	// inward, so it runs in full or not at all, and only for the slab that holds
+	// all of them at the same timestep. The schedule guarantees such a slab
+	// exists at either domain edge, and SupportsSlabApply() has already refused
+	// any sheet not on one; this test only picks out which slab it is, it is
+	// not what makes the case safe.
+	unsigned int xLo, xHi;
+	FootprintX(xLo, xHi);
+	return (xLo >= startX) && (xHi < stopX);
+}
+
+bool Engine_Ext_Absorbing_BC::SupportsSlabApply() const
+{
+	// Normal to y or z, every shifted read sits on the same x-line as the write,
+	// so any slab that owns the line owns everything this sheet touches.
+	if (m_ny != 0)
+		return true;
+
+	// Normal to x, the sheet reads up to two lines inward and needs them at the
+	// same timestep as the line it writes. On a domain face that is exactly the
+	// guarantee the slab contract makes, and the schedule pays for it on both
+	// sides: the first tile holds x=0 and is never narrower than
+	// W-k+1 >= k+1 >= 3 lines, and ConfigureTemporalBlocking() folds a short
+	// tail tile into its neighbour so the last tile is at least k+3 -- which is
+	// what stops the tail's sloping *left* side from reaching x=NX-1 after
+	// x=NX-2 has dropped out of the slab.
+	//
+	// An *interior* sheet still cannot work, and unlike Mur this extension can
+	// be placed on one: the partition boundary between a core and its wedge
+	// sweeps one x-line per timestep, so it eventually falls between the line
+	// written and the line read, and no tile sizing fixes that. The test below
+	// therefore admits only a sheet whose whole footprint sits on a domain
+	// face -- {0,1} at the low end, {NX-1,NX-2,NX-3} at the high end.
+	const unsigned int NX = m_Op_ABC->m_Op->GetNumberOfLines(0);
+	unsigned int xLo, xHi;
+	FootprintX(xLo, xHi);
+	return (xLo == 0 && xHi <= 2) || (NX >= 3 && xHi == NX - 1 && xLo >= NX - 3);
+}
+
+//! The x-lines this sheet reads or writes, when it is normal to x.
+void Engine_Ext_Absorbing_BC::FootprintX(unsigned int& xLo, unsigned int& xHi) const
+{
+	xLo = std::min(m_posStart[m_ny], std::min(m_pos_ny0_shift_V, std::min(m_pos_ny0_I, m_pos_ny0_shift_I)));
+	xHi = std::max(m_posStart[m_ny], std::max(m_pos_ny0_shift_V, std::max(m_pos_ny0_I, m_pos_ny0_shift_I)));
+}
+
 // The first order Mur boundary condition is based on the following step:
 // The field at time step n, location i, is u
 // E(i,n + 1) = E(i + s,n) + K1*[E(i,n + 1) - E(i,n)]
@@ -106,25 +215,18 @@ void Engine_Ext_Absorbing_BC::SetNumberOfThreads(int nrThread)
 // K1 = (vp*Dt - Dx)/(vp*Dt + Dx)
 
 template <typename EngType>
-void Engine_Ext_Absorbing_BC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_Absorbing_BC::DoPreVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-	if (IsActive()==false) return;
-
-	if (m_Eng==NULL) return;
-
-	if (threadID >= m_NrThreads)
-		return;
-
 	unsigned int pos[] = {0,0,0};
 	unsigned int pos_shift[] = {0,0,0};
 
 	pos[m_ny] = m_posStart[m_ny];
 	pos_shift[m_ny] = m_pos_ny0_shift_V;
-	for (unsigned int i = m_threadStartLine.at(threadID) ; i < (m_threadStartLine.at(threadID) + m_linesPerThread.at(threadID)) ; i++)
+	for (unsigned int i = iStart ; i < iStop ; i++)
 	{
 		// Store shifted location in this container
 		pos_shift[m_nyP] = pos[m_nyP] = m_posStart[m_nyP] + i;
-		for (unsigned int j = 0; j < m_numLines[1]; j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos_shift[m_nyPP] = pos[m_nyPP] = m_posStart[m_nyPP] + j;
 
@@ -139,27 +241,33 @@ void Engine_Ext_Absorbing_BC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID
 
 void Engine_Ext_Absorbing_BC::DoPreVoltageUpdates(int threadID)
 {
-	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, m_numLines[0], m_numLines[1], iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Absorbing_BC::DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, m_numLines[0], m_numLines[1], iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
 }
 
 template <typename EngType>
-void Engine_Ext_Absorbing_BC::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_Absorbing_BC::DoPostVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-	if (IsActive()==false) return;
-
-	if (m_Eng==NULL) return;
-
-	if (threadID >= m_NrThreads)
-		return;
-
 	unsigned int pos_shift[] = {0,0,0};
 
 	pos_shift[m_ny] = m_pos_ny0_shift_V;
-	for (unsigned int i = m_threadStartLine.at(threadID) ; i < (m_threadStartLine.at(threadID) + m_linesPerThread.at(threadID)) ; i++)
+	for (unsigned int i = iStart ; i < iStop ; i++)
 	{
 		// Store shifted location in this container
 		pos_shift[m_nyP] = m_posStart[m_nyP] + i;
-		for (unsigned int j = 0; j < m_numLines[1]; j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos_shift[m_nyPP] = m_posStart[m_nyPP] + j;
 
@@ -175,27 +283,33 @@ void Engine_Ext_Absorbing_BC::DoPostVoltageUpdatesImpl(EngType* eng, int threadI
 
 void Engine_Ext_Absorbing_BC::DoPostVoltageUpdates(int threadID)
 {
-	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, m_numLines[0], m_numLines[1], iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Absorbing_BC::DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, m_numLines[0], m_numLines[1], iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
 }
 
 template <typename EngType>
-void Engine_Ext_Absorbing_BC::Apply2VoltagesImpl(EngType* eng, int threadID)
+void Engine_Ext_Absorbing_BC::Apply2VoltagesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-	if (IsActive()==false) return;
-
-	if (m_Eng==NULL) return;
-
-	if (threadID >= m_NrThreads)
-		return;
-
 	unsigned int pos[] = {0,0,0};
 
 	pos[m_ny] = m_posStart[m_ny];
-	for (unsigned int i = m_threadStartLine.at(threadID) ; i < (m_threadStartLine.at(threadID) + m_linesPerThread.at(threadID)) ; i++)
+	for (unsigned int i = iStart ; i < iStop ; i++)
 	{
 		// Store shifted location in this container
 		pos[m_nyP] = m_posStart[m_nyP] + i;
-		for (unsigned int j = 0; j < m_numLines[1]; j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos[m_nyPP] = m_posStart[m_nyPP] + j;
 
@@ -209,42 +323,35 @@ void Engine_Ext_Absorbing_BC::Apply2VoltagesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Absorbing_BC::Apply2Voltages(int threadID)
 {
-	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, m_numLines[0], m_numLines[1], iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Absorbing_BC::Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, m_numLines[0], m_numLines[1], iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, iStart, iStop, jStart, jStop);
 }
 
 template <typename EngType>
-void Engine_Ext_Absorbing_BC::DoPreCurrentUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_Absorbing_BC::DoPreCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-
-	if (IsActive()==false) return;
-
-	if (m_Eng==NULL) return;
-
-	if (threadID >= m_NrThreads)
-		return;
-
 	unsigned int 	pos[] = {0,0,0},
 					pos_shift[] = {0,0,0};
 
-
-	// If this isn't the appropriate boundary type, move on to the next primitive
-	if ((Operator_Ext_Absorbing_BC::ABCtype)(m_ABCtype) != Operator_Ext_Absorbing_BC::MUR_1ST_SA)
-		return;
-
-	// For magnetic field, -1, due to dual grid
-	unsigned int numLines_1 = std::min(
-		m_threadStartLine.at(threadID) + m_linesPerThread.at(threadID),
-		m_numLines[0] - 1
-	);
-	unsigned int numLine_0 = m_threadStartLine.at(threadID);
-
 	pos[m_ny] = m_pos_ny0_I;
 	pos_shift[m_ny] = m_pos_ny0_shift_I;
-	for (unsigned int i = numLine_0 ; i < numLines_1 ; i++)
+	for (unsigned int i = iStart ; i < iStop ; i++)
 	{
 		// Store shifted location in this container
 		pos_shift[m_nyP] = pos[m_nyP] = m_posStart[m_nyP] + i;
-		for (unsigned int j = 0; j < (m_numLines[1] - 1); j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos_shift[m_nyPP] = pos[m_nyPP] = m_posStart[m_nyPP] + j;
 
@@ -256,9 +363,26 @@ void Engine_Ext_Absorbing_BC::DoPreCurrentUpdatesImpl(EngType* eng, int threadID
 
 }
 
+// The current hooks only exist for the super-absorbing variant, and they walk
+// the dual grid, one line short in each in-plane direction.
 void Engine_Ext_Absorbing_BC::DoPreCurrentUpdates(int threadID)
 {
-	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	if (!IsSuperAbsorbing()) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, m_numLines[0]-1, m_numLines[1]-1, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Absorbing_BC::DoPreCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	if (!IsSuperAbsorbing()) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, m_numLines[0]-1, m_numLines[1]-1, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, iStart, iStop, jStart, jStop);
 }
 
 // Super-absorption:
@@ -273,35 +397,16 @@ void Engine_Ext_Absorbing_BC::DoPreCurrentUpdates(int threadID)
 // and K2 = vp*Dt/Dx
 
 template <typename EngType>
-void Engine_Ext_Absorbing_BC::DoPostCurrentUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_Absorbing_BC::DoPostCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-
-	if (IsActive()==false) return;
-
-	if (m_Eng==NULL) return;
-
-	if (threadID >= m_NrThreads)
-		return;
-
 	unsigned int pos_shift[] = {0,0,0};
 
-	// If this isn't the appropriate boundary type, move on to the next primitive
-	if ((Operator_Ext_Absorbing_BC::ABCtype)(m_ABCtype) != Operator_Ext_Absorbing_BC::MUR_1ST_SA)
-		return;
-
-	// For magnetic field, -1, due to dual grid
-	unsigned int numLine_1 = std::min<unsigned int>(
-		m_threadStartLine.at(threadID) + m_linesPerThread.at(threadID),
-		m_numLines[0] - 1
-	);
-	unsigned int numLine_0 = m_threadStartLine.at(threadID);
-
 	pos_shift[m_ny] = m_pos_ny0_shift_I;
-	for (unsigned int i = numLine_0 ; i < numLine_1 ; i++)
+	for (unsigned int i = iStart ; i < iStop ; i++)
 	{
 		// Store shifted location in this container
 		pos_shift[m_nyP] = m_posStart[m_nyP] + i;
-		for (unsigned int j = 0; j < (m_numLines[1] - 1); j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos_shift[m_nyPP] = m_posStart[m_nyPP] + j;
 
@@ -315,38 +420,35 @@ void Engine_Ext_Absorbing_BC::DoPostCurrentUpdatesImpl(EngType* eng, int threadI
 
 void Engine_Ext_Absorbing_BC::DoPostCurrentUpdates(int threadID)
 {
-	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	if (!IsSuperAbsorbing()) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, m_numLines[0]-1, m_numLines[1]-1, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Absorbing_BC::DoPostCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	if (!IsSuperAbsorbing()) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, m_numLines[0]-1, m_numLines[1]-1, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, iStart, iStop, jStart, jStop);
 }
 
 template <typename EngType>
-void Engine_Ext_Absorbing_BC::Apply2CurrentImpl(EngType* eng, int threadID)
+void Engine_Ext_Absorbing_BC::Apply2CurrentImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-	if (IsActive()==false) return;
-
-	if (m_Eng==NULL) return;
-
-	if (threadID >= m_NrThreads)
-		return;
-
 	unsigned int pos[] = {0,0,0};
 
-	// If this isn't the appropriate boundary type, move on to the next primitive
-	if ((Operator_Ext_Absorbing_BC::ABCtype)(m_ABCtype) != Operator_Ext_Absorbing_BC::MUR_1ST_SA)
-		return;
-
-	// For magnetic field, -1, due to dual grid
-	unsigned int numLine_1 = std::min<unsigned int>(
-		m_threadStartLine.at(threadID) + m_linesPerThread.at(threadID),
-		m_numLines[0] - 1
-	);
-	unsigned int numLine_0 = m_threadStartLine.at(threadID);
-
 	pos[m_ny] = m_pos_ny0_I;
-	for (unsigned int i = numLine_0 ; i < numLine_1 ; i++)
+	for (unsigned int i = iStart ; i < iStop ; i++)
 	{
 		// Store shifted location in this container
 		pos[m_nyP] = m_posStart[m_nyP] + i;
-		for (unsigned int j = 0; j < (m_numLines[1] - 1); j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos[m_nyPP] = m_posStart[m_nyPP] + j;
 
@@ -362,5 +464,20 @@ void Engine_Ext_Absorbing_BC::Apply2CurrentImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Absorbing_BC::Apply2Current(int threadID)
 {
-	ENG_DISPATCH_ARGS(Apply2CurrentImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	if (!IsSuperAbsorbing()) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, m_numLines[0]-1, m_numLines[1]-1, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(Apply2CurrentImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Absorbing_BC::Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	if (!IsSuperAbsorbing()) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, m_numLines[0]-1, m_numLines[1]-1, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(Apply2CurrentImpl, iStart, iStop, jStart, jStop);
 }

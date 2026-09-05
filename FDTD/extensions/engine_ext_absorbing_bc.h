@@ -48,28 +48,63 @@ public:
 	virtual void Apply2Current() {Engine_Ext_Absorbing_BC::Apply2Current(0);}
 	virtual void Apply2Current(int threadID);
 
+	virtual bool SupportsSlabApply() const;
+	virtual unsigned int SlabHookMask() const
+	{return SLAB_PRE_VOLT | SLAB_POST_VOLT | SLAB_APPLY_VOLT |
+	        SLAB_PRE_CURR | SLAB_POST_CURR | SLAB_APPLY_CURR;}
+
+	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+
+	virtual void DoPreCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPostCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+
 protected:
 	Operator_Ext_Absorbing_BC* m_Op_ABC;
 
 	template <typename EngType>
-	void DoPreVoltageUpdatesImpl(EngType* eng, int threadID);
+	void DoPreVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
 
 	template <typename EngType>
-	void DoPostVoltageUpdatesImpl(EngType* eng, int threadID);
+	void DoPostVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
 
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng, int threadID);
+	void Apply2VoltagesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
 
 	template <typename EngType>
-	void DoPreCurrentUpdatesImpl(EngType* eng, int threadID);
+	void DoPreCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
 
 	template <typename EngType>
-	void DoPostCurrentUpdatesImpl(EngType* eng, int threadID);
+	void DoPostCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
 
 	template <typename EngType>
-	void Apply2CurrentImpl(EngType* eng, int threadID);
+	void Apply2CurrentImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop);
+
+	//! Is this the super-absorbing variant, the only one with current hooks?
+	bool IsSuperAbsorbing() const;
+
+	//! The x-lines this sheet reads or writes, when it is normal to x.
+	void FootprintX(unsigned int& xLo, unsigned int& xHi) const;
+
+	//! This thread's share of the sheet: its stripe of \a i, all of \a j. The
+	//! current hooks pass the dual-grid counts, one short in each direction.
+	bool ThreadRange(int threadID, unsigned int iCount, unsigned int jCount,
+	                 unsigned int& iStart, unsigned int& iStop,
+	                 unsigned int& jStart, unsigned int& jStop);
+
+	//! The same, reduced to the part of the sheet that lies in the x-slab.
+	bool SlabRange(unsigned int startX, unsigned int stopX, int threadID,
+	               unsigned int iCount, unsigned int jCount,
+	               unsigned int& iStart, unsigned int& iStop,
+	               unsigned int& jStart, unsigned int& jStop);
 
 	inline bool IsActive() {if (m_Eng->GetNumberOfTimesteps() < m_start_TS) return false; return true;}
+	//! The engine's timestep counter only moves at block boundaries and is wrong
+	//! inside one, so the slab hooks must judge activity from the timestep they
+	//! are handed instead.
+	inline bool IsActive(int numTS) const {return (numTS>=0) && ((unsigned int)numTS>=m_start_TS);}
 
 	unsigned int m_start_TS;
 

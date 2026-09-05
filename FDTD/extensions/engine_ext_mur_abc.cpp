@@ -79,26 +79,100 @@ void Engine_Ext_Mur_ABC::SetNumberOfThreads(int nrThread)
 }
 
 
-template <typename EngType>
-void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
+// The plane this extension owns is indexed (i,j) along m_nyP and m_nyPP, and
+// which of those is the engine's x axis depends on m_ny: for m_ny==1 it is the
+// inner loop j, for m_ny==2 the outer loop i, and for m_ny==0 neither -- the
+// whole plane then sits on the single x-line m_LineNr. The two helpers below
+// are where that mapping lives; the three hooks just take loop bounds and are
+// the same code for the flat sweep and for a slab.
+bool Engine_Ext_Mur_ABC::ThreadRange(int threadID,
+                                     unsigned int& iStart, unsigned int& iStop,
+                                     unsigned int& jStart, unsigned int& jStop)
 {
-	if (IsActive()==false) return;
-	if (m_Eng==NULL) return;
-	if (threadID>=m_NrThreads)
-		return;
+	iStart = iStop = jStart = jStop = 0;
+	if ((threadID<0) || (threadID>=m_NrThreads))
+		return false;
 
+	iStart = m_start.at(threadID);
+	iStop = iStart + m_numX.at(threadID);
+	jStop = m_numLines[1];
+	return (iStop>iStart) && (jStop>jStart);
+}
+
+bool Engine_Ext_Mur_ABC::SlabRange(unsigned int startX, unsigned int stopX, int threadID,
+                                   unsigned int& iStart, unsigned int& iStop,
+                                   unsigned int& jStart, unsigned int& jStop)
+{
+	iStart = iStop = jStart = jStop = 0;
+
+	if (m_ny==2)
+	{
+		// m_nyP is x, so the slab cuts the outer loop and the share-out across
+		// threads has to be made over what is left of it. Keeping the plane's
+		// own split would leave a slab that covers one thread's stripe to that
+		// one thread while the rest idle.
+		if (!SlabShare(0, m_numLines[0], startX, stopX, m_NrThreads, threadID, iStart, iStop))
+			return false;
+		jStop = m_numLines[1];
+		return jStop>jStart;
+	}
+
+	if (!ThreadRange(threadID, iStart, iStop, jStart, jStop))
+		return false;
+
+	if (m_ny==1)
+	{
+		// m_nyPP is x: cut the inner loop and leave the split over i alone.
+		if (jStart<startX) jStart = startX;
+		if (jStop>stopX) jStop = stopX;
+		return jStop>jStart;
+	}
+
+	// m_ny==0: pattern B. The plane writes m_LineNr and reads m_LineNr_Shift one
+	// line inward, so it runs in full or not at all, and only for the slab that
+	// holds both at the same timestep. The schedule guarantees such a slab
+	// exists at either domain edge (see SupportsSlabApply()); this test only
+	// picks out which slab it is, it is not what makes the case safe.
+	return (m_LineNr>=startX) && (m_LineNr<stopX) &&
+	       ((unsigned int)m_LineNr_Shift>=startX) && ((unsigned int)m_LineNr_Shift<stopX);
+}
+
+bool Engine_Ext_Mur_ABC::SupportsSlabApply() const
+{
+	// Normal to y or z, the shifted read sits on the same x-line as the write,
+	// so any slab that owns the line owns everything the extension touches.
+	if (m_ny!=0)
+		return true;
+
+	// Normal to x, the extension reads one line inward and needs that line at
+	// the same timestep as the one it writes. That is exactly the guarantee the
+	// slab contract makes for a cell on a domain edge, and the schedule pays
+	// for it on both sides: the first tile holds x=0 and is never narrower than
+	// W-k+1 >= 3 lines, and ConfigureTemporalBlocking() folds a short tail tile
+	// into its neighbour so the last tile is at least k+3 lines -- which is
+	// what stops the tail's sloping *left* side from reaching x=NX-1 after
+	// x=NX-2 has dropped out of the slab.
+	//
+	// A Mur ABC is only ever created on a domain face, so there is no interior
+	// case to exclude here.
+	return true;
+}
+
+template <typename EngType>
+void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
+{
 	// See detailed comments in operator_ext_mur_abc.h, not repeated here.
 	unsigned int pos[] = {0,0,0};
 	unsigned int pos_shift[] = {0,0,0};
 	pos[m_ny] = m_LineNr;
 	pos_shift[m_ny] = m_LineNr_Shift;
 
-	for (unsigned int i = m_start.at(threadID); i < m_start.at(threadID) + m_numX.at(threadID); i++)
+	for (unsigned int i = iStart; i < iStop; i++)
 	{
 		pos[m_nyP] = i;
 		pos_shift[m_nyP] = i;
 
-		for (unsigned int j = 0; j < m_numLines[1]; j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos[m_nyPP] = j;
 			pos_shift[m_nyPP] = j;
@@ -114,24 +188,33 @@ void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Mur_ABC::DoPreVoltageUpdates(int threadID)
 {
-	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
 }
 
 template <typename EngType>
-void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-	if (IsActive()==false) return;
-	if (m_Eng==NULL) return;
-	if (threadID>=m_NrThreads)
-		return;
 	unsigned int pos_shift[] = {0,0,0};
 	pos_shift[m_ny] = m_LineNr_Shift;
 
-	for (unsigned int i = m_start.at(threadID); i < m_start.at(threadID) + m_numX.at(threadID); i++)
+	for (unsigned int i = iStart; i < iStop; i++)
 	{
 		pos_shift[m_nyP] = i;
 
-		for (unsigned int j = 0; j < m_numLines[1]; j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos_shift[m_nyPP] = j;
 
@@ -145,24 +228,33 @@ void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Mur_ABC::DoPostVoltageUpdates(int threadID)
 {
-	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, iStart, iStop, jStart, jStop);
 }
 
 template <typename EngType>
-void Engine_Ext_Mur_ABC::Apply2VoltagesImpl(EngType* eng, int threadID)
+void Engine_Ext_Mur_ABC::Apply2VoltagesImpl(EngType* eng, unsigned int iStart, unsigned int iStop, unsigned int jStart, unsigned int jStop)
 {
-	if (IsActive()==false) return;
-	if (threadID>=m_NrThreads)
-		return;
-	if (m_Eng==NULL) return;
 	unsigned int pos[] = {0,0,0};
 	pos[m_ny] = m_LineNr;
 
-	for (unsigned int i = m_start.at(threadID); i < m_start.at(threadID) + m_numX.at(threadID); i++)
+	for (unsigned int i = iStart; i < iStop; i++)
 	{
 		pos[m_nyP] = i;
 
-		for (unsigned int j = 0; j < m_numLines[1]; j++)
+		for (unsigned int j = jStart; j < jStop; j++)
 		{
 			pos[m_nyPP] = j;
 
@@ -174,5 +266,18 @@ void Engine_Ext_Mur_ABC::Apply2VoltagesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Mur_ABC::Apply2Voltages(int threadID)
 {
-	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, threadID);
+	if (m_Eng==NULL) return;
+	if (IsActive()==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!ThreadRange(threadID, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, iStart, iStop, jStart, jStop);
+}
+
+void Engine_Ext_Mur_ABC::Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	if (m_Eng==NULL) return;
+	if (IsActive(numTS)==false) return;
+	unsigned int iStart,iStop,jStart,jStop;
+	if (!SlabRange(startX, stopX, threadID, iStart, iStop, jStart, jStop)) return;
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, iStart, iStop, jStart, jStop);
 }
