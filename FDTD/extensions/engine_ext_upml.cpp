@@ -74,22 +74,45 @@ void Engine_Ext_UPML::SetNumberOfThreads(int nrThread)
 		m_start.at(n) = m_start.at(n-1) + m_numX.at(n-1);
 }
 
+// The flat path's split is the one SetNumberOfThreads() precomputed; the
+// blocked path's is whatever is left of the box once it is clipped to the
+// slab, which changes from call to call and so cannot be precomputed. Both
+// answer in PML-local x, which is what the kernels iterate.
+
+bool Engine_Ext_UPML::ThreadLocalX(int threadID, unsigned int& locStart, unsigned int& locStop) const
+{
+	if (threadID < 0 || threadID >= m_NrThreads)
+		return false;
+	locStart = m_start.at(threadID);
+	locStop  = locStart + m_numX.at(threadID);
+	return locStop > locStart;
+}
+
+bool Engine_Ext_UPML::SlabLocalX(unsigned int startX, unsigned int stopX, int threadID,
+                                 unsigned int& locStart, unsigned int& locStop) const
+{
+	const unsigned int lo = m_Op_UPML->m_StartPos[0];
+	const unsigned int hi = lo + m_Op_UPML->m_numLines[0];
+	unsigned int gStart, gStop;
+	if (!SlabShare(lo, hi, startX, stopX, m_NrThreads, threadID, gStart, gStop))
+		return false;
+	locStart = gStart - lo;
+	locStop  = gStop  - lo;
+	return true;
+}
+
 template <typename EngType>
-void Engine_Ext_UPML::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_UPML::DoPreVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd)
 {
 	if (m_Eng==NULL)
-		return;
-
-	if (threadID>=m_NrThreads)
 		return;
 
 	unsigned int pos[3];
 	unsigned int loc_pos[3];
 	FDTD_FLOAT f_help;
 
-	for (unsigned int lineX=0; lineX<m_numX.at(threadID); ++lineX)
+	for (loc_pos[0]=iStart; loc_pos[0]<iEnd; ++loc_pos[0])
 	{
-		loc_pos[0]=lineX+m_start.at(threadID);
 		pos[0] = loc_pos[0] + m_Op_UPML->m_StartPos[0];
 		for (loc_pos[1]=0; loc_pos[1]<m_Op_UPML->m_numLines[1]; ++loc_pos[1])
 		{
@@ -119,31 +142,47 @@ void Engine_Ext_UPML::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPreVoltageUpdates(int threadID)
 {
+	unsigned int iStart, iEnd;
+	if (!ThreadLocalX(threadID, iStart, iEnd))
+		return;
 #if OPENEMS_ENABLE_AVX2
 	if (m_avx2_packed)
 	{
-		DoPreVoltageUpdatesAVX2(threadID);
+		DoPreVoltageUpdatesAVX2(iStart, iEnd);
 		return;
 	}
 #endif
-	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, threadID);
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, iStart, iEnd);
+}
+
+void Engine_Ext_UPML::DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	(void)numTS; // the UPML update is time-invariant; only the range matters
+	unsigned int iStart, iEnd;
+	if (!SlabLocalX(startX, stopX, threadID, iStart, iEnd))
+		return;
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPreVoltageUpdatesAVX2(iStart, iEnd);
+		return;
+	}
+#endif
+	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, iStart, iEnd);
 }
 
 template <typename EngType>
-void Engine_Ext_UPML::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_UPML::DoPostVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd)
 {
 	if (m_Eng==NULL)
-		return;
-	if (threadID>=m_NrThreads)
 		return;
 
 	unsigned int pos[3];
 	unsigned int loc_pos[3];
 	FDTD_FLOAT f_help;
 
-	for (unsigned int lineX=0; lineX<m_numX.at(threadID); ++lineX)
+	for (loc_pos[0]=iStart; loc_pos[0]<iEnd; ++loc_pos[0])
 	{
-		loc_pos[0]=lineX+m_start.at(threadID);
 		pos[0] = loc_pos[0] + m_Op_UPML->m_StartPos[0];
 		for (loc_pos[1]=0; loc_pos[1]<m_Op_UPML->m_numLines[1]; ++loc_pos[1])
 		{
@@ -170,31 +209,47 @@ void Engine_Ext_UPML::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPostVoltageUpdates(int threadID)
 {
+	unsigned int iStart, iEnd;
+	if (!ThreadLocalX(threadID, iStart, iEnd))
+		return;
 #if OPENEMS_ENABLE_AVX2
 	if (m_avx2_packed)
 	{
-		DoPostVoltageUpdatesAVX2(threadID);
+		DoPostVoltageUpdatesAVX2(iStart, iEnd);
 		return;
 	}
 #endif
-	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, threadID);
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, iStart, iEnd);
+}
+
+void Engine_Ext_UPML::DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	(void)numTS; // the UPML update is time-invariant; only the range matters
+	unsigned int iStart, iEnd;
+	if (!SlabLocalX(startX, stopX, threadID, iStart, iEnd))
+		return;
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPostVoltageUpdatesAVX2(iStart, iEnd);
+		return;
+	}
+#endif
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, iStart, iEnd);
 }
 
 template <typename EngType>
-void Engine_Ext_UPML::DoPreCurrentUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_UPML::DoPreCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd)
 {
 	if (m_Eng==NULL)
-		return;
-	if (threadID>=m_NrThreads)
 		return;
 
 	unsigned int pos[3];
 	unsigned int loc_pos[3];
 	FDTD_FLOAT f_help;
 
-	for (unsigned int lineX=0; lineX<m_numX.at(threadID); ++lineX)
+	for (loc_pos[0]=iStart; loc_pos[0]<iEnd; ++loc_pos[0])
 	{
-		loc_pos[0]=lineX+m_start.at(threadID);
 		pos[0] = loc_pos[0] + m_Op_UPML->m_StartPos[0];
 		for (loc_pos[1]=0; loc_pos[1]<m_Op_UPML->m_numLines[1]; ++loc_pos[1])
 		{
@@ -225,31 +280,47 @@ void Engine_Ext_UPML::DoPreCurrentUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPreCurrentUpdates(int threadID)
 {
+	unsigned int iStart, iEnd;
+	if (!ThreadLocalX(threadID, iStart, iEnd))
+		return;
 #if OPENEMS_ENABLE_AVX2
 	if (m_avx2_packed)
 	{
-		DoPreCurrentUpdatesAVX2(threadID);
+		DoPreCurrentUpdatesAVX2(iStart, iEnd);
 		return;
 	}
 #endif
-	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, threadID);
+	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, iStart, iEnd);
+}
+
+void Engine_Ext_UPML::DoPreCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	(void)numTS; // the UPML update is time-invariant; only the range matters
+	unsigned int iStart, iEnd;
+	if (!SlabLocalX(startX, stopX, threadID, iStart, iEnd))
+		return;
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPreCurrentUpdatesAVX2(iStart, iEnd);
+		return;
+	}
+#endif
+	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, iStart, iEnd);
 }
 
 template <typename EngType>
-void Engine_Ext_UPML::DoPostCurrentUpdatesImpl(EngType* eng, int threadID)
+void Engine_Ext_UPML::DoPostCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd)
 {
 	if (m_Eng==NULL)
-		return;
-	if (threadID>=m_NrThreads)
 		return;
 
 	unsigned int pos[3];
 	unsigned int loc_pos[3];
 	FDTD_FLOAT f_help;
 
-	for (unsigned int lineX=0; lineX<m_numX.at(threadID); ++lineX)
+	for (loc_pos[0]=iStart; loc_pos[0]<iEnd; ++loc_pos[0])
 	{
-		loc_pos[0]=lineX+m_start.at(threadID);
 		pos[0] = loc_pos[0] + m_Op_UPML->m_StartPos[0];
 		for (loc_pos[1]=0; loc_pos[1]<m_Op_UPML->m_numLines[1]; ++loc_pos[1])
 		{
@@ -276,12 +347,31 @@ void Engine_Ext_UPML::DoPostCurrentUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPostCurrentUpdates(int threadID)
 {
+	unsigned int iStart, iEnd;
+	if (!ThreadLocalX(threadID, iStart, iEnd))
+		return;
 #if OPENEMS_ENABLE_AVX2
 	if (m_avx2_packed)
 	{
-		DoPostCurrentUpdatesAVX2(threadID);
+		DoPostCurrentUpdatesAVX2(iStart, iEnd);
 		return;
 	}
 #endif
-	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, threadID);
+	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, iStart, iEnd);
+}
+
+void Engine_Ext_UPML::DoPostCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	(void)numTS; // the UPML update is time-invariant; only the range matters
+	unsigned int iStart, iEnd;
+	if (!SlabLocalX(startX, stopX, threadID, iStart, iEnd))
+		return;
+#if OPENEMS_ENABLE_AVX2
+	if (m_avx2_packed)
+	{
+		DoPostCurrentUpdatesAVX2(iStart, iEnd);
+		return;
+	}
+#endif
+	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, iStart, iEnd);
 }

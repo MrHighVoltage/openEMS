@@ -45,18 +45,43 @@ public:
 	virtual void DoPostCurrentUpdates() {Engine_Ext_UPML::DoPostCurrentUpdates(0);};
 	virtual void DoPostCurrentUpdates(int threadID);
 
+	//! Every UPML pass is a per-cell read-modify-write of one field cell and its
+	//! own flux cell -- no neighbour is touched, in x or in anything else -- so
+	//! restricting a pass to an x-range is exact, and slab pattern A applies.
+	virtual bool SupportsSlabApply() const {return true;}
+	virtual unsigned int SlabHookMask() const
+	{return SLAB_PRE_VOLT | SLAB_POST_VOLT | SLAB_PRE_CURR | SLAB_POST_CURR;}
+
+	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPreCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual void DoPostCurrentUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+
 protected:
-	template <typename EngType>
-	void DoPreVoltageUpdatesImpl(EngType* eng, int threadID);
+	// Both the scalar and the packed AVX2 passes below are parameterised by a
+	// half-open range of PML-local x-lines rather than by a thread id, because
+	// the two callers disagree about what a thread's share is: the flat path
+	// hands out the whole box split m_NrThreads ways, the blocked path hands
+	// out only the part of the box inside the current slab. Splitting the range
+	// out of the kernels is what keeps one implementation serving both.
+
+	//! This thread's share of the whole PML box, in PML-local x. False if none.
+	bool ThreadLocalX(int threadID, unsigned int& locStart, unsigned int& locStop) const;
+	//! This thread's share of the box's intersection with the slab. False if none.
+	bool SlabLocalX(unsigned int startX, unsigned int stopX, int threadID,
+	                unsigned int& locStart, unsigned int& locStop) const;
 
 	template <typename EngType>
-	void DoPostVoltageUpdatesImpl(EngType* eng, int threadID);
+	void DoPreVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd);
 
 	template <typename EngType>
-	void DoPreCurrentUpdatesImpl(EngType* eng, int threadID);
+	void DoPostVoltageUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd);
 
 	template <typename EngType>
-	void DoPostCurrentUpdatesImpl(EngType* eng, int threadID);
+	void DoPreCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd);
+
+	template <typename EngType>
+	void DoPostCurrentUpdatesImpl(EngType* eng, unsigned int iStart, unsigned int iEnd);
 
 	Operator_Ext_UPML* m_Op_UPML;
 
@@ -86,14 +111,16 @@ protected:
 	void ReleaseAVX2Layout();
 
 	void PreUpdateAVX2(f8vector* field, f8vector* flux,
-	                   const f8vector* a, const f8vector* b, int threadID);
+	                   const f8vector* a, const f8vector* b,
+	                   unsigned int iStart, unsigned int iEnd);
 	void PostUpdateAVX2(f8vector* field, f8vector* flux,
-	                    const f8vector* c, int threadID);
+	                    const f8vector* c,
+	                    unsigned int iStart, unsigned int iEnd);
 
-	void DoPreVoltageUpdatesAVX2(int threadID);
-	void DoPostVoltageUpdatesAVX2(int threadID);
-	void DoPreCurrentUpdatesAVX2(int threadID);
-	void DoPostCurrentUpdatesAVX2(int threadID);
+	void DoPreVoltageUpdatesAVX2(unsigned int iStart, unsigned int iEnd);
+	void DoPostVoltageUpdatesAVX2(unsigned int iStart, unsigned int iEnd);
+	void DoPreCurrentUpdatesAVX2(unsigned int iStart, unsigned int iEnd);
+	void DoPostCurrentUpdatesAVX2(unsigned int iStart, unsigned int iEnd);
 
 	bool m_avx2_packed;
 

@@ -232,15 +232,12 @@ void Engine_Ext_UPML::ReleaseAVX2Layout()
 void Engine_Ext_UPML::PreUpdateAVX2(
 	f8vector* __restrict field, f8vector* __restrict flux,
 	const f8vector* __restrict a, const f8vector* __restrict b,
-	int threadID
+	unsigned int iStart, unsigned int iEnd
 )
 {
-	if (threadID >= m_NrThreads)
-		return;
-
 	const unsigned int cnt = 3 * m_v_numVectors;
 
-	for (unsigned int i = m_start.at(threadID), iEnd = i + m_numX.at(threadID); i < iEnd; ++i)
+	for (unsigned int i = iStart; i < iEnd; ++i)
 	{
 		for (unsigned int j = 0; j < m_v_pNy; ++j)
 		{
@@ -266,15 +263,12 @@ void Engine_Ext_UPML::PreUpdateAVX2(
 void Engine_Ext_UPML::PostUpdateAVX2(
 	f8vector* __restrict field, f8vector* __restrict flux,
 	const f8vector* __restrict c_arr,
-	int threadID
+	unsigned int iStart, unsigned int iEnd
 )
 {
-	if (threadID >= m_NrThreads)
-		return;
-
 	const unsigned int cnt = 3 * m_v_numVectors;
 
-	for (unsigned int i = m_start.at(threadID), iEnd = i + m_numX.at(threadID); i < iEnd; ++i)
+	for (unsigned int i = iStart; i < iEnd; ++i)
 	{
 		for (unsigned int j = 0; j < m_v_pNy; ++j)
 		{
@@ -294,28 +288,28 @@ void Engine_Ext_UPML::PostUpdateAVX2(
 	}
 }
 
-void Engine_Ext_UPML::DoPreVoltageUpdatesAVX2(int threadID)
+void Engine_Ext_UPML::DoPreVoltageUpdatesAVX2(unsigned int iStart, unsigned int iEnd)
 {
 	Engine_AVX2* eng = static_cast<Engine_AVX2*>(m_Eng);
-	PreUpdateAVX2(eng->m_volt, m_v_volt_flux, m_v_vv, m_v_vvfo, threadID);
+	PreUpdateAVX2(eng->m_volt, m_v_volt_flux, m_v_vv, m_v_vvfo, iStart, iEnd);
 }
 
-void Engine_Ext_UPML::DoPostVoltageUpdatesAVX2(int threadID)
+void Engine_Ext_UPML::DoPostVoltageUpdatesAVX2(unsigned int iStart, unsigned int iEnd)
 {
 	Engine_AVX2* eng = static_cast<Engine_AVX2*>(m_Eng);
-	PostUpdateAVX2(eng->m_volt, m_v_volt_flux, m_v_vvfn, threadID);
+	PostUpdateAVX2(eng->m_volt, m_v_volt_flux, m_v_vvfn, iStart, iEnd);
 }
 
-void Engine_Ext_UPML::DoPreCurrentUpdatesAVX2(int threadID)
+void Engine_Ext_UPML::DoPreCurrentUpdatesAVX2(unsigned int iStart, unsigned int iEnd)
 {
 	Engine_AVX2* eng = static_cast<Engine_AVX2*>(m_Eng);
-	PreUpdateAVX2(eng->m_curr, m_v_curr_flux, m_v_ii, m_v_iifo, threadID);
+	PreUpdateAVX2(eng->m_curr, m_v_curr_flux, m_v_ii, m_v_iifo, iStart, iEnd);
 }
 
-void Engine_Ext_UPML::DoPostCurrentUpdatesAVX2(int threadID)
+void Engine_Ext_UPML::DoPostCurrentUpdatesAVX2(unsigned int iStart, unsigned int iEnd)
 {
 	Engine_AVX2* eng = static_cast<Engine_AVX2*>(m_Eng);
-	PostUpdateAVX2(eng->m_curr, m_v_curr_flux, m_v_iifn, threadID);
+	PostUpdateAVX2(eng->m_curr, m_v_curr_flux, m_v_iifn, iStart, iEnd);
 }
 
 #endif // OPENEMS_ENABLE_AVX2
