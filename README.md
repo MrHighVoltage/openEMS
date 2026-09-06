@@ -15,7 +15,8 @@ and is used together with [CSXCAD](https://github.com/thliebig/CSXCAD) for geome
 
 - 3-D FDTD solver for electromagnetic wave propagation
 - Cartesian and cylindrical (including multi-grid) coordinate systems
-- SIMD-accelerated engines (SSE2, multi-threaded, optional MPI)
+- SIMD-accelerated engines (SSE2, **AVX2/FMA**, multi-threaded, optional MPI)
+- **Vulkan GPU engine** — see [PERFORMANCE.md](PERFORMANCE.md)
 - Uniaxial PML and Mur ABC absorbing boundary conditions
 - Total-field / scattered-field (TFSF) excitation
 - Lumped RLC elements
@@ -107,6 +108,30 @@ Verify from outside the source tree:
 python3 -c "import CSXCAD; print(CSXCAD.__version__)"
 python3 -c "import openEMS; print(openEMS.__version__)"
 ```
+
+---
+
+## Performance
+
+This fork adds AVX2/FMA CPU engines and a Vulkan GPU engine on top of upstream
+openEMS. Measured against a from-scratch build of upstream on the same machine
+(i9-13900K, Radeon RX 6800), on models from 0.26 M to 11.2 M cells:
+
+| | compared against | speedup |
+|---|---|---|
+| AVX2, single-threaded | upstream SSE, single-threaded | 1.33–2.07&times; |
+| AVX2 + temporal blocking (opt-in), 8 threads | upstream's best CPU config | 2.8–4.5&times; *(grids larger than L3)* |
+| Vulkan, Radeon RX 6800 | upstream's best CPU config | 6–34&times; |
+
+Full tables, the method, and the cases where this fork is *not* faster are in
+**[PERFORMANCE.md](PERFORMANCE.md)**. The engineering record behind the numbers
+— including approaches that were tried and rejected — is in
+[OPTIMIZATIONS.md](OPTIMIZATIONS.md).
+
+Engine selection is via `--engine=<name>`; this fork adds `avx2`,
+`avx2-multithreaded` and `gpu` to the upstream set. The GPU engine requires
+`-DWITH_GPU=ON` at configure time (Vulkan SDK with `glslc`), and
+`OPENEMS_GPU_INDEX` selects the device when more than one is present.
 
 ---
 
