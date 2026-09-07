@@ -473,8 +473,17 @@ void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
 		SlabApply2Voltages(eS, eE, ts, threadID);
 
 		const int hHi = (Bn < NXH) ? Bn : NXH;
+		// The sweep stops at NX-1 because UpdateCurrents reads volt at x+1, but
+		// the extension hooks must not: the flat path calls Apply2Current() and
+		// the DoPre/DoPost pair over the whole domain (stopX = UINT_MAX), so an
+		// extension that writes the last x-line gets that call there. The tile
+		// owning the domain edge therefore hands the hooks [An, NX) while the
+		// sweep itself still stops at NX-1. Only that tile can reach NX -- a
+		// wedge never does and every other core has Bn < NX -- so the line is
+		// still covered exactly once per timestep.
+		const int hExt = (Bn >= NX) ? NX : hHi;
 		const unsigned int hS = (unsigned int)An;
-		const unsigned int hE = (unsigned int)(hHi < An ? An : hHi);
+		const unsigned int hE = (unsigned int)(hExt < An ? An : hExt);
 
 		SlabPreCurrent(hS, hE, ts, threadID);
 		SplitRange(An, hHi, m_numThreads, threadID, s, e);
