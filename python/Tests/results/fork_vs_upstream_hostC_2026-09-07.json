@@ -1,0 +1,1886 @@
+[
+ {
+  "ok": true,
+  "mcells_s": 476.44,
+  "loop_s": 22.01,
+  "notes": [],
+  "setup_s": 0.26,
+  "cells": 262144,
+  "wall_s": 22.27228593826294,
+  "samples": [
+   222.1,
+   145.7,
+   473.7,
+   190.3,
+   475.7,
+   476.4
+  ],
+  "config": "64x64x64 pec",
+  "engine": "upstream sse 1t",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 2039.39,
+  "loop_s": 5.14,
+  "notes": [],
+  "setup_s": 0.15,
+  "cells": 262144,
+  "wall_s": 5.2863850593566895,
+  "samples": [
+   1926.3,
+   1144.7,
+   1288.9,
+   2039.4,
+   2021.7,
+   1814.0
+  ],
+  "config": "64x64x64 pec",
+  "engine": "upstream mt 8t",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 956.16,
+  "loop_s": 10.97,
+  "notes": [],
+  "setup_s": 0.13,
+  "cells": 262144,
+  "wall_s": 11.101956129074097,
+  "samples": [
+   299.4,
+   935.2,
+   920.7,
+   934.3,
+   931.2,
+   956.2
+  ],
+  "config": "64x64x64 pec",
+  "engine": "upstream mt default",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 971.52,
+  "loop_s": 10.79,
+  "notes": [],
+  "setup_s": 0.26,
+  "cells": 262144,
+  "wall_s": 11.048216342926025,
+  "samples": [
+   971.5,
+   954.0,
+   936.2,
+   916.5,
+   769.9,
+   705.5
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork avx2 1t",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 3506.89,
+  "loop_s": 2.99005,
+  "notes": [],
+  "setup_s": 0.14,
+  "cells": 262144,
+  "wall_s": 3.1290550231933594,
+  "samples": [
+   3506.9,
+   3421.7,
+   2696.2,
+   3245.0,
+   3163.7,
+   3190.3
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork avx2-mt 8t",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 2927.75,
+  "loop_s": 3.58151,
+  "notes": [],
+  "setup_s": 0.13,
+  "cells": 262144,
+  "wall_s": 3.7142727375030518,
+  "samples": [
+   2624.5,
+   2299.9,
+   2927.8,
+   2587.5,
+   2391.0,
+   2886.1
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork avx2-mt default",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 3457.67,
+  "loop_s": 3.03261,
+  "notes": [
+   "AVX2 temporal blocking: disabled, only 64 x-lines for a tile width of 384."
+  ],
+  "setup_s": 0.13,
+  "cells": 262144,
+  "wall_s": 3.1645090579986572,
+  "samples": [
+   3011.5,
+   3206.8,
+   3139.3,
+   3050.3,
+   3457.7,
+   2739.1
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork tblock 8t",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 2845.53,
+  "loop_s": 3.68499,
+  "notes": [
+   "AVX2 temporal blocking: disabled, only 64 x-lines for a tile width of 384."
+  ],
+  "setup_s": 0.12,
+  "cells": 262144,
+  "wall_s": 3.8086750507354736,
+  "samples": [
+   2132.3,
+   2814.1,
+   2385.2,
+   2845.5,
+   2702.3,
+   2329.4
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork tblock default",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 267.43,
+  "loop_s": 44.11,
+  "notes": [],
+  "setup_s": 3.86,
+  "cells": 3932160,
+  "wall_s": 47.97473740577698,
+  "samples": [
+   267.0,
+   267.4,
+   266.9
+  ],
+  "config": "160x128x192 pec",
+  "engine": "upstream sse 1t",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 788.68,
+  "loop_s": 14.96,
+  "notes": [],
+  "setup_s": 2.01,
+  "cells": 3932160,
+  "wall_s": 16.971232891082764,
+  "samples": [
+   788.3,
+   788.7,
+   788.4
+  ],
+  "config": "160x128x192 pec",
+  "engine": "upstream mt 8t",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 569.47,
+  "loop_s": 20.71,
+  "notes": [],
+  "setup_s": 1.9,
+  "cells": 3932160,
+  "wall_s": 22.612695932388306,
+  "samples": [
+   569.5,
+   563.0,
+   555.2
+  ],
+  "config": "160x128x192 pec",
+  "engine": "upstream mt default",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 493.63,
+  "loop_s": 23.9,
+  "notes": [],
+  "setup_s": 3.72,
+  "cells": 3932160,
+  "wall_s": 27.623005628585815,
+  "samples": [
+   491.9,
+   493.6,
+   492.8
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork avx2 1t",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 888.7,
+  "loop_s": 13.27,
+  "notes": [],
+  "setup_s": 1.77,
+  "cells": 3932160,
+  "wall_s": 15.043083429336548,
+  "samples": [
+   884.1,
+   886.9,
+   888.7
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork avx2-mt 8t",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 864.97,
+  "loop_s": 13.64,
+  "notes": [],
+  "setup_s": 2.0,
+  "cells": 3932160,
+  "wall_s": 15.638798713684082,
+  "samples": [
+   860.5,
+   864.4,
+   865.0
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork avx2-mt default",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 3249.23,
+  "loop_s": null,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 64 x-lines, 36 MB per tile, 3 tiles"
+  ],
+  "setup_s": null,
+  "cells": 3932160,
+  "wall_s": 5.41406512260437,
+  "samples": [
+   3185.7,
+   3216.6,
+   3249.2
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork tblock 8t",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 2722.5,
+  "loop_s": 4.33,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 64 x-lines, 36 MB per tile, 3 tiles"
+  ],
+  "setup_s": 1.63,
+  "cells": 3932160,
+  "wall_s": 5.958014726638794,
+  "samples": [
+   2097.8,
+   2076.2,
+   2722.5
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork tblock default",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 247.17,
+  "loop_s": 54.57,
+  "notes": [],
+  "setup_s": 11.2,
+  "cells": 11239424,
+  "wall_s": 65.76923108100891,
+  "samples": [
+   245.0,
+   247.2,
+   247.1
+  ],
+  "config": "224x224x224 pec",
+  "engine": "upstream sse 1t",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 586.38,
+  "loop_s": 23.0,
+  "notes": [],
+  "setup_s": 5.95,
+  "cells": 11239424,
+  "wall_s": 28.946783781051636,
+  "samples": [
+   585.1,
+   585.6,
+   586.4
+  ],
+  "config": "224x224x224 pec",
+  "engine": "upstream mt 8t",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 495.5,
+  "loop_s": 27.22,
+  "notes": [],
+  "setup_s": 5.64,
+  "cells": 11239424,
+  "wall_s": 32.864598989486694,
+  "samples": [
+   495.5,
+   492.9,
+   493.6
+  ],
+  "config": "224x224x224 pec",
+  "engine": "upstream mt default",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 448.73,
+  "loop_s": 30.06,
+  "notes": [],
+  "setup_s": 10.71,
+  "cells": 11239424,
+  "wall_s": 40.77011513710022,
+  "samples": [
+   447.8,
+   448.7,
+   447.5
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork avx2 1t",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 631.68,
+  "loop_s": 21.35,
+  "notes": [],
+  "setup_s": 5.14,
+  "cells": 11239424,
+  "wall_s": 26.491910934448242,
+  "samples": [
+   630.6,
+   630.5,
+   631.7
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork avx2-mt 8t",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 612.31,
+  "loop_s": 22.03,
+  "notes": [],
+  "setup_s": 4.74,
+  "cells": 11239424,
+  "wall_s": 26.772560596466064,
+  "samples": [
+   612.3,
+   603.7,
+   608.5
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork avx2-mt default",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 2607.01,
+  "loop_s": 5.17,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB per tile, 7 tiles"
+  ],
+  "setup_s": 5.16,
+  "cells": 11239424,
+  "wall_s": 10.329067707061768,
+  "samples": [
+   2464.4,
+   2607.0,
+   2545.3
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork tblock 8t",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 1959.8,
+  "loop_s": 6.88,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB per tile, 7 tiles"
+  ],
+  "setup_s": 4.7,
+  "cells": 11239424,
+  "wall_s": 11.584285259246826,
+  "samples": [
+   1959.8,
+   1917.9,
+   1919.9
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork tblock default",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 110.66,
+  "loop_s": 53.3,
+  "notes": [],
+  "setup_s": 4.97,
+  "cells": 3932160,
+  "wall_s": 58.273133754730225,
+  "samples": [
+   110.0,
+   110.0,
+   110.7
+  ],
+  "config": "160x128x192 pml",
+  "engine": "upstream sse 1t",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 280.07,
+  "loop_s": 21.06,
+  "notes": [],
+  "setup_s": 3.12,
+  "cells": 3932160,
+  "wall_s": 24.180712699890137,
+  "samples": [
+   279.9,
+   278.9,
+   280.1
+  ],
+  "config": "160x128x192 pml",
+  "engine": "upstream mt 8t",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 207.02,
+  "loop_s": 28.49,
+  "notes": [],
+  "setup_s": 3.03,
+  "cells": 3932160,
+  "wall_s": 31.519002676010132,
+  "samples": [
+   206.8,
+   207.0,
+   204.4
+  ],
+  "config": "160x128x192 pml",
+  "engine": "upstream mt default",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 147.91,
+  "loop_s": 39.88,
+  "notes": [],
+  "setup_s": 4.86,
+  "cells": 3932160,
+  "wall_s": 44.73755478858948,
+  "samples": [
+   147.2,
+   147.9,
+   147.6
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork avx2 1t",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 266.31,
+  "loop_s": 22.15,
+  "notes": [],
+  "setup_s": 2.05,
+  "cells": 3932160,
+  "wall_s": 24.19650959968567,
+  "samples": [
+   265.8,
+   266.3,
+   265.8
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork avx2-mt 8t",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 256.02,
+  "loop_s": 23.04,
+  "notes": [],
+  "setup_s": 2.03,
+  "cells": 3932160,
+  "wall_s": 25.067025899887085,
+  "samples": [
+   255.1,
+   256.0,
+   254.7
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork avx2-mt default",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 800.13,
+  "loop_s": 7.37,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 64 x-lines, 36 MB per tile, 3 tiles"
+  ],
+  "setup_s": 2.03,
+  "cells": 3932160,
+  "wall_s": 9.402844905853271,
+  "samples": [
+   800.1,
+   769.5,
+   766.9
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork tblock 8t",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 684.52,
+  "loop_s": 8.62,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 64 x-lines, 36 MB per tile, 3 tiles"
+  ],
+  "setup_s": 2.02,
+  "cells": 3932160,
+  "wall_s": 10.635828971862793,
+  "samples": [
+   658.0,
+   619.0,
+   684.5
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork tblock default",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 111.93,
+  "loop_s": 60.25,
+  "notes": [],
+  "setup_s": 13.42,
+  "cells": 11239424,
+  "wall_s": 73.6684501171112,
+  "samples": [
+   110.2,
+   111.9,
+   109.4
+  ],
+  "config": "224x224x224 pml",
+  "engine": "upstream sse 1t",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 261.94,
+  "loop_s": 25.75,
+  "notes": [],
+  "setup_s": 8.25,
+  "cells": 11239424,
+  "wall_s": 33.99566960334778,
+  "samples": [
+   260.3,
+   260.8,
+   261.9
+  ],
+  "config": "224x224x224 pml",
+  "engine": "upstream mt 8t",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 179.65,
+  "loop_s": 37.54,
+  "notes": [],
+  "setup_s": 7.93,
+  "cells": 11239424,
+  "wall_s": 45.46562671661377,
+  "samples": [
+   179.7,
+   179.6,
+   179.1
+  ],
+  "config": "224x224x224 pml",
+  "engine": "upstream mt default",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 146.9,
+  "loop_s": 45.91,
+  "notes": [],
+  "setup_s": 13.01,
+  "cells": 11239424,
+  "wall_s": 58.923678398132324,
+  "samples": [
+   146.9,
+   146.8,
+   146.6
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork avx2 1t",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 236.55,
+  "loop_s": 28.51,
+  "notes": [],
+  "setup_s": 5.64,
+  "cells": 11239424,
+  "wall_s": 34.14709258079529,
+  "samples": [
+   236.5,
+   236.6,
+   236.4
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork avx2-mt 8t",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 224.26,
+  "loop_s": 30.07,
+  "notes": [],
+  "setup_s": 5.75,
+  "cells": 11239424,
+  "wall_s": 35.82052040100098,
+  "samples": [
+   223.6,
+   224.3,
+   224.1
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork avx2-mt default",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 827.76,
+  "loop_s": 8.15,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB per tile, 7 tiles"
+  ],
+  "setup_s": 5.62,
+  "cells": 11239424,
+  "wall_s": 13.774827480316162,
+  "samples": [
+   814.3,
+   788.9,
+   827.8
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork tblock 8t",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 639.85,
+  "loop_s": 10.54,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB per tile, 7 tiles"
+  ],
+  "setup_s": 5.78,
+  "cells": 11239424,
+  "wall_s": 16.320836782455444,
+  "samples": [
+   625.5,
+   639.9,
+   638.2
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork tblock default",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 219.31,
+  "loop_s": 51.25,
+  "notes": [],
+  "setup_s": 11.19,
+  "cells": 11239424,
+  "wall_s": 62.43990397453308,
+  "samples": [
+   212.6,
+   218.6,
+   219.3
+  ],
+  "config": "224x224x224 mur",
+  "engine": "upstream sse 1t",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 530.64,
+  "loop_s": 21.18,
+  "notes": [],
+  "setup_s": 5.99,
+  "cells": 11239424,
+  "wall_s": 27.16639471054077,
+  "samples": [
+   530.6,
+   529.3,
+   530.1
+  ],
+  "config": "224x224x224 mur",
+  "engine": "upstream mt 8t",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 431.12,
+  "loop_s": 26.07,
+  "notes": [],
+  "setup_s": 5.7,
+  "cells": 11239424,
+  "wall_s": 31.773204565048218,
+  "samples": [
+   427.0,
+   431.1,
+   425.1
+  ],
+  "config": "224x224x224 mur",
+  "engine": "upstream mt default",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 364.4,
+  "loop_s": 30.84,
+  "notes": [],
+  "setup_s": 10.72,
+  "cells": 11239424,
+  "wall_s": 41.56115746498108,
+  "samples": [
+   364.4,
+   363.0,
+   363.8
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork avx2 1t",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 569.38,
+  "loop_s": 19.74,
+  "notes": [],
+  "setup_s": 5.14,
+  "cells": 11239424,
+  "wall_s": 24.884652853012085,
+  "samples": [
+   569.4,
+   569.3,
+   569.3
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork avx2-mt 8t",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 543.23,
+  "loop_s": 20.69,
+  "notes": [],
+  "setup_s": 4.72,
+  "cells": 11239424,
+  "wall_s": 25.408324003219604,
+  "samples": [
+   541.7,
+   543.2,
+   536.7
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork avx2-mt default",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 1848.06,
+  "loop_s": 6.08,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB per tile, 7 tiles"
+  ],
+  "setup_s": 5.27,
+  "cells": 11239424,
+  "wall_s": 11.354286432266235,
+  "samples": [
+   1822.9,
+   1848.1,
+   1783.6
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork tblock 8t",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0,2,4,6,8,10,12,14",
+  "num_threads": 8
+ },
+ {
+  "ok": true,
+  "mcells_s": 1466.2,
+  "loop_s": 7.67,
+  "notes": [
+   "AVX2 temporal blocking ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB per tile, 7 tiles"
+  ],
+  "setup_s": 4.75,
+  "cells": 11239424,
+  "wall_s": 12.41746473312378,
+  "samples": [
+   1454.2,
+   1464.0,
+   1466.2
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork tblock default",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 12433.2,
+  "loop_s": 0.843365,
+  "notes": [],
+  "setup_s": 0.32,
+  "cells": 262144,
+  "wall_s": 1.1668615341186523,
+  "samples": [
+   12397.5,
+   12433.2,
+   12397.6,
+   12413.0,
+   12214.3,
+   12196.9
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork gpu rx6800",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 12385.1,
+  "loop_s": 0.846643,
+  "notes": [
+   "Engine_Vulkan: temporal blocking disabled \u2014 grid already fits the 64 MB tile target (6 MB of field state)"
+  ],
+  "setup_s": 0.34,
+  "cells": 262144,
+  "wall_s": 1.1837713718414307,
+  "samples": [
+   12228.5,
+   12385.1,
+   12092.4,
+   12331.6,
+   12179.3,
+   12146.8
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork gpu rx6800 tblock",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 633.2,
+  "loop_s": 16.56,
+  "notes": [],
+  "setup_s": 0.28,
+  "cells": 262144,
+  "wall_s": 16.839388370513916,
+  "samples": [
+   632.5,
+   633.0,
+   633.0,
+   633.2,
+   633.1,
+   632.9
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork gpu uhd770",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 633.25,
+  "loop_s": 16.56,
+  "notes": [
+   "Engine_Vulkan: temporal blocking disabled \u2014 grid already fits the 16 MB tile target (6 MB of field state)"
+  ],
+  "setup_s": 0.3,
+  "cells": 262144,
+  "wall_s": 16.855077981948853,
+  "samples": [
+   633.2,
+   633.2,
+   633.2,
+   633.2,
+   633.1,
+   633.1
+  ],
+  "config": "64x64x64 pec",
+  "engine": "fork gpu uhd770 tblock",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 13069.5,
+  "loop_s": 0.902594,
+  "notes": [],
+  "setup_s": 2.52,
+  "cells": 3932160,
+  "wall_s": 3.4183406829833984,
+  "samples": [
+   13037.7,
+   12844.1,
+   13069.5
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork gpu rx6800",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 12950.0,
+  "loop_s": 0.910928,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=16 W=113 (2 tiles, 63 MB/tile, 90 MB of field state)"
+  ],
+  "setup_s": 2.51,
+  "cells": 3932160,
+  "wall_s": 3.4200189113616943,
+  "samples": [
+   12801.5,
+   12950.0,
+   12837.7
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork gpu rx6800 tblock",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 524.05,
+  "loop_s": 22.51,
+  "notes": [],
+  "setup_s": 2.46,
+  "cells": 3932160,
+  "wall_s": 24.97038984298706,
+  "samples": [
+   524.0,
+   523.5,
+   523.9
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork gpu uhd770",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 611.4,
+  "loop_s": 19.29,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=6 W=28 (6 tiles, 15 MB/tile, 90 MB of field state)"
+  ],
+  "setup_s": 2.5,
+  "cells": 3932160,
+  "wall_s": 21.785788536071777,
+  "samples": [
+   611.3,
+   610.9,
+   611.4
+  ],
+  "config": "160x128x192 pec",
+  "engine": "fork gpu uhd770 tblock",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 5673.61,
+  "loop_s": 2.3772,
+  "notes": [],
+  "setup_s": 6.95,
+  "cells": 11239424,
+  "wall_s": 9.329362630844116,
+  "samples": [
+   5673.6,
+   5673.1,
+   5670.0
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork gpu rx6800",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 12319.4,
+  "loop_s": 1.0948,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=16 W=55 (4 tiles, 63 MB/tile, 257 MB of field state)"
+  ],
+  "setup_s": 6.95,
+  "cells": 11239424,
+  "wall_s": 8.041481018066406,
+  "samples": [
+   11815.8,
+   11798.7,
+   12319.4
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork gpu rx6800 tblock",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 519.72,
+  "loop_s": 25.95,
+  "notes": [],
+  "setup_s": 6.98,
+  "cells": 11239424,
+  "wall_s": 32.925225257873535,
+  "samples": [
+   519.3,
+   519.7,
+   519.1
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork gpu uhd770",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 601.21,
+  "loop_s": 22.43,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=6 W=13 (17 tiles, 14 MB/tile, 257 MB of field state)"
+  ],
+  "setup_s": 6.93,
+  "cells": 11239424,
+  "wall_s": 29.362231969833374,
+  "samples": [
+   601.2,
+   601.1,
+   601.0
+  ],
+  "config": "224x224x224 pec",
+  "engine": "fork gpu uhd770 tblock",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 9462.07,
+  "loop_s": 0.623356,
+  "notes": [],
+  "setup_s": 2.49,
+  "cells": 3932160,
+  "wall_s": 3.1101882457733154,
+  "samples": [
+   9437.8,
+   9188.8,
+   9462.1
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork gpu rx6800",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 9844.48,
+  "loop_s": 0.599142,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=16 W=113 (2 tiles, 63 MB/tile, 90 MB of field state)"
+  ],
+  "setup_s": 2.5,
+  "cells": 3932160,
+  "wall_s": 3.1015191078186035,
+  "samples": [
+   9759.8,
+   9844.5,
+   9825.9
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork gpu rx6800 tblock",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 316.93,
+  "loop_s": 18.61,
+  "notes": [],
+  "setup_s": 2.49,
+  "cells": 3932160,
+  "wall_s": 21.096049308776855,
+  "samples": [
+   314.4,
+   316.9,
+   315.8
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork gpu uhd770",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 343.82,
+  "loop_s": 17.15,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=6 W=28 (6 tiles, 15 MB/tile, 90 MB of field state)"
+  ],
+  "setup_s": 2.47,
+  "cells": 3932160,
+  "wall_s": 19.620046377182007,
+  "samples": [
+   342.1,
+   343.8,
+   342.8
+  ],
+  "config": "160x128x192 pml",
+  "engine": "fork gpu uhd770 tblock",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 4619.13,
+  "loop_s": 1.45994,
+  "notes": [],
+  "setup_s": 6.76,
+  "cells": 11239424,
+  "wall_s": 8.222216844558716,
+  "samples": [
+   4618.2,
+   4617.6,
+   4619.1
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork gpu rx6800",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 10211.7,
+  "loop_s": 0.660383,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=16 W=55 (4 tiles, 63 MB/tile, 257 MB of field state)"
+  ],
+  "setup_s": 6.83,
+  "cells": 11239424,
+  "wall_s": 7.494772911071777,
+  "samples": [
+   10169.1,
+   10211.7,
+   10178.4
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork gpu rx6800 tblock",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 322.96,
+  "loop_s": 20.88,
+  "notes": [],
+  "setup_s": 6.69,
+  "cells": 11239424,
+  "wall_s": 27.56708812713623,
+  "samples": [
+   321.7,
+   323.0,
+   321.8
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork gpu uhd770",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 347.24,
+  "loop_s": 19.42,
+  "notes": [
+   "Engine_Vulkan: trapezoidal temporal blocking active \u2014 k=6 W=13 (17 tiles, 14 MB/tile, 257 MB of field state)"
+  ],
+  "setup_s": 6.78,
+  "cells": 11239424,
+  "wall_s": 26.196228981018066,
+  "samples": [
+   346.0,
+   345.5,
+   347.2
+  ],
+  "config": "224x224x224 pml",
+  "engine": "fork gpu uhd770 tblock",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 5125.11,
+  "loop_s": 2.19301,
+  "notes": [],
+  "setup_s": 6.96,
+  "cells": 11239424,
+  "wall_s": 9.153934478759766,
+  "samples": [
+   5125.1,
+   5123.6,
+   5124.8
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork gpu rx6800",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 5124.65,
+  "loop_s": 2.19321,
+  "notes": [
+   "Engine_Vulkan: temporal blocking disabled \u2014 Mur ABC has no slab path yet"
+  ],
+  "setup_s": 6.93,
+  "cells": 11239424,
+  "wall_s": 9.122779846191406,
+  "samples": [
+   5124.6,
+   5123.3,
+   5123.1
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork gpu rx6800 tblock",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 518.46,
+  "loop_s": 21.68,
+  "notes": [],
+  "setup_s": 6.91,
+  "cells": 11239424,
+  "wall_s": 28.594362020492554,
+  "samples": [
+   518.3,
+   518.3,
+   518.5
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork gpu uhd770",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 518.49,
+  "loop_s": 21.68,
+  "notes": [
+   "Engine_Vulkan: temporal blocking disabled \u2014 Mur ABC has no slab path yet"
+  ],
+  "setup_s": 6.92,
+  "cells": 11239424,
+  "wall_s": 28.60266923904419,
+  "samples": [
+   518.3,
+   518.5,
+   518.2
+  ],
+  "config": "224x224x224 mur",
+  "engine": "fork gpu uhd770 tblock",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ }
+]

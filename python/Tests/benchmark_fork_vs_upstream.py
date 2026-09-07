@@ -17,6 +17,11 @@ Usage (from the repo root, with the venv that has CSXCAD/openEMS importable):
         --out /tmp/bench.json
 
 `--only` filters runs by a substring of "<config>/<engine label>".
+
+Everything host-specific is an option, because the same matrix is run on more
+than one machine: `--pin-single` / `--pin-tuned` / `--tuned-threads` for the
+core layout, `--gpu label:index[:k]` (repeatable, `--gpu none` for CPU-only)
+for the devices, `--csxcad-lib` for where libCSXCAD.so lives.
 """
 
 import argparse
@@ -29,12 +34,15 @@ import tempfile
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-CSXCAD_LIB = os.path.expanduser("~/opt/lib")
+DEFAULT_CSXCAD_LIB = os.path.expanduser("~/opt/lib")
 
 SPEED_RE = re.compile(r"^Speed:\s+([0-9.eE+-]+)\s+MCells/s", re.M)
-# The cell count prints as an integer on short runs and as "262144.00" once
-# an interval line has put the stream into fixed notation.
-ITER_RE = re.compile(r"Time for \d+ iterations with [\d.]+ cells :\s+([0-9.eE+-]+)\s+sec", re.M)
+# The cell count's format depends on what the stream printed before it: an
+# integer on a short run, "262144.00" once an interval line has switched to
+# fixed notation, and "1.12394e+07" on a run fast enough to print no interval
+# line at all -- which is every GPU run on a large grid. Accept all three, or
+# setup_s silently becomes None on exactly the rows that have the most setup.
+ITER_RE = re.compile(r"Time for \d+ iterations with [0-9.eE+-]+ cells :\s+([0-9.eE+-]+)\s+sec", re.M)
 CELLS_RE = re.compile(r"-->\s+([\d.]+)\s+FDTD cells", re.M)
 
 
@@ -77,10 +85,10 @@ def write_model(nx, ny, nz, boundary, timesteps, out_path):
 # --------------------------------------------------------------------------
 
 def run_once(build, xml, engine, env_extra=None, num_threads=0, cpus=None,
-             timeout=3600):
+             timeout=3600, csxcad_lib=DEFAULT_CSXCAD_LIB):
     binary = os.path.join(build, "openEMS")
     env = dict(os.environ)
-    env["LD_LIBRARY_PATH"] = ":".join([build, CSXCAD_LIB])
+    env["LD_LIBRARY_PATH"] = ":".join([build, csxcad_lib])
     env.update(env_extra or {})
 
     cmd = []
@@ -111,10 +119,15 @@ def run_once(build, xml, engine, env_extra=None, num_threads=0, cpus=None,
     iters = ITER_RE.search(out)
     cells = CELLS_RE.search(out)
     loop_s = float(iters.group(1)) if iters else None
+    # The schedule announces itself, and announces what made it refuse. Keep
+    # that line: a tblock row that quietly fell back to the flat sweep is
+    # otherwise indistinguishable from one that engaged and gained nothing.
+    notes = [ln.strip() for ln in out.splitlines() if "temporal blocking" in ln]
     return {
         "ok": True,
         "mcells_s": float(m.group(1)),
         "loop_s": loop_s,
+        "notes": notes,
         # everything the run spent outside the stepping loop: operator build,
         # engine/GPU init, teardown.
         "setup_s": round(wall - loop_s, 2) if loop_s is not None else None,
@@ -156,34 +169,59 @@ CONFIGS = [
 ]
 
 
-# One hardware thread on each of the eight P-cores; CPUs 16-31 are E-cores.
-PIN_1 = "0"
-PIN_8 = "0,2,4,6,8,10,12,14"
+# Default pinning for the i9-13900K this matrix was first run on: one hardware
+# thread on each of the eight P-cores; CPUs 16-31 are E-cores. Other hosts pass
+# --pin-single / --pin-tuned / --tuned-threads.
+DEFAULT_PIN_1 = "0"
+DEFAULT_PIN_N = "0,2,4,6,8,10,12,14"
+
+# label:index[:k] -- k is the GPU block depth for that device's +tblock row.
+DEFAULT_GPUS = ["rx6800:0:16", "uhd770:1:6"]
+
+
+def parse_gpu_spec(spec):
+    """Parse "label:index[:k]". k is None when unset; the caller defaults it."""
+    parts = spec.split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError("--gpu wants label:index[:k], got %r" % spec)
+    return parts[0], parts[1], (parts[2] if len(parts) == 3 else None)
 
 
 def engine_matrix(args):
     """(label, build, engine, env, num_threads, cpus)
 
-    Two families of row. The *pinned* rows fix the thread count and the core
+    Three families of row. The *pinned* rows fix the thread count and the core
     placement identically on both sides, and are what the engine-vs-engine
     speedups are computed from. The *default* rows run exactly as a user gets
     them -- no pinning, no --numThreads -- and so also measure each build's own
-    thread auto-tune.
+    thread auto-tune. The *GPU* rows are neither: the CPU is not the resource
+    under test, so pinning it would only add a variable.
     """
     blk = {"OPENEMS_AVX2_TEMPORAL_BLOCK": str(args.block_k)}
     t = args.tuned_threads
-    return [
-        ("upstream sse 1t",      args.upstream_build, "sse",                {}, 0, PIN_1),
-        ("upstream mt 8t",       args.upstream_build, "multithreaded",      {}, t, PIN_8),
-        ("upstream mt default",  args.upstream_build, "multithreaded",      {}, 0, None),
-        ("fork avx2 1t",         args.fork_build,     "avx2",               {}, 0, PIN_1),
-        ("fork avx2-mt 8t",      args.fork_build,     "avx2-multithreaded", {}, t, PIN_8),
-        ("fork avx2-mt default", args.fork_build,     "avx2-multithreaded", {}, 0, None),
-        ("fork tblock 8t",       args.fork_build,     "avx2-multithreaded", blk, t, PIN_8),
-        ("fork tblock default",  args.fork_build,     "avx2-multithreaded", blk, 0, None),
-        ("fork gpu rx6800",      args.fork_build,     "gpu", {"OPENEMS_GPU_INDEX": "0"}, 0, None),
-        ("fork gpu uhd770",      args.fork_build,     "gpu", {"OPENEMS_GPU_INDEX": "1"}, 0, None),
+    p1, pn = args.pin_single, args.pin_tuned
+    rows = [
+        ("upstream sse 1t",       args.upstream_build, "sse",                {}, 0, p1),
+        ("upstream mt %dt" % t,   args.upstream_build, "multithreaded",      {}, t, pn),
+        ("upstream mt default",   args.upstream_build, "multithreaded",      {}, 0, None),
+        ("fork avx2 1t",          args.fork_build,     "avx2",               {}, 0, p1),
+        ("fork avx2-mt %dt" % t,  args.fork_build,     "avx2-multithreaded", {}, t, pn),
+        ("fork avx2-mt default",  args.fork_build,     "avx2-multithreaded", {}, 0, None),
+        ("fork tblock %dt" % t,   args.fork_build,     "avx2-multithreaded", blk, t, pn),
+        ("fork tblock default",   args.fork_build,     "avx2-multithreaded", blk, 0, None),
     ]
+    for spec in args.gpu:
+        label, index, k = parse_gpu_spec(spec)
+        k = k or args.gpu_block_k
+        rows.append(("fork gpu %s" % label, args.fork_build, "gpu",
+                     {"OPENEMS_GPU_INDEX": index}, 0, None))
+        # Same device, same run, with the trapezoidal schedule turned on. The
+        # engine prints why it refused when it does, and the flat row above is
+        # the control that says what the refusal cost.
+        rows.append(("fork gpu %s tblock" % label, args.fork_build, "gpu",
+                     {"OPENEMS_GPU_INDEX": index,
+                      "OPENEMS_GPU_TEMPORAL_BLOCK": k}, 0, None))
+    return rows
 
 
 def parse_args():
@@ -194,11 +232,28 @@ def parse_args():
     p.add_argument("--out", default="/tmp/oebench/results.json")
     p.add_argument("--repeats", type=int, default=3,
                    help="floor on the per-config repeat count in CONFIGS")
-    p.add_argument("--block-k", default="16")
+    p.add_argument("--block-k", default="16",
+                   help="AVX2 block depth (OPENEMS_AVX2_TEMPORAL_BLOCK)")
+    p.add_argument("--gpu-block-k", default="16",
+                   help="GPU block depth for --gpu entries that do not name one")
+    p.add_argument("--gpu", action="append", default=None, metavar="LABEL:INDEX[:K]",
+                   help="repeatable; default: " + " ".join(DEFAULT_GPUS)
+                        + ". Pass --gpu none for a CPU-only matrix.")
     p.add_argument("--tuned-threads", type=int, default=8)
+    p.add_argument("--pin-single", default=DEFAULT_PIN_1,
+                   help="taskset CPU list for the 1-thread rows")
+    p.add_argument("--pin-tuned", default=DEFAULT_PIN_N,
+                   help="taskset CPU list for the --tuned-threads rows")
+    p.add_argument("--csxcad-lib", default=DEFAULT_CSXCAD_LIB,
+                   help="directory holding libCSXCAD.so, added to LD_LIBRARY_PATH")
     p.add_argument("--only", default=None)
     p.add_argument("--xml-dir", default="/tmp/oebench/xml")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.gpu is None:
+        args.gpu = list(DEFAULT_GPUS)
+    elif args.gpu == ["none"]:
+        args.gpu = []
+    return args
 
 
 def main():
@@ -226,7 +281,8 @@ def main():
                 continue
             print("### %-46s " % key, end="", flush=True)
             r = run_best(max(reps, args.repeats), build=build, xml=xml, engine=engine,
-                         env_extra=env, num_threads=threads, cpus=cpus)
+                         env_extra=env, num_threads=threads, cpus=cpus,
+                         csxcad_lib=args.csxcad_lib)
             r.update(config=cfg_name, engine=label, cells=nx * ny * nz,
                      timesteps=ts, boundary=boundary, grid=[nx, ny, nz],
                      cpus=cpus, num_threads=threads)

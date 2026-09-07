@@ -1,10 +1,14 @@
 # Performance
 
 This fork adds two engine families to openEMS — **AVX2/FMA CPU engines** and a
-**Vulkan GPU engine** — plus a trapezoidal temporal-blocking schedule for the
-AVX2 multithreaded engine. This document reports what they are worth, measured
+**Vulkan GPU engine** — plus a trapezoidal temporal-blocking schedule that now
+runs on **both** of them. This document reports what they are worth, measured
 against a from-scratch build of upstream openEMS on the same machine, with the
 same compiler and the same models.
+
+Everything here was re-measured after the GPU engine gained the blocked
+schedule: Host C on **2026-09-07**, Host A on **2026-09-08** from a clean
+rebuild of the same commit.
 
 The engineering record behind these numbers — including what was tried and
 rejected — is in [OPTIMIZATIONS.md](OPTIMIZATIONS.md). This document is the
@@ -16,52 +20,110 @@ summary; that one is the evidence.
 
 Throughput in **MCells/s** (million cell-updates per second), higher is better.
 "Upstream best" is the fastest of the three upstream configurations measured,
-which is always its SSE multithreaded engine at a hand-picked thread count —
-not its slower out-of-the-box default.
+which is almost always its SSE multithreaded engine at a hand-picked thread
+count — not its slower out-of-the-box default.
 
-| Model | Cells | Upstream<br>best | Fork AVX2<br>8 threads | Fork AVX2<br>+ temporal blocking | Fork Vulkan<br>RX 6800 | Best speedup |
-|---|---|---|---|---|---|---|
-| 64&sup3; PEC | 0.26 M | 2081 | 3397 | 3407 | 12384 | **5.95&times;** |
-| 160&times;128&times;192 PEC | 3.93 M | 789 | 896 | 3284 | 13211 | **16.75&times;** |
-| 224&sup3; PEC | 11.24 M | 585 | 630 | 2644 | 5673 | **9.70&times;** |
-| 160&times;128&times;192 PML_8 | 3.93 M | 280 | 266 | 775 | 9574 | **34.20&times;** |
-| 224&sup3; PML_8 | 11.24 M | 261 | 237 | 830 | 4620 | **17.68&times;** |
-| 224&sup3; Mur | 11.24 M | 530 | 565 | 1813 | 5126 | **9.68&times;** |
+### Host C — i9-13900K + Radeon RX 6800
 
-Two separate results are stacked in that table, and they are worth keeping
+| Model | Cells | Upstream<br>best | Fork AVX2<br>8 threads | Fork AVX2<br>+ temporal blocking | Fork Vulkan<br>RX 6800 | Fork Vulkan<br>+ temporal blocking | Best speedup |
+|---|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 0.26 M | 2039 | 3507 | 3458 | 12433 | 12385 | **6.10&times;** |
+| 160&times;128&times;192 PEC | 3.93 M | 789 | 889 | 3249 | 13070 | 12950 | **16.57&times;** |
+| 224&sup3; PEC | 11.24 M | 586 | 632 | 2607 | 5674 | 12319 | **21.01&times;** |
+| 160&times;128&times;192 PML_8 | 3.93 M | 280 | 266 | 800 | 9462 | 9844 | **35.15&times;** |
+| 224&sup3; PML_8 | 11.24 M | 262 | 237 | 828 | 4619 | 10212 | **38.98&times;** |
+| 224&sup3; Mur | 11.24 M | 531 | 569 | 1848 | 5125 | 5125 | **9.66&times;** |
+
+Three separate results are stacked in that table, and they are worth keeping
 apart:
 
-- **On the CPU**, temporal blocking is the large win: **2.8&times;–4.5&times;**
-  over upstream's best on every grid that does not fit last-level cache. It is
-  an opt-in prototype (§5.4).
-- **On a discrete GPU**, the Vulkan engine is worth **6&times;–34&times;**
-  over upstream's best CPU engine. The spread is wide because the two sides
-  respond very differently to a PML: on the 224&sup3; model, adding PML_8 costs
-  the CPU **2.24&times;** (585 → 261 MC/s) and the GPU only **1.23&times;**
-  (5673 → 4620 MC/s), so the ratio between them widens wherever PML dominates.
+- **On the CPU**, temporal blocking is the large win: **3.0&times;–4.1&times;**
+  over the flat AVX2 sweep on every grid that does not fit last-level cache. It
+  is an opt-in prototype (§5.5).
+- **On a discrete GPU**, temporal blocking is worth **2.2&times;** on the grids
+  that exceed the card's Infinity Cache, and roughly nothing on the ones that
+  do not (§4.3). This is new since the last revision of this document, and it
+  is what moves 224&sup3; PML_8 from 17.7&times; to **39.0&times;**.
+- **Together**, the Vulkan engine is worth **6&times;–39&times;** over
+  upstream's best CPU engine. The spread is wide because the two sides respond
+  very differently to a PML: on the 224&sup3; model, adding PML_8 costs the CPU
+  **2.24&times;** (586 → 262 MC/s) and the blocked GPU only **1.21&times;**
+  (12319 → 10212 MC/s), so the ratio between them widens wherever PML
+  dominates.
+
+### Host A — i7-6700K + integrated HD 530
+
+A four-core Skylake desktop part with an 8 MB L3 and a Gen9 iGPU. It is in this
+document because *every conclusion above is a property of the hardware as much
+as of the code*, and a second machine is the cheapest way to say which is
+which.
+
+| Model | Upstream<br>best | Fork AVX2<br>4 threads | Fork AVX2<br>+ tblock (default threads) | Fork Vulkan<br>HD 530 | Best speedup |
+|---|---|---|---|---|---|
+| 64&sup3; PEC | 544 | 937 | 1322 | 505 | **2.45&times;** |
+| 160&times;128&times;192 PEC | 448 | 497 | 862 | 381 | **1.93&times;** |
+| 224&sup3; PEC | 423 | 475 | 577 | 484 | **1.37&times;** |
+| 160&times;128&times;192 PML_8 | 146 | 164 | 251 | 225 | **1.72&times;** |
+| 224&sup3; PML_8 | 168 | 183 | 227 | 270 | **1.61&times;** |
+| 224&sup3; Mur | 358 | 388 | 382 | 503 | **1.40&times;** |
+
+Two things do **not** carry over from Host C, and both have the same cause —
+an 8 MB last-level cache instead of 36 MB:
+
+- **CPU temporal blocking gains far less** (1.05&times;–1.42&times; instead of
+  3.0&times;–4.1&times;), and on the Mur model it is a **13% loss**. An 8 MB L3
+  forces tiles six x-lines wide at k=3, and at that size the trapezoid's wedges
+  cost more than the traffic they save (§5.4).
+- **GPU temporal blocking gains nothing at all** on the HD 530 (1.00&times;–
+  1.04&times;), because that device is compute-bound rather than
+  bandwidth-bound, so removing DRAM traffic removes nothing that was limiting
+  it (§4.3).
+
+What *does* carry over is the AVX2 width itself (1.65&times;–2.59&times;
+single-threaded, §4.1), and — unexpectedly — the value of the GPU engine on a
+weak CPU: the HD 530 is the **fastest engine on this machine** on the 224&sup3;
+PML_8 and Mur models, which the much stronger UHD 770 never is on Host C
+(§5.3).
 
 ---
 
 ## 2. What was measured, and how
 
-**Host.** Intel Core i9-13900K (8 P-cores + 16 E-cores, 32 threads, 36 MB L3),
-32 GB dual-channel DDR5, `powersave` governor with turbo active. Two GPUs:
-Radeon RX 6800 (RADV) and integrated UHD 770 (ANV), Mesa 26.2.1, Vulkan 1.4.
+**Host C.** Intel Core i9-13900K (8 P-cores + 16 E-cores, 32 threads, 36 MB
+L3), 32 GB dual-channel DDR5, `powersave` governor with turbo active. Two GPUs:
+Radeon RX 6800 (RADV, 128 MB Infinity Cache, 256 MB BAR, no resizable BAR) and
+integrated UHD 770 (ANV). Mesa 26.2.1, Vulkan 1.4. Otherwise idle.
 
-**Builds.** Both configured from scratch and compiled with the same toolchain
-(GCC 16.2.1, CMake Release, `-O3 -DNDEBUG`) against the same CSXCAD, HDF5, VTK
-and Boost:
+**Host A.** Intel Core i7-6700K (4 cores / 8 threads, 8 MB L3), 64 GB
+dual-channel DDR4, `powersave` governor. One GPU: integrated Intel HD Graphics
+530 (Skylake GT2, ANV). Mesa 26.2.1, Vulkan 1.4. This is the machine
+[OPTIMIZATIONS.md](OPTIMIZATIONS.md) calls Host A and describes as "gone" — it
+is not; it is a remote server, and §1's AVX2 table there was measured on it.
+It is a **shared** machine and was not quiesced for this run: `rclone`,
+Jellyfin and an idle BOINC client were resident throughout, at a load average
+of 0.6–2.8. See §8 for what that does and does not affect.
+
+Host A's matrix was run twice, a day apart, the second time from a clean
+rebuild of the same commit fetched from the remote rather than from a local
+copy. The two agree to **1.7% worst case** and to 0.8% on every DRAM-bound
+row; the tables here are the second run, and the first is committed alongside
+it as the corroborating repeat (§7).
+
+**Builds.** All four configured from scratch and compiled with the same
+toolchain (GCC 16.2.1, CMake Release, `-O3 -DNDEBUG`) against each host's own
+CSXCAD, HDF5, VTK and Boost:
 
 | | commit | engines available |
 |---|---|---|
 | upstream | `d3d2a49` (2026-08-15) | `basic`, `sse`, `sse-compressed`, `multithreaded` |
-| this fork | `42e3d2e` (2026-09-05) | the above **+** `avx2`, `avx2-multithreaded`, `gpu` |
+| this fork | `6c795de` (2026-09-07) | the above **+** `avx2`, `avx2-multithreaded`, `gpu` |
 
 The fork's merge-base with upstream *is* upstream's head, so this is exactly
-upstream plus 93 commits, with no divergence to account for.
+upstream plus 99 commits, with no divergence to account for.
 
 **Method.** Both builds' `openEMS` **binaries** are driven over byte-identical
-XML models, written once with `Write2XML()`. Nothing depends on which Python
+XML models, written once with `Write2XML()` and then copied to the second host,
+so the two machines run the same bytes. Nothing depends on which Python
 bindings happen to be installed, and the models contain nothing a stock
 upstream build cannot parse — a uniform Cartesian grid, one excitation box, a
 boundary condition. There are **no probes, no field dumps and no
@@ -74,29 +136,49 @@ installed one — separately *configured* build directories, because RPATH is
 absolute and a copied build tree is not an independent binary.
 
 **The harness is in the repo**: `python/Tests/benchmark_fork_vs_upstream.py`.
-See §7 to reproduce.
+Everything host-specific in it is a command-line option, which is what let the
+same matrix run unchanged on both machines. See §7 to reproduce.
 
-### 2.1 Why some rows are pinned
+### 2.1 Why some rows are pinned, and at what thread count
 
-Rows that compare engines to each other pin to one hardware thread on each of
-the eight P-cores (`taskset -c 0,2,4,6,8,10,12,14`) and pass
-`--numThreads=8` on both sides. This is **not** noise reduction — the one
-genuinely noisy configuration stays noisy when pinned (§8) — it is to make the
-comparison controlled, so that both builds run the same number of threads on
-the same cores and a column difference is the engine and nothing else.
+Rows that compare engines to each other pin both builds to one hardware thread
+per physical core and pass the same `--numThreads` on both sides. This is
+**not** noise reduction — the one genuinely noisy configuration stays noisy
+when pinned (§8) — it is to make the comparison controlled, so that both builds
+run the same number of threads on the same cores and a column difference is the
+engine and nothing else.
 
-Eight threads is where both builds peak. From a separate calibration sweep on
-the 224&sup3; PEC model (600 timesteps, unpinned): upstream reaches
-543 / 570 / **572** / 499 MC/s at 4 / 6 / 8 / 12 threads, the fork's AVX2
-engine 600 / 621 / **622** / 552, and the temporal-blocked schedule
-1765 / **2305** / 2109 at 4 / 8 / 12. Both roll off past 8 for the same reason:
-a plain OpenMP STREAM-Triad on this host peaks at 6–8 threads and loses ~20% by
+The pinned count is where **both builds peak**, from a separate calibration
+sweep on the 224&sup3; PEC model (600–1200 timesteps, unpinned):
+
+| host | pinning | upstream SSE-MT | fork AVX2-MT | fork +tblock |
+|---|---|---|---|---|
+| C | `-c 0,2,4,6,8,10,12,14`, 8 threads | 543 / 570 / **572** / 499 at 4/6/8/12 | 600 / 621 / **622** / 552 | 1765 / **2305** / 2109 at 4/8/12 |
+| A | `-c 0,2,4,6`, 4 threads | 384 / **441** / 394 / 377 at 2/4/6/8 | **487** / 480 / 431 / 391 | 484 / 554 / **592** / 575 |
+
+Host C's two engines agree on 8, and both roll off past it for the same reason:
+a plain OpenMP STREAM-Triad on that host peaks at 6–8 threads and loses ~20% by
 16 ([OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.3). The memory controller sets that
 curve, not the engines.
 
+**Host A's engines do not agree**, and that is itself a result. Its flat AVX2
+engine peaks at **2** threads, upstream's SSE engine at **4**, and the
+temporally blocked schedule at **6** — past the physical core count, into SMT.
+Blocking makes the engine less bandwidth-bound, and a less bandwidth-bound
+kernel is exactly the kind that SMT siblings help. Pinning to 4 was chosen
+because it is where the two *flat* engines are closest to their peaks, so the
+engine-vs-engine columns stay controlled; the consequence is that Host A's
+`tblock 4t` column is **16% below** that schedule's own optimum, and its
+`tblock default` column (unpinned, auto-tuned, free to use all 8 logical CPUs)
+is the more representative one. Host A's summary table in §1 therefore quotes
+the default column, and both are in §3.
+
 Rows labelled **default** run exactly as a user gets them: no pinning, no
 `--numThreads`, each build using its own thread auto-tune. Both families are
-reported; §5.3 is specifically about the difference between them.
+reported; §5.6 is specifically about the difference between them.
+
+GPU rows are neither pinned nor thread-limited: the CPU is not the resource
+under test there, so constraining it would only add a variable.
 
 Every figure is the best of 3 repeats, or 6 on the 64&sup3; grid, for the
 reason in §8.
@@ -105,14 +187,32 @@ reason in §8.
 
 ## 3. Full results
 
-| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 8t | upstream<br>default | fork<br>AVX2 1t | fork<br>AVX2-MT 8t | fork<br>default | fork<br>+tblock 8t | fork<br>+tblock default | fork GPU<br>RX 6800 | fork GPU<br>UHD 770 |
+### Host C — i9-13900K, RX 6800, UHD 770
+
+| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 8t | upstream<br>default | fork<br>AVX2 1t | fork<br>AVX2-MT 8t | fork<br>default | fork<br>+tblock 8t | fork<br>+tblock default | GPU<br>RX 6800 | GPU RX 6800<br>+tblock | GPU<br>UHD 770 | GPU UHD 770<br>+tblock |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 40000 | 476 | 2039 | 956 | 972 | 3507 | 2928 | 3458 | 2846 | 12433 | 12385 | 633 | 633 |
+| 160&times;128&times;192 PEC | 3000 | 267 | 789 | 569 | 494 | 889 | 865 | 3249 | 2723 | 13070 | 12950 | 524 | 611 |
+| 224&sup3; PEC | 1200 | 247 | 586 | 496 | 449 | 632 | 612 | 2607 | 1960 | 5674 | 12319 | 520 | 601 |
+| 160&times;128&times;192 PML_8 | 1500 | 111 | 280 | 207 | 148 | 266 | 256 | 800 | 685 | 9462 | 9844 | 317 | 344 |
+| 224&sup3; PML_8 | 600 | 112 | 262 | 180 | 147 | 237 | 224 | 828 | 640 | 4619 | 10212 | 323 | 347 |
+| 224&sup3; Mur | 1000 | 219 | 531 | 431 | 364 | 569 | 543 | 1848 | 1466 | 5125 | 5125 | 518 | 518 |
+
+### Host A — i7-6700K, HD 530
+
+| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 4t | upstream<br>default | fork<br>AVX2 1t | fork<br>AVX2-MT 4t | fork<br>default | fork<br>+tblock 4t | fork<br>+tblock default | GPU<br>HD 530 | GPU HD 530<br>+tblock |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 64&sup3; PEC | 40000 | 478 | 2081 | 942 | 989 | 3397 | 2786 | 3407 | 2981 | 12384 | 633 |
-| 160&times;128&times;192 PEC | 3000 | 267 | 789 | 558 | 498 | 896 | 905 | 3284 | 2345 | 13211 | 520 |
-| 224&sup3; PEC | 1200 | 251 | 585 | 497 | 449 | 630 | 611 | 2644 | 2110 | 5673 | 519 |
-| 160&times;128&times;192 PML_8 | 1500 | 110 | 280 | 206 | 148 | 266 | 257 | 775 | 673 | 9574 | 317 |
-| 224&sup3; PML_8 | 600 | 111 | 261 | 179 | 147 | 237 | 225 | 830 | 647 | 4620 | 321 |
-| 224&sup3; Mur | 1000 | 212 | 530 | 423 | 362 | 565 | 541 | 1813 | 1458 | 5126 | 518 |
+| 64&sup3; PEC | 40000 | 198 | 512 | 544 | 513 | 937 | 1335 | 938 | 1322 | 505 | 504 |
+| 160&times;128&times;192 PEC | 3000 | 199 | 448 | 393 | 374 | 497 | 492 | 706 | 862 | 368 | 381 |
+| 224&sup3; PEC | 1200 | 200 | 423 | 387 | 376 | 475 | 489 | 497 | 577 | 478 | 484 |
+| 160&times;128&times;192 PML_8 | 1500 | 70 | 146 | 141 | 124 | 164 | 169 | 221 | 251 | 225 | 224 |
+| 224&sup3; PML_8 | 600 | 83 | 168 | 133 | 137 | 183 | 186 | 205 | 227 | 270 | 269 |
+| 224&sup3; Mur | 1000 | 173 | 358 | 321 | 286 | 388 | 406 | 339 | 382 | 503 | 502 |
+
+Raw output for both, including every individual repeat and the engine's own
+"temporal blocking active / disabled — …" line for each blocked row, is
+committed as `python/Tests/results/fork_vs_upstream_hostC_2026-09-07.json` and
+`…_hostA_2026-09-07.json`.
 
 ---
 
@@ -134,33 +234,37 @@ engines. On top of the raw width, three changes mattered:
 - **Vectorized UPML passes** (`08fa968`).
 
 Single-threaded, where the engine is not yet fighting the memory system, the
-width shows up directly:
+width shows up directly — and it shows up on both machines:
 
-| Model | upstream SSE | fork AVX2 | |
-|---|---|---|---|
-| 64&sup3; PEC | 478 | 989 | 2.07&times; |
-| 160&times;128&times;192 PEC | 267 | 498 | 1.86&times; |
-| 224&sup3; PEC | 251 | 449 | 1.79&times; |
-| 160&times;128&times;192 PML_8 | 110 | 148 | 1.34&times; |
-| 224&sup3; PML_8 | 111 | 147 | 1.33&times; |
-| 224&sup3; Mur | 212 | 362 | 1.71&times; |
+| Model | Host C<br>SSE → AVX2 | | Host A<br>SSE → AVX2 | |
+|---|---|---|---|---|
+| 64&sup3; PEC | 476 → 972 | 2.04&times; | 198 → 513 | 2.59&times; |
+| 160&times;128&times;192 PEC | 267 → 494 | 1.85&times; | 199 → 374 | 1.88&times; |
+| 224&sup3; PEC | 247 → 449 | 1.82&times; | 200 → 376 | 1.88&times; |
+| 160&times;128&times;192 PML_8 | 111 → 148 | 1.34&times; | 70 → 124 | 1.77&times; |
+| 224&sup3; PML_8 | 112 → 147 | 1.31&times; | 83 → 137 | 1.65&times; |
+| 224&sup3; Mur | 219 → 364 | 1.66&times; | 173 → 286 | 1.65&times; |
 
-The 1.79–2.07&times; on PEC is close to what doubling the vector width can
-give. The 1.33–1.34&times; on PML is lower because the PML passes are a larger
-share of the work and vectorize less well — see §5.1, where this becomes a
-problem at high thread counts.
+The 1.82–2.59&times; on PEC is close to what doubling the vector width can
+give. On Host C the PML rows drop to 1.31–1.34&times; because the PML passes
+are a larger share of the work and vectorize less well — see §5.1, where this
+becomes a problem at high thread counts. On Host A the same rows hold
+1.65–1.77&times;, which is the clearest single sign that §5.1 is a
+memory-system effect and not a property of the kernel: the slower machine, with
+proportionally more compute per byte of bandwidth, keeps the vector win the
+faster machine loses.
 
-### 4.2 Trapezoidal temporal blocking
+### 4.2 Trapezoidal temporal blocking on the CPU
 
-This is the largest CPU result in this document, and the reasoning behind it is
+This was the largest CPU result in this document, and the reasoning behind it is
 worth stating because it is not "make the arithmetic faster".
 
 The multithreaded AVX2 engine **is already at the DRAM roofline.** Traffic
-measured with the core PMU on this host is 31.4 bytes per cell per timestep
+measured with the core PMU on Host C is 31.4 bytes per cell per timestep
 against a 24 B/cell ideal, which at its optimum is ~48 GB/s against a ~49 GB/s
 STREAM-Triad ceiling. There is no arithmetic left to win and no scattered
 access left to tile. (Traffic and roofline figures in this section are from
-[OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.5 and §4.7, measured separately on this
+[OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.5 and §4.7, measured separately on that
 same host; the throughput tables below are from this run.)
 
 What is left is to *stop going to DRAM*. A trapezoidal schedule advances a
@@ -168,14 +272,20 @@ cache-resident tile of the grid through *k* consecutive timesteps before moving
 on, which divides DRAM traffic by roughly *k*. Measured on a proxy benchmark:
 30.95 → 2.40 B/cell, **12.9&times; less traffic.** In the real engine:
 
-| Model | field state | flat AVX2-MT | + temporal blocking | |
-|---|---|---|---|---|
-| 64&sup3; PEC | 6 MB | 3397 | 3407 | 1.00&times; |
-| 160&times;128&times;192 PEC | 94 MB | 896 | 3284 | 3.67&times; |
-| 224&sup3; PEC | 270 MB | 630 | 2644 | 4.20&times; |
-| 160&times;128&times;192 PML_8 | 94 MB | 266 | 775 | 2.91&times; |
-| 224&sup3; PML_8 | 270 MB | 237 | 830 | 3.51&times; |
-| 224&sup3; Mur | 270 MB | 565 | 1813 | 3.21&times; |
+| Model | field state | Host C<br>flat → blocked | | Host A<br>flat → blocked | |
+|---|---|---|---|---|---|
+| 64&sup3; PEC | 6 MB | 3507 → 3458 | 0.99&times; | 937 → 938 | 1.00&times; |
+| 160&times;128&times;192 PEC | 94 MB | 889 → 3249 | 3.66&times; | 497 → 706 | 1.42&times; |
+| 224&sup3; PEC | 270 MB | 632 → 2607 | 4.13&times; | 475 → 497 | 1.05&times; |
+| 160&times;128&times;192 PML_8 | 94 MB | 266 → 800 | 3.00&times; | 164 → 221 | 1.34&times; |
+| 224&sup3; PML_8 | 270 MB | 237 → 828 | 3.50&times; | 183 → 205 | 1.12&times; |
+| 224&sup3; Mur | 270 MB | 569 → 1848 | 3.25&times; | 388 → 339 | **0.87&times;** |
+
+(Both columns at each host's pinned thread count, so the comparison is
+controlled. Host A's blocked schedule prefers 6 threads and reaches
+1.18&times;–1.75&times; when allowed them on the four models where it helps at
+all; on Mur it still loses, 406 → 382. See §2.1 and the `+tblock default`
+column in §3.)
 
 The 64&sup3; row is the schedule declining to engage, and saying so:
 
@@ -188,7 +298,7 @@ x-planes that comes out wider than the grid itself. There is nothing to gain
 here anyway — 6 MB of field state is already L3-resident, and blocking a
 cache-resident grid was measured to *lose* 32% — but the guard that fires first
 is the geometric one. Either way the run falls back to the flat sweep, which is
-why the row reads 1.00&times; rather than a regression.
+why the row reads ~1.00&times; rather than a regression.
 
 Three properties make this usable rather than merely fast:
 
@@ -197,9 +307,9 @@ Three properties make this usable rather than merely fast:
   checks this for PEC, PML, Mur, Drude, lumped RLC, a local absorbing sheet, a
   TF/SF plane wave, a combined case, and a sweep over
   (k,W) &isin; {2:8, 4:16, 3:13, 6:20} &times; {1,3,4} threads; all 9 cases pass
-  on this build. Each case asserts that blocking actually *engaged* before
-  comparing fields — otherwise the comparison passes vacuously every time an
-  extension declines and the run silently falls back to the flat sweep.
+  on the build measured here. Each case asserts that blocking actually
+  *engaged* before comparing fields — otherwise the comparison passes vacuously
+  every time an extension declines and the run silently falls back.
 - **It refuses rather than risks.** Blocking engages only when *every* active
   engine extension implements the per-slab hooks. An extension that has not
   returns `false` by default and sends the whole run back to the flat sweep, so
@@ -212,23 +322,88 @@ Three properties make this usable rather than merely fast:
   period, and a blocked schedule has no moment at which the whole grid is at one
   timestep.
 
-### 4.3 The Vulkan GPU engine
+### 4.3 Trapezoidal temporal blocking on the GPU — new
+
+The same schedule now runs in `Engine_Vulkan`, enabled by
+`OPENEMS_GPU_TEMPORAL_BLOCK=<k>`. §4.4 concluded that the GPU Yee kernel is at
+roofline and that further gains have to come from *reducing traffic* rather
+than from tightening arithmetic. This is that reduction, and it is the largest
+new result in this revision:
+
+| Model | field state | RX 6800<br>flat → blocked | | UHD 770<br>flat → blocked | | HD 530<br>flat → blocked | |
+|---|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 6 MB | 12433 → 12385 | 1.00&times; | 633 → 633 | 1.00&times; | 505 → 504 | 1.00&times; |
+| 160&times;128&times;192 PEC | 94 MB | 13070 → 12950 | 0.99&times; | 524 → 611 | 1.17&times; | 368 → 381 | 1.04&times; |
+| 224&sup3; PEC | 270 MB | 5674 → **12319** | **2.17&times;** | 520 → 601 | 1.16&times; | 478 → 484 | 1.01&times; |
+| 160&times;128&times;192 PML_8 | 94 MB | 9462 → 9844 | 1.04&times; | 317 → 344 | 1.08&times; | 225 → 224 | 1.00&times; |
+| 224&sup3; PML_8 | 270 MB | 4619 → **10212** | **2.21&times;** | 323 → 347 | 1.08&times; | 270 → 269 | 1.00&times; |
+| 224&sup3; Mur | 270 MB | 5125 → 5125 | 1.00&times; | 518 → 518 | 1.00&times; | 503 → 502 | 1.00&times; |
+
+Read the RX 6800 column top to bottom and the mechanism is visible directly.
+The card has a 128 MB Infinity Cache. The two small grids are already inside it
+and there is nothing to save — and on the 94 MB PEC row the schedule engages
+anyway and loses 1%, which is a defaulting bug and is §5.2. The two 270 MB
+grids are outside the cache, and those are
+exactly the two rows that gain **2.2&times;** — which erases the throughput
+cliff at the cache boundary: 224&sup3; PEC went from 5674 (below it) to 12319,
+which is within 6% of the 13070 the 94 MB grid reaches *inside* the cache. The
+blocked schedule makes a grid that does not fit run at close to the speed of one
+that does. That is the whole claim of the method, and this is the cleanest
+demonstration of it in this document.
+
+Three device classes, three outcomes, all consistent with the same explanation:
+
+- **RX 6800 (discrete, bandwidth-bound, 128 MB cache)** — 2.2&times; where the
+  grid exceeds the cache, nothing where it does not.
+- **UHD 770 (integrated, shares 36 MB of CPU L3)** — a flat 1.08–1.17&times;
+  everywhere above 6 MB. Its cache is small enough that every real grid is
+  outside it, so the gain does not switch on and off with grid size; but the
+  device is partly latency-bound, so the gain is small.
+- **HD 530 (integrated, Gen9)** — nothing, anywhere. `clpeak`-class bandwidth
+  is not what limits this part; it is 24 execution units. Removing DRAM traffic
+  from a compute-bound kernel removes nothing that was in the way.
+
+The correctness apparatus is the same as the CPU's, and for the same reason.
+`python/Tests/test_gpu_temporal_blocking.py` checks the blocked sweep
+**bit-identical** to the flat one for PEC, fused UPML, unfused UPML, a
+dispersive material with UPML, and a sweep of (k,W) schedules including one
+where W does not divide NX — 11 tests, all passing on the build measured here.
+Two of them exist specifically to close gaps the others cannot see: one asserts
+the flat reference is not all zeros (a comparison against zero passes no matter
+what), and one checks the fused and unfused PML paths against *each other*,
+because each of the first two compares a path against itself and both would
+pass if the slab range were wrong in a way they shared.
+
+The Mur row is the refusal mechanism working:
+
+```
+Engine_Vulkan: temporal blocking disabled — Mur ABC has no slab path yet
+```
+
+Mur, TF/SF, lumped RLC and GPU probes have no slab path on the GPU yet, so any
+model using them falls back to the flat sweep and reports the flat number. What
+remains to be done, in the order that pays, is in
+`plans/GPU_TEMPORAL_BLOCKING_PLAN.md`.
+
+### 4.4 The Vulkan GPU engine
 
 A full Vulkan 1.3 compute implementation — Yee update, UPML, Mur, excitation,
 TF/SF, dispersive materials, lumped RLC, energy reduction and probe gather all
 run as compute shaders, with the operator compressed on the device.
 
-| Model | RX 6800 | vs upstream best | UHD 770 | vs upstream best |
-|---|---|---|---|---|
-| 64&sup3; PEC | 12384 | 5.95&times; | 633 | 0.30&times; |
-| 160&times;128&times;192 PEC | 13211 | 16.75&times; | 520 | 0.66&times; |
-| 224&sup3; PEC | 5673 | 9.70&times; | 519 | 0.89&times; |
-| 160&times;128&times;192 PML_8 | 9574 | 34.20&times; | 317 | 1.13&times; |
-| 224&sup3; PML_8 | 4620 | 17.68&times; | 321 | 1.23&times; |
-| 224&sup3; Mur | 5126 | 9.68&times; | 518 | 0.98&times; |
+| Model | RX 6800<br>best | vs upstream best | UHD 770<br>best | vs upstream best | HD 530<br>best | vs Host A<br>upstream best |
+|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 12433 | 6.10&times; | 633 | 0.31&times; | 505 | 0.93&times; |
+| 160&times;128&times;192 PEC | 13070 | 16.57&times; | 611 | 0.78&times; | 381 | 0.85&times; |
+| 224&sup3; PEC | 12319 | 21.01&times; | 601 | 1.03&times; | 484 | 1.14&times; |
+| 160&times;128&times;192 PML_8 | 9844 | 35.15&times; | 344 | 1.23&times; | 225 | 1.54&times; |
+| 224&sup3; PML_8 | 10212 | 38.98&times; | 347 | 1.33&times; | 270 | 1.61&times; |
+| 224&sup3; Mur | 5125 | 9.66&times; | 518 | 0.98&times; | 503 | 1.40&times; |
 
 The changes that produced those numbers, in order of what they were worth:
 
+- **Trapezoidal temporal blocking** (`99ac18a`, `d9a6431`, `88032e4`) —
+  **2.2&times;** on grids exceeding the card's cache. §4.3.
 - **Don't put field buffers in an undersized BAR aperture** (`fbd95a6`) —
   **6.4&times;** on grids exceeding the 256 MB aperture. This card has no
   resizable BAR, so above that size the buffers were being serviced across
@@ -251,20 +426,15 @@ The changes that produced those numbers, in order of what they were worth:
   Throughput unchanged; this sets the largest grid the card can hold, which is
   the GPU's hard limit.
 
-**The GPU Yee kernel is at roofline.** Counting traffic from the shader source
-rather than assuming it gives 74 B/cell/timestep ([OPTIMIZATIONS.md](OPTIMIZATIONS.md)
-§4.7/C4), and this run's 5673 MC/s &times; 74 B = **420 GB/s** against a
-`clpeak` ceiling of 477 GB/s on this card — **88% of achievable bandwidth**.
-Further GPU gains have to come from reducing traffic or passes, not from
-tightening arithmetic.
+**The flat GPU Yee kernel is at roofline.** Counting traffic from the shader
+source rather than assuming it gives 74 B/cell/timestep
+([OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.7/C4), and the flat 5674 MC/s
+&times; 74 B = **420 GB/s** against a `clpeak` ceiling of 477 GB/s on this
+card — **88% of achievable bandwidth**. That is precisely why §4.3 was worth
+doing and why it works: the only way past a roofline is to stop needing the
+resource it measures.
 
-The 64&sup3; and 160&times;128&times;192 rows run 12–13 GC/s because their
-field state fits the card's 128 MB Infinity Cache; the cliff between 3.9 M and
-11.2 M cells is exactly where ~24 B/cell crosses that boundary (94 MB vs
-270 MB of field state). Above it the GPU sits flat at ~5.2 GC/s out to at least
-26 M cells ([OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.1).
-
-### 4.4 Correctness work that came with it
+### 4.5 Correctness work that came with it
 
 Two fixes worth naming, because performance work that breaks results is worth
 nothing:
@@ -284,50 +454,137 @@ nothing:
 
 ## 5. Where this fork is *not* faster
 
-### 5.1 The AVX2 multithreaded engine loses to SSE on PML
+### 5.1 The AVX2 multithreaded engine loses to SSE on PML — on Host C only
 
-At 8 threads on a PML model, the AVX2 engine is **5–9% slower** than the SSE
-engine it was meant to replace — despite being 1.33&times; faster
+At 8 threads on a PML model, the AVX2 engine is **5–10% slower** than the SSE
+engine it was meant to replace — despite being 1.31&times; faster
 single-threaded on the same model.
 
-| Model | upstream SSE-MT | fork SSE-MT | fork AVX2-MT | fork AVX2-MT<br>+ temporal blocking |
-|---|---|---|---|---|
-| 160&times;128&times;192 PML_8 | 280 | 281 | 266 | 775 |
-| 224&sup3; PML_8 | 261 | 261 | 237 | 830 |
-| 224&sup3; PEC | 585 | 587 | 630 | 2644 |
+| Model | upstream SSE-MT | fork AVX2-MT | fork AVX2-MT<br>+ temporal blocking |
+|---|---|---|---|
+| 160&times;128&times;192 PML_8 | 280 | 266 | 800 |
+| 224&sup3; PML_8 | 262 | 237 | 828 |
+| 224&sup3; PEC | 586 | 632 | 2607 |
 
-The fork's SSE-MT column was measured the same way as the rest — same pinning,
-same 8 threads, best of 3. It matches upstream's to within 0.4%, so this is
-not a fork-wide regression; it is specific to the AVX2 engine at high thread
-counts. Both engines are bandwidth-bound there, and the AVX2 kernel's wider
-per-lane footprint buys nothing once DRAM sets the pace, while its PML passes
-cost slightly more. The right fix is not more vectorization — temporal blocking
-removes the constraint entirely and takes the same case to 775–830 MC/s.
+Both engines are bandwidth-bound there, and the AVX2 kernel's wider per-lane
+footprint buys nothing once DRAM sets the pace, while its PML passes cost
+slightly more. That this is a memory-system effect and not a kernel defect is
+now directly confirmed: on **Host A the same comparison never inverts** —
+164 vs 146 and 183 vs 168 MC/s, the AVX2 engine ahead by 9–13% on exactly the
+models where it falls behind on Host C. Four cores cannot saturate DDR4 the way
+eight P-cores saturate DDR5, so the crossover never happens.
 
-**Practical guidance:** on a PML-dominated model with many threads and without
+The right fix is not more vectorization — temporal blocking removes the
+constraint entirely and takes the same case to 800–828 MC/s.
+
+**Practical guidance:** on a many-core host, on a PML-dominated model, without
 temporal blocking, `--engine=multithreaded` is the better choice.
 
-### 5.2 The integrated GPU is not a compute device
+### 5.2 GPU temporal blocking engages when it should not, and costs ~5%
 
-Measured here: **317–633 MC/s on every grid**, essentially flat with grid size,
-i.e. **0.30&times;–1.23&times;** upstream's best CPU configuration (§4.3 table).
+The tile target is a **tunable with a per-device-class default** — 64 MB
+discrete, 16 MB integrated — because Vulkan exposes no last-level-cache size to
+query. On the RX 6800 the real cache is 128 MB, so a grid between 64 and 128 MB
+is already cache-resident but still looks too large to the guard. It engages,
+adds the trapezoid's wedge overhead, and saves traffic that was not being spent:
 
-That flatness has a cause. `clpeak` reports 48.7 GB/s for the UHD 770 against
-the CPU's ~49 GB/s STREAM-Triad ceiling: the iGPU and the CPU are the same
-memory system, so there is no cache hierarchy of its own for grid size to
-interact with. It is worth having as a portability check on a second Vulkan
-driver — ANV rather than RADV, which is how driver-specific assumptions get
-caught — and for nothing else. Device selection already prefers the discrete
-GPU.
+| 160&times;128&times;192 PEC, RX 6800 | result |
+|---|---|
+| flat | 13070 |
+| blocked, default 64 MB target | 12950 |
+| blocked, `OPENEMS_GPU_TEMPORAL_BLOCK_MB=64` (single run) | 12508 |
+| blocked, `OPENEMS_GPU_TEMPORAL_BLOCK_MB=128` (single run) | **13143** — *refuses, correctly* |
 
-### 5.3 Thread auto-tune: fixed here, still worth knowing
+Told the card's actual cache size, the guard declines and full flat throughput
+comes back. Told the default, it costs about 1% in the best-of-3 matrix row and
+about 5% in the direct single-run A/B above. Either way it is a loss, and it is
+avoidable per host with one environment variable.
+
+This is a defaulting problem, not a schedule problem, and the fix is known: a
+device-ID table or a startup micro-probe instead of a constant. Until then, on
+a card with an unusually large last-level cache, set
+`OPENEMS_GPU_TEMPORAL_BLOCK_MB` to it.
+
+### 5.3 The integrated GPUs are not compute devices — but the comparison is relative
+
+On Host C the UHD 770 measures **317–633 MC/s on every grid**, essentially flat
+with grid size, i.e. **0.31&times;–1.33&times;** upstream's best CPU
+configuration. That flatness has a cause: `clpeak` reports 48.7 GB/s for it
+against the CPU's ~49 GB/s STREAM-Triad ceiling, because the iGPU and the CPU
+*are the same memory system*, so there is no cache hierarchy of its own for
+grid size to interact with.
+
+The Host A result is the same device class against a much weaker CPU, and it
+lands differently. The HD 530 is **slower in absolute terms** than the UHD 770
+on every one of the six models — and yet on two of them, 224&sup3; PML_8 and
+224&sup3; Mur, it is the **fastest engine on its machine**, beating every CPU
+configuration including the blocked one. Against upstream's best it reaches
+1.54&times;–1.61&times; on the PML models and 1.40&times; on Mur. An iGPU is not
+fast; it is simply not competing with much on a four-core desktop part, and it
+does not slow down when a PML is added the way the CPU does (224&sup3;:
+478 → 270 MC/s on the GPU, 423 → 168 on the CPU).
+
+The qualifier matters. On the smaller 160&times;128&times;192 PML_8 model the
+blocked CPU schedule reaches 251 MC/s against the GPU's 225, so the GPU is
+*not* simply the right answer for PML on this machine — it wins where the grid
+is large enough that the CPU's 8 MB L3 has stopped helping.
+
+So the honest statement is not "integrated GPUs are useless" but: **an
+integrated GPU is worth trying whenever the CPU it shares a die with is weak
+and the model is both PML-dominated and large.** On Host C it remains a portability check on a
+second Vulkan driver — ANV rather than RADV, which is how driver-specific
+assumptions get caught — and little more. Device selection already prefers the
+discrete GPU where one exists.
+
+### 5.4 CPU temporal blocking needs a large last-level cache
+
+On Host A's 8 MB L3, the schedule's gains collapse and one model regresses:
+
+| Model | tile geometry chosen | flat → blocked (4t) | |
+|---|---|---|---|
+| 160&times;128&times;192 PEC | k=7, W=14, 11 tiles, 7.9 MB/tile | 497 → 706 | 1.42&times; |
+| 224&sup3; PEC | k=3, W=6, 37 tiles, 6.9 MB/tile | 475 → 497 | 1.05&times; |
+| 224&sup3; PML_8 | k=3, W=6, 37 tiles, 6.9 MB/tile | 183 → 205 | 1.12&times; |
+| 224&sup3; Mur | k=3, W=6, 37 tiles, 6.9 MB/tile | 388 → 339 | **0.87&times;** |
+
+Compare Host C, where the same models get k=15–16 and 31–64-line tiles. The
+tile width is derived from the L3, so a 4.5&times; smaller cache buys a
+4.5&times; narrower tile, and the depth *k* has to shrink with it to satisfy
+the geometric `W >= 2k` constraint. At k=3 the schedule is paying the
+trapezoid's full wedge and re-traversal overhead to divide DRAM traffic by
+three, and on the Mur model — whose boundary work is per-face and does not
+shrink with the tile — that trade is a net loss.
+
+The schedule is opt-in (§5.5), so this costs nothing unless it is asked for.
+But it does mean the 3–4&times; figures in §4.2 should be read as a property of
+a 36 MB L3, not of the method: **check it on your own hardware before relying
+on it**, which is a two-command exercise (§7).
+
+### 5.5 Temporal blocking is opt-in, and capped by probe cadence
+
+Both schedules are prototypes behind environment variables —
+`OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` and `OPENEMS_GPU_TEMPORAL_BLOCK=<k>` (here,
+k=16 on the CPU and on the RX 6800, k=6 on the integrated devices) — and do
+nothing unless set. Two limits are worth knowing before relying on the numbers
+in §4.2 and §4.3:
+
+- **Block depth is capped by the probe interval.** `openems.cpp` calls
+  `IterateTS()` with the number of timesteps until the next probe or dump, and
+  both schedules clamp *k* to it — which is what keeps probes and dumps correct
+  with no work on their side. That interval is typically 5–25 timesteps, which
+  happens to bracket the measured optimum (*k* = 6–24). A run oversampled far
+  past Nyquist will not reach these figures.
+- **These models have no probes or dumps at all**, so they see the ceiling of
+  what blocking can do. A probe-dense model will land lower.
+
+### 5.6 Thread auto-tune: fixed here, still worth knowing
 
 Upstream's thread search hill-climbs inside `NextInterval()`, which is called
 only after four seconds of wall time, adding one thread per call starting from
-one. On a 4-core machine it converges quickly; on this 32-thread machine
-reaching the optimum takes ~44 s, during which the run is nowhere near peak
-([OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.2). `fd555ee` replaces it
-with a search that scores candidates on real timesteps inside `IterateTS()` —
+one. On a 4-core machine it converges quickly; on a 32-thread machine reaching
+the optimum takes ~44 s, during which the run is nowhere near peak
+([OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.2). `fd555ee` replaces it with a
+search that scores candidates on real timesteps inside `IterateTS()` —
 legitimate because thread count cannot change results — settling in ~250
 timesteps instead. One detail mattered more than expected: the first batch after
 each thread respawn must be discarded, or cold private caches penalise exactly
@@ -335,34 +592,25 @@ the wide configurations under judgement.
 
 How close each build's default gets to its own pinned optimum:
 
-| Model | upstream default | upstream best | reached | fork default | fork best | reached |
-|---|---|---|---|---|---|---|
-| 64&sup3; PEC | 942 | 2081 | 45% | 2786 | 3397 | 82% |
-| 160&times;128&times;192 PEC | 558 | 789 | 71% | 905 | 896 | 101% |
-| 224&sup3; PEC | 497 | 585 | 85% | 611 | 630 | 97% |
-| 160&times;128&times;192 PML_8 | 206 | 280 | 74% | 257 | 266 | 97% |
-| 224&sup3; PML_8 | 179 | 261 | 68% | 225 | 237 | 95% |
-| 224&sup3; Mur | 423 | 530 | 80% | 541 | 565 | 96% |
+| Model | Host C<br>upstream | Host C<br>fork | Host A<br>upstream | Host A<br>fork |
+|---|---|---|---|---|
+| 64&sup3; PEC | 47% | 83% | 100% | 100% |
+| 160&times;128&times;192 PEC | 72% | 97% | 88% | 99% |
+| 224&sup3; PEC | 85% | 97% | 91% | 100% |
+| 160&times;128&times;192 PML_8 | 74% | 96% | 97% | 100% |
+| 224&sup3; PML_8 | 69% | 95% | 79% | 100% |
+| 224&sup3; Mur | 81% | 95% | 90% | 100% |
 
-Upstream's default leaves 15–55% on the table; the fork's lands within 3–5% on
-every stable configuration. This is a fork improvement, but note what it means
-for reading §3: **comparing the two `default` columns measures the auto-tune as
-much as the engines.** That is why the pinned columns exist.
+The two hosts together are the whole argument. On Host C upstream's default
+leaves 15–53% on the table and the fork's lands within 3–5%. On Host A —
+4 cores, exactly the shape of machine upstream's search was written for —
+upstream loses at most 21% and the fork reaches 99–100%. The fix is worth most
+where the old search was worst, which is the many-core case, and costs nothing
+where it was already fine.
 
-### 5.4 Temporal blocking is opt-in, and capped by probe cadence
-
-It is a prototype behind `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` (here, `k=16`) and
-does nothing unless the variable is set. Two limits are worth knowing before
-relying on the numbers in §4.2:
-
-- **Block depth is capped by the probe interval.** `openems.cpp` calls
-  `IterateTS()` with the number of timesteps until the next probe or dump, and
-  the schedule clamps *k* to it — which is what keeps probes and dumps correct
-  with no work on their side. That interval is typically 5–25 timesteps, which
-  happens to bracket the measured optimum (*k* = 6–24). A run oversampled far
-  past Nyquist will not reach these figures.
-- **These models have no probes or dumps at all**, so they see the ceiling of
-  what blocking can do. A probe-dense model will land lower.
+Note what this means for reading §3: **comparing the two `default` columns
+measures the auto-tune as much as the engines.** That is why the pinned columns
+exist.
 
 ---
 
@@ -371,21 +619,25 @@ relying on the numbers in §4.2:
 Time-stepping throughput is not the whole cost. Operator construction, measured
 as wall clock outside the stepping loop:
 
-| Model | upstream SSE-MT | fork AVX2-MT | fork Vulkan |
-|---|---|---|---|
-| 224&sup3; PEC | 6.0 s | 5.1 s | 6.9 s |
-| 224&sup3; PML_8 | 8.3 s | 5.6 s | 6.6 s |
-| 224&sup3; Mur | 6.0 s | 5.1 s | 6.9 s |
+| Model | | upstream SSE-MT | fork AVX2-MT | fork Vulkan |
+|---|---|---|---|---|
+| 224&sup3; PEC | Host C | 6.0 s | 5.1 s | 7.0 s |
+| 224&sup3; PML_8 | Host C | 8.2 s | 5.6 s | 6.8 s |
+| 224&sup3; Mur | Host C | 6.0 s | 5.1 s | 7.0 s |
+| 224&sup3; PEC | Host A | 13.9 s | 12.9 s | 12.2 s |
+| 224&sup3; PML_8 | Host A | 17.3 s | 14.3 s | 13.1 s |
+| 224&sup3; Mur | Host A | 13.9 s | 12.6 s | 12.1 s |
 
 Operator setup is parallelized in this fork, which is where the PML case's
-8.3 s → 5.6 s comes from.
+8.2 s → 5.6 s comes from; on Host A's four cores the same change is worth
+17.3 s → 14.3 s.
 
-For the GPU, setup is the dominant fixed cost of a short run: at 224&sup3; the
-operator takes ~6.9 s while all 1200 timesteps take only ~2.4 s. Since the CPU
-pays ~6.0 s of setup too, though, the crossover is early — the GPU is ahead of
-upstream's best CPU configuration after about **52 timesteps**. Against the
-fork's own temporal-blocked CPU engine the crossover is ~790 timesteps, so on
-short runs the two are closer than §3 suggests.
+For the GPU, setup is the dominant fixed cost of a short run: on Host C at
+224&sup3; the operator takes ~7.0 s while all 1200 timesteps take only ~1.1 s
+with blocking on. Since the CPU pays ~6.0 s of setup too, the crossover is
+early — the blocked GPU is ahead of upstream's best CPU configuration after
+about **55 timesteps**, and ahead of the fork's own blocked CPU engine after
+about **530**.
 
 ---
 
@@ -404,31 +656,46 @@ cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release -DWITH_GPU=ON \
       -DCSXCAD_ROOT_DIR=$HOME/opt -DFPARSER_ROOT_DIR=$HOME/opt
 make -C build-bench -j$(nproc)
 
-# 3. run the matrix (~2 h)
+# 3. run the matrix (~2 h) -- Host C
 python python/Tests/benchmark_fork_vs_upstream.py --out /tmp/bench.json
+
+# 3'. the same matrix on a different machine: everything host-specific is a flag
+python python/Tests/benchmark_fork_vs_upstream.py \
+    --tuned-threads 4 --pin-single 0 --pin-tuned 0,2,4,6 \
+    --gpu hd530:0:6 --csxcad-lib ~/openEMS/build-deps/install/lib \
+    --out /tmp/bench-hostA.json
 ```
 
-The script writes incrementally and skips configurations already present in the
-output file, so it can be interrupted and resumed. `--only <substring>` runs a
-single cell of the matrix.
+`--gpu LABEL:INDEX[:K]` is repeatable and adds both a flat and a
+`+tblock` row for each device; `--gpu none` gives a CPU-only matrix. The script
+writes incrementally and skips configurations already present in the output
+file, so it can be interrupted and resumed. `--only <substring>` runs a single
+cell of the matrix.
 
 The raw output behind every table in this document is committed as
-`python/Tests/results/fork_vs_upstream_2026-09-05.json`, including the
-individual repeats, so the best-of-N choices can be checked rather than taken
-on trust.
+`python/Tests/results/fork_vs_upstream_hostC_2026-09-07.json` and
+`python/Tests/results/fork_vs_upstream_hostA_2026-09-08.json`, including the
+individual repeats and each blocked row's schedule announcement, so the
+best-of-N choices and the engage/refuse decisions can be checked rather than
+taken on trust. Host A's first, independently built run is kept beside it as
+`fork_vs_upstream_hostA_2026-09-07.json` — the two are a full-matrix
+reproducibility check, not a duplicate. The previous single-host revision is
+preserved as `fork_vs_upstream_2026-09-05.json`.
 
 Related drivers: `python/Tests/benchmark_avx2_engine.py`,
 `python/Tests/benchmark_gpu_engine.py` (`--gpu-index` selects the device),
-`python/Tests/bench_temporal_blocking.c`.
+`python/Tests/bench_temporal_blocking.c`. Correctness:
+`python/Tests/test_temporal_blocking.py` and
+`python/Tests/test_gpu_temporal_blocking.py`.
 
 ---
 
 ## 8. Measurement notes
 
-Two hazards on this host produced wrong numbers before they were understood,
-and both are worth repeating for anyone re-running this.
+Three hazards produced wrong numbers before they were understood, and all three
+are worth repeating for anyone re-running this.
 
-**Cache-resident grids are bimodal on this CPU, for a reason not identified.**
+**Cache-resident grids are bimodal on Host C, for a reason not identified.**
 The 64&sup3; model returns either ~480 or ~150–310 MC/s from run to run — a
 3&times; swing on identical input. What it is *not*, each ruled out by direct
 measurement rather than by argument:
@@ -446,13 +713,29 @@ The leading remaining candidate is the **uncore/ring clock**, which ranges
 a hypothesis, not a finding: `current_freq_khz` is not readable unprivileged
 here, so it was never confirmed, and the effect shows up at 8 threads as well
 as at 1, which a simple "one core does not raise the uncore" story does not
-explain.
+explain. It reproduces on Host A's 64&sup3; rows as well (198 vs 162 MC/s
+single-threaded in the run tabulated here, and 199 vs 146 in the repeat), on a
+completely different microarchitecture, which weakens any explanation specific
+to Raptor Lake.
 
 What matters for reading this document is the scope, and that *is* established:
 only the cache-resident grid is affected. Every DRAM-bound configuration is
-stable to **0.5–4%** across repeats. Hence 6 repeats on the 64&sup3; grid and 3
-elsewhere, and hence the 64&sup3; row should be read as "about this" while the
-rest can be read as measured.
+stable to **0.5–4%** across repeats — visible directly in the committed JSON,
+whose `samples` arrays are within a percent of each other on every large grid.
+Hence 6 repeats on the 64&sup3; grid and 3 elsewhere, and hence the 64&sup3;
+row should be read as "about this" while the rest can be read as measured.
+
+**Host A was not quiesced.** It is a shared server and ran `rclone`, Jellyfin
+and an idle BOINC client throughout, at a load average of 0.6–2.8. This is a
+real caveat and it is not hidden: it means Host A's absolute numbers could be a
+few percent low. It does **not** undermine what Host A is used for here, which
+is entirely *ratios measured within the host* — AVX2 vs SSE, blocked vs flat,
+GPU vs CPU — all of which are best-of-3 over interleaved runs that shared the
+same background load. The one place to be careful is the 64&sup3; row, where
+that noise compounds with the bimodality above: its 8-thread repeats spread
+491–512 MC/s in the run tabulated here and 380–512 in the repeat, which is why
+that row moved 1.4% between the two while every other row moved under 0.8%.
+Nothing in §1 or §5 turns on it.
 
 **Never A/B a GPU change by disabling the excitation.** With no source the
 fields stay exactly zero, and an all-zero grid runs ~28% faster than the
@@ -460,10 +743,11 @@ identical kernel on real data — zero operands flip almost no bits. This nearly
 produced a fake 26% win once. Both arms of any comparison must carry real field
 data.
 
----
-
-*Measurements taken 2026-09-05. Upstream `d3d2a49`, fork `42e3d2e`. Every
-throughput figure in the tables above comes from
-`python/Tests/results/fork_vs_upstream_2026-09-05.json`; the two prose figures
-that do not (the fork's SSE-MT column in §5.1 and the thread sweep in §2.1) are
-labelled where they appear.*
+**A harness bug worth naming**, because it silently produced missing data
+rather than wrong data: the regex that reads the loop time out of openEMS's
+output accepted `1200` and `262144.00` but not `1.12394e+07`, and the cell
+count prints in scientific notation exactly when the run is too fast to emit an
+interval line first — that is, on every GPU run on a large grid. The effect was
+that `setup_s` came back `None` on precisely the rows with the most setup to
+report. Fixed in this revision; §6's GPU column is the first that did not have
+to be measured by hand.

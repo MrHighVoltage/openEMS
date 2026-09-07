@@ -113,15 +113,23 @@ python3 -c "import openEMS; print(openEMS.__version__)"
 
 ## Performance
 
-This fork adds AVX2/FMA CPU engines and a Vulkan GPU engine on top of upstream
-openEMS. Measured against a from-scratch build of upstream on the same machine
-(i9-13900K, Radeon RX 6800), on models from 0.26 M to 11.2 M cells:
+This fork adds AVX2/FMA CPU engines, a Vulkan GPU engine, and an opt-in
+trapezoidal temporal-blocking schedule that runs on both. Measured against a
+from-scratch build of upstream on the same machine (i9-13900K, Radeon RX 6800),
+on models from 0.26 M to 11.2 M cells:
 
 | | compared against | speedup |
 |---|---|---|
-| AVX2, single-threaded | upstream SSE, single-threaded | 1.33–2.07&times; |
-| AVX2 + temporal blocking (opt-in), 8 threads | upstream's best CPU config | 2.8–4.5&times; *(grids larger than L3)* |
-| Vulkan, Radeon RX 6800 | upstream's best CPU config | 6–34&times; |
+| AVX2, single-threaded | upstream SSE, single-threaded | 1.31–2.04&times; |
+| AVX2 + temporal blocking (opt-in), 8 threads | upstream's best CPU config | 2.9–4.5&times; *(grids larger than L3)* |
+| Vulkan, Radeon RX 6800 | upstream's best CPU config | 6–39&times; |
+| Vulkan + temporal blocking (opt-in) | the same GPU, flat sweep | 2.2&times; *(grids larger than the GPU's cache)* |
+
+Cross-checked on a second machine (i7-6700K, integrated HD 530), where the
+gains are smaller and one is a regression — an 8 MB L3 is too small for the
+blocked CPU schedule to pay on every model. Which results are properties of the
+code and which are properties of a 36 MB cache is exactly what the second host
+is there to separate.
 
 Full tables, the method, and the cases where this fork is *not* faster are in
 **[PERFORMANCE.md](PERFORMANCE.md)**. The engineering record behind the numbers

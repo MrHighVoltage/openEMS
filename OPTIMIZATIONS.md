@@ -10,9 +10,14 @@ basic engines are out of scope.
 
 Measurements come from three hosts and are not comparable across them:
 
-- **Host A (historic, CPU)** — i7-6700K, 4 cores / 8 threads (SMT2),
-  dual-channel DDR4. Practical STREAM-Triad ceiling ~29 GB/s. Everything in
-  §1's AVX2 table was measured here. **This host is gone**; see §4.
+- **Host A** — i7-6700K, 4 cores / 8 threads (SMT2), 8 MB L3, dual-channel
+  DDR4. Practical STREAM-Triad ceiling ~29 GB/s. Everything in §1's AVX2 table
+  was measured here. It was believed lost when §4 was written; it is a remote
+  server, it is still available, and it also carries an integrated
+  **Intel HD Graphics 530** (Skylake GT2, ANV). Re-measured 2026-09-08 —
+  see [PERFORMANCE.md](PERFORMANCE.md), where it is the second host and where
+  its small L3 is what shows which §4 conclusions are properties of the code
+  and which are properties of a 36 MB cache.
 - **Host B (historic, GPU)** — Radeon RX 6800, 512 GB/s peak, 128 MB Infinity
   Cache, **256 MB BAR** (no resizable BAR). Everything in §1's GPU table was
   measured here.
@@ -268,9 +273,11 @@ its engine port.**
 
 ## 4. Re-verification on Host C (2026-09-04)
 
-Host A (i7-6700K) is gone. Host C is an i9-13900K carrying **both** the RX 6800
-from Host B and an integrated UHD 770, so for the first time the GPU and CPU
-numbers come from one machine and the two GPUs are directly comparable.
+Host A (i7-6700K) was believed gone when this section was written; it was not
+(see the host list above, and PERFORMANCE.md, which re-measures it on
+2026-09-07). Host C is an i9-13900K carrying **both** the RX 6800 from Host B
+and an integrated UHD 770, so for the first time the GPU and CPU numbers come
+from one machine and the two GPUs are directly comparable.
 
 Every number below is a fresh measurement on Host C. Benchmark drivers are
 unchanged: `python/Tests/benchmark_avx2_engine.py` and
@@ -769,6 +776,42 @@ Corollary: `clpeak` also reports **48.7 GB/s** for the UHD 770, against the
 CPU's 49 GB/s STREAM-Triad ceiling (§4.3). The iGPU and the CPU are the same
 memory system to within measurement error, which is why §4.1's iGPU column is
 flat at ~0.5 GC/s regardless of grid size.
+
+#### C5 — Temporal blocking of the GPU sweep  ✅ **validated, 2.2× on out-of-cache grids**
+
+The direct consequence of C4. If the kernel is at 88–89% of achievable
+bandwidth, the only remaining move is to stop needing the bandwidth — which is
+what C2 did on the CPU. `RecordSlabSweep()` transcribes
+`Engine_AVX2_Multithread::TrapezoidSweep`; an x-slab is a contiguous linear
+cell index on the GPU (x is the slowest axis), so the shader change is a
+`gidBase`/`gidEnd` push-constant pair and a smaller dispatch, with no change to
+the kernel body. Enabled by `OPENEMS_GPU_TEMPORAL_BLOCK=<k>`.
+
+Measured 2026-09-07 (Host C) and 2026-09-08 (Host A), 224³, flat → blocked (k=16):
+
+| device | PEC | PML_8 | |
+|---|---|---|---|
+| RX 6800 (128 MB Infinity Cache) | 5674 → **12319** | 4619 → **10212** | **2.2×** |
+| UHD 770 (share of 36 MB CPU L3) | 520 → 601 | 323 → 347 | 1.08–1.16× |
+| HD 530 (Gen9, Host A) | 478 → 484 | 270 → 269 | 1.00× |
+
+The RX 6800 result erases the cache cliff §4.1 documents: a 270 MB grid now
+runs within 6% of what a 94 MB grid reaches *inside* the Infinity Cache. The
+HD 530 gains nothing because it is compute-bound, not bandwidth-bound — which
+is a useful negative control for the whole premise, since it is the one device
+here where the roofline C4 established was never the binding constraint.
+
+Bit-identical to the flat sweep on both drivers
+(`python/Tests/test_gpu_temporal_blocking.py`, 11 tests). Mur, TF/SF, lumped
+RLC and GPU probes still have no slab path and make the schedule refuse rather
+than risk; the remaining work is in `plans/GPU_TEMPORAL_BLOCKING_PLAN.md`.
+
+Two things this opened, both recorded in [PERFORMANCE.md](PERFORMANCE.md) §5.2:
+Vulkan exposes no last-level-cache size, so the tile target is a tunable
+(`OPENEMS_GPU_TEMPORAL_BLOCK_MB`, default 64 MB discrete / 16 MB integrated),
+and on a card whose real cache is larger than the default the guard engages on
+a grid that was already cache-resident and **costs ~5%**. A device-ID table or
+a startup micro-probe would fix it.
 
 
 ---
