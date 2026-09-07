@@ -385,13 +385,12 @@ private:
 	//! Decide tile edges and depth for trapezoidal temporal blocking, or leave
 	//! m_tbActive false with a printed reason.  Called once, after the grid and
 	//! the extension set are known.
-	//! Build the x-prefix table that maps an x-range to a contiguous run of
-	//! excitation entries.  `order` is the x-sorted permutation, `xIdx` the
-	//! operator's per-entry x index; `xStart` comes back with numLines[0]+1
+	//! Build the x-prefix table that maps an x-range to a contiguous run of a
+	//! sparse extension's entries.  `sortedX` is the x index of each entry in
+	//! the already-x-sorted list; `xStart` comes back with numLines[0]+1
 	//! entries so [xStart[a], xStart[b]) is the entry range of x in [a,b).
-	void BuildExcitationSlabIndex(const std::vector<uint32_t>& order,
-	                              const unsigned int* xIdx,
-	                              std::vector<uint32_t>& xStart) const;
+	void BuildSlabEntryIndex(const std::vector<uint32_t>& sortedX,
+	                         std::vector<uint32_t>& xStart) const;
 
 	void ConfigureTemporalBlocking();
 
@@ -450,12 +449,19 @@ private:
 	//! `phase` is 0=pre-volt, 1=post-volt, 2=pre-curr, 3=post-curr.
 	void RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const;
 
+	//! Record the dispersive dispatches of one phase over [x0,x1).
+	//! `phase` is 0=pre-volt, 1=apply-volt, 2=pre-curr, 3=apply-curr.
+	//! Returns true if anything was dispatched, so the caller can skip a
+	//! barrier it does not need.
+	bool RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const;
+
 	//! Push constant struct for UPML shaders.  The trailing slab range
 	//! defaults to "everything", so the flat path is unaffected.
 	struct PmlPC    { uint32_t Nx, Ny, Nz, pNx, pNy, pNz, pStartX, pStartY, pStartZ;
 	                  uint32_t gidBase = 0; uint32_t gidEnd = 0xFFFFFFFFu; };
 	//! Push constant struct for dispersive material shaders.
-	struct DispPC   { uint32_t count, Nx, Ny, Nz, hasLorADE; };
+	struct DispPC   { uint32_t count, Nx, Ny, Nz, hasLorADE;
+	                  uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
 	//! Push constant struct for TF/SF shaders (same as ExcPC).
 	struct TfsfPC   { uint32_t count; int32_t numTS; uint32_t sigLen; int32_t sigPeriod; };
 	//! Push constant struct for Mur ABC shaders.
@@ -512,6 +518,9 @@ private:
 		VkDescriptorSet applyVoltDesc = VK_NULL_HANDLE;
 		VkDescriptorSet applyCurrDesc = VK_NULL_HANDLE;
 		DispPC voltPC{}, currPC{};
+		//! Entries sorted by x, with the prefix table that maps an x-range to a
+		//! contiguous run of them.
+		std::vector<uint32_t> xStart;
 		uint32_t count = 0;
 		bool voltLorADEOn = false, currLorADEOn = false;
 		bool voltADEOn = false, currADEOn = false;

@@ -1854,7 +1854,12 @@ void Engine_Vulkan::SetupGPUExcitation()
 		const unsigned int* vx = opExc->GetVoltIndex(0);
 		std::stable_sort(order.begin(), order.end(),
 		                 [vx](uint32_t a, uint32_t b) { return vx[a] < vx[b]; });
-		BuildExcitationSlabIndex(order, vx, m_excVoltXStart);
+		{
+			std::vector<uint32_t> sortedX(order.size());
+			for (size_t n = 0; n < order.size(); ++n)
+				sortedX[n] = vx[order[n]];
+			BuildSlabEntryIndex(sortedX, m_excVoltXStart);
+		}
 
 		std::vector<uint32_t>   sIdx(m_excVoltCount), sDelay(m_excVoltCount);
 		std::vector<FDTD_FLOAT> sAmp(m_excVoltCount);
@@ -1896,7 +1901,12 @@ void Engine_Vulkan::SetupGPUExcitation()
 		const unsigned int* cx = opExc->GetCurrIndex(0);
 		std::stable_sort(order.begin(), order.end(),
 		                 [cx](uint32_t a, uint32_t b) { return cx[a] < cx[b]; });
-		BuildExcitationSlabIndex(order, cx, m_excCurrXStart);
+		{
+			std::vector<uint32_t> sortedX(order.size());
+			for (size_t n = 0; n < order.size(); ++n)
+				sortedX[n] = cx[order[n]];
+			BuildSlabEntryIndex(sortedX, m_excCurrXStart);
+		}
 
 		std::vector<uint32_t>   sIdx(m_excCurrCount), sDelay(m_excCurrCount);
 		std::vector<FDTD_FLOAT> sAmp(m_excCurrCount);
@@ -2540,13 +2550,37 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 			VkDeviceSize adeSize = 3 * cnt * sizeof(FDTD_FLOAT);
 			VkDeviceSize idxSize = 3 * cnt * sizeof(uint32_t);
 
+			// Entries are reordered by x so that a temporal-blocking slab maps
+			// to a contiguous run of them, exactly as the excitation list is.
+			// Stable, so entries sharing an x keep the operator's order.
+			//
+			// Safe across the two orders of a conducting sheet even though both
+			// carry the *identical* position list and both subtract from the
+			// same engine cell: each order is its own dispatch, the two run in
+			// sequence separated by a barrier, and sorting identical lists by
+			// the same key gives both the same permutation. So a cell still
+			// sees order 0 then order 1, which is what the flat path does and
+			// what makes the result independent of the reordering.
+			std::vector<uint32_t> perm(cnt);
+			for (uint32_t i = 0; i < cnt; i++)
+				perm[i] = i;
+			const unsigned int* px = lor->m_LM_pos[order][0];
+			std::stable_sort(perm.begin(), perm.end(),
+			                 [px](uint32_t a, uint32_t b) { return px[a] < px[b]; });
+			{
+				std::vector<uint32_t> sortedX(cnt);
+				for (uint32_t i = 0; i < cnt; i++)
+					sortedX[i] = px[perm[i]];
+				BuildSlabEntryIndex(sortedX, data.xStart);
+			}
+
 			// Flatten position indices: [3][count]
 			std::vector<uint32_t> posIdx(3 * cnt);
 			for (uint32_t i = 0; i < cnt; i++)
 			{
-				posIdx[i]           = lor->m_LM_pos[order][0][i];
-				posIdx[cnt + i]     = lor->m_LM_pos[order][1][i];
-				posIdx[2*cnt + i]   = lor->m_LM_pos[order][2][i];
+				posIdx[i]           = lor->m_LM_pos[order][0][perm[i]];
+				posIdx[cnt + i]     = lor->m_LM_pos[order][1][perm[i]];
+				posIdx[2*cnt + i]   = lor->m_LM_pos[order][2][perm[i]];
 			}
 			CreateGpuBuf(data.posIdx, idxSize, usage, dLoc);
 			UploadGpuBuf(data.posIdx, posIdx.data(), idxSize);
@@ -2575,7 +2609,7 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 				std::vector<float> flat(3 * cnt);
 				for (int n = 0; n < 3; n++)
 					for (uint32_t i = 0; i < cnt; i++)
-						flat[n * cnt + i] = arr[order][n][i];
+						flat[n * cnt + i] = arr[order][n][perm[i]];
 				return flat;
 			};
 
@@ -4169,14 +4203,13 @@ void Engine_Vulkan::ReportGPUFieldValidation(unsigned int timestep) const
 // IterateTS — the main time-stepping loop
 // ===========================================================================
 
-void Engine_Vulkan::BuildExcitationSlabIndex(const std::vector<uint32_t>& order,
-                                             const unsigned int* xIdx,
-                                             std::vector<uint32_t>& xStart) const
+void Engine_Vulkan::BuildSlabEntryIndex(const std::vector<uint32_t>& sortedX,
+                                        std::vector<uint32_t>& xStart) const
 {
 	const unsigned int NX = numLines[0];
-	xStart.assign(NX + 1, (uint32_t)order.size());
-	for (size_t n = order.size(); n-- > 0; )
-		xStart[xIdx[order[n]]] = (uint32_t)n;
+	xStart.assign(NX + 1, (uint32_t)sortedX.size());
+	for (size_t n = sortedX.size(); n-- > 0; )
+		xStart[sortedX[n]] = (uint32_t)n;
 	// An x with no entries inherits the next populated one, which is what makes
 	// [xStart[a], xStart[b]) correct for every a <= b rather than only for
 	// populated bounds.
@@ -4225,7 +4258,6 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	else if (m_hasGPU_Mur)                      refuse = "Mur ABC has no slab path yet";
 	else if (m_hasGPU_TFSF)                     refuse = "TF/SF has no slab path yet";
 	else if (m_hasGPU_RLC)                      refuse = "lumped RLC has no slab path yet";
-	else if (m_hasGPU_Dispersive)               refuse = "dispersive materials have no slab path yet";
 	else if (m_hasGPU_Probes)                   refuse = "GPU probes have no slab path yet";
 	else if (m_steadyPipeline != VK_NULL_HANDLE)
 		refuse = "steady-state detection integrates energy over the whole grid, "
@@ -4365,6 +4397,45 @@ void Engine_Vulkan::RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, 
 	}
 }
 
+bool Engine_Vulkan::RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const
+{
+	if (m_gpuDisp.empty() || x1 <= x0)
+		return false;
+
+	const bool isVolt  = (phase == 0 || phase == 1);
+	const bool isApply = (phase == 1 || phase == 3);
+
+	VkPipeline pipe = isApply ? (isVolt ? m_dispApplyVoltPipeline : m_dispApplyCurrPipeline)
+	                          : (isVolt ? m_dispPreVoltPipeline   : m_dispPreCurrPipeline);
+	VkPipelineLayout layout = isApply ? m_dispApplyPipeLayout : m_dispPrePipeLayout;
+
+	bool any = false;
+	for (const auto& d : m_gpuDisp)
+	{
+		if (isVolt ? !d.voltADEOn : !d.currADEOn)
+			continue;
+		const uint32_t b = d.xStart[x0], e = d.xStart[x1];
+		if (e <= b)
+			continue;
+
+		// The apply pass takes hasLorADE = 0 in the flat path, so keep that.
+		DispPC pc = isApply ? DispPC{d.count, numLines[0], numLines[1], numLines[2], 0}
+		                    : (isVolt ? d.voltPC : d.currPC);
+		pc.entryBase = b;
+		pc.entryEnd  = e;
+
+		VkDescriptorSet desc = isApply ? (isVolt ? d.applyVoltDesc : d.applyCurrDesc)
+		                               : (isVolt ? d.preVoltDesc   : d.preCurrDesc);
+		if (!any)
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &desc, 0, nullptr);
+		vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &pc);
+		vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
+		any = true;
+	}
+	return any;
+}
+
 void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, int dir,
                                     uint32_t t0, const GridPC& gridV, const GridPC& gridC,
                                     const FusedPC& fused, const VkMemoryBarrier& barrier,
@@ -4396,6 +4467,16 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		if (eHi < eLo) eHi = eLo;
 
 		const uint32_t ts = t0 + (uint32_t)t;
+
+		// --- Dispersive pre-voltage (ADE update before the Yee sweep) ---
+		// Ordered exactly as the flat path has it: the pre passes run before
+		// the update, the apply passes after it and before the excitation.
+		if (RecordDispersiveSlabPhase(cmd, 0, eLo, eHi))
+		{
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
 
 		// --- Voltage update on [eLo, eHi) ---
 		// With UPML fused into the main kernel this is one dispatch: PML
@@ -4452,6 +4533,14 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			}
 		}
 
+		// --- Dispersive apply-voltage ---
+		if (RecordDispersiveSlabPhase(cmd, 1, eLo, eHi))
+		{
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
+
 		// --- Voltage excitation, restricted to the same x-range ---
 		if (hasExcVolt && eHi > eLo)
 		{
@@ -4486,6 +4575,14 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		// sweep applies, so clamping would drop it.
 		const int hHi  = (Bn < NXH) ? Bn : NXH;
 		const int hExc = (Bn >= NX) ? NX : hHi;
+
+		if (RecordDispersiveSlabPhase(cmd, 2, An, hExc))
+		{
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
+
 		if (m_hasFusedUPML)
 		{
 			if (hExc > An)
@@ -4535,6 +4632,14 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
 			}
+		}
+
+		// --- Dispersive apply-current ---
+		if (RecordDispersiveSlabPhase(cmd, 3, An, hExc))
+		{
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
 		}
 
 		// --- Current excitation ---

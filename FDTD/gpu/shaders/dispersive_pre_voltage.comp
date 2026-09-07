@@ -28,12 +28,16 @@ layout(push_constant) uniform PC {
     uint count;       // number of dispersive cells for this order
     uint Nx, Ny, Nz;  // global grid dimensions
     uint hasLorADE;   // 1 = Lorentz, 0 = Drude
+    // Temporal blocking: this dispatch owns entries [entryBase, entryEnd).
+    // The entry list is sorted by x on the host, so an x-slab is one
+    // contiguous run.  The flat sweep passes (0, 0xFFFFFFFF).
+    uint entryBase, entryEnd;
 };
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= count) return;
+    uint gid = gl_GlobalInvocationID.x + entryBase;
+    if (gid >= count || gid >= entryEnd) return;
 
     uint N   = Nx * Ny * Nz;
     uint sYZ = Ny * Nz;

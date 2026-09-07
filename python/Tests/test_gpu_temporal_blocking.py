@@ -26,6 +26,7 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 import numpy as np
@@ -58,6 +59,10 @@ BLOCK_ENV = "4:16"          # k=4, W=16 -> four tiles across the grid
 EXC_X = 20                  # excitation plane, inside tile 1 ([16,32))
 GPU_INDEX = os.environ.get("OPENEMS_TEST_GPU_INDEX", "0")
 
+# Objects straddle the tile boundary at x=48 on purpose, so a wedge has to
+# reconcile something other than vacuum.
+OBJ_X_LO, OBJ_X_HI = 38, 54
+
 ACTIVE_MARK = "trapezoidal temporal blocking active"
 
 _SCRIPT_TEMPLATE = """
@@ -78,6 +83,8 @@ mesh.SetLines("y", np.arange({ny}, dtype=float))
 mesh.SetLines("z", np.arange({nz}, dtype=float))
 xl, yl, zl = mesh.GetLines("x"), mesh.GetLines("y"), mesh.GetLines("z")
 
+{extra_setup}
+
 exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
 exc.AddBox([xl[{exc_x}], yl[10], zl[10]], [xl[{exc_x}] + 1, yl[22], zl[22]])
 
@@ -90,7 +97,7 @@ FDTD.Run({sim_path!r}, cleanup=True, engine="gpu")
 """
 
 
-def _run(tag, boundary, block_env, extra_env=None):
+def _run(tag, boundary, block_env, extra_env=None, extra_setup=""):
     """Run one small GPU simulation in a subprocess.
 
     Returns (output, E_time_series, H_time_series). `block_env` is the value
@@ -104,6 +111,7 @@ def _run(tag, boundary, block_env, extra_env=None):
     script = _SCRIPT_TEMPLATE.format(
         timesteps=TIMESTEPS, boundary=boundary, nx=NX, ny=NY, nz=NZ,
         exc_x=EXC_X, sim_path=sim_path,
+        extra_setup=textwrap.dedent(extra_setup).strip(),
     )
     script_path = os.path.join(tempfile.gettempdir(), "gputblk_%s.py" % tag)
     with open(script_path, "w") as f:
@@ -240,6 +248,55 @@ class GPUTemporalBlockingTest(unittest.TestCase):
         self.assertTrue(np.allclose(fused_E, unfused_E, rtol=0, atol=1e-9),
                         "fused and unfused blocked PML disagree: max |delta| = %g"
                         % float(np.max(np.abs(fused_E - unfused_E))))
+
+    def _compare(self, tag, boundary, extra_setup):
+        """Run flat vs blocked with the same geometry and compare."""
+        _, flat_E, flat_H = _run(tag + "_flat", boundary, None, extra_setup=extra_setup)
+        self.assertGreater(float(np.max(np.abs(flat_E))), 0.0,
+                           "flat run for %s produced an all-zero field" % tag)
+        out, E, H = _run(tag + "_blocked", boundary, BLOCK_ENV, extra_setup=extra_setup)
+        self.assertIn(ACTIVE_MARK, out, _relevant_lines(out))
+        self.assertTrue(np.array_equal(flat_E, E),
+                        "%s: blocked E differs from flat, max |delta| = %g"
+                        % (tag, float(np.max(np.abs(flat_E - E)))))
+        self.assertTrue(np.array_equal(flat_H, H),
+                        "%s: blocked H differs from flat, max |delta| = %g"
+                        % (tag, float(np.max(np.abs(flat_H - H)))))
+
+    def test_drude(self):
+        """A dispersive (Drude) block straddling a tile boundary."""
+        self._compare("drude", ["PEC"] * 6, """
+            from CSXCAD.CSProperties import CSPropLorentzMaterial
+            mat = CSPropLorentzMaterial(CSX.GetParameterSet(), epsilon=1.0, order=1)
+            CSX.AddProperty(mat)
+            mat.SetName("drude")
+            mat.SetDispersiveMaterialProperty(0, eps_plasma=2 * np.pi * 5e9, eps_relax=2e-11)
+            mat.AddBox([xl[%d], yl[10], zl[10]], [xl[%d], yl[22], zl[22]], priority=5)
+            """ % (OBJ_X_LO, OBJ_X_HI))
+
+    def test_conducting_sheet(self):
+        """The two-order case.
+
+        Operator_Ext_ConductingSheet pushes the *identical* position list into
+        both of its orders, so one engine cell is written once per order. The
+        x-sort has to give both orders the same permutation, or a cell sees the
+        two subtractions in the wrong order and the result drifts.
+        """
+        self._compare("sheet", ["PEC"] * 6, """
+            sheet = CSX.AddConductingSheet("sheet", conductivity=5.8e7, thickness=1e-6)
+            sheet.AddBox([xl[%d], yl[10], zl[10]], [xl[%d], yl[22], zl[22]], priority=5)
+            """ % (OBJ_X_LO, OBJ_X_HI))
+
+    def test_drude_with_pml(self):
+        """Dispersive material and UPML together, since they share the sweep."""
+        self._compare("drude_pml", ["PML_8"] * 6, """
+            from CSXCAD.CSProperties import CSPropLorentzMaterial
+            mat = CSPropLorentzMaterial(CSX.GetParameterSet(), epsilon=1.0, order=1)
+            CSX.AddProperty(mat)
+            mat.SetName("drude")
+            mat.SetDispersiveMaterialProperty(0, eps_plasma=2 * np.pi * 5e9, eps_relax=2e-11)
+            mat.AddBox([xl[%d], yl[10], zl[10]], [xl[%d], yl[22], zl[22]], priority=5)
+            """ % (OBJ_X_LO, OBJ_X_HI))
 
     def test_refuses_unsupported_extension_and_stays_correct(self):
         """Mur has no slab path yet: blocking must decline, not silently differ."""
