@@ -322,6 +322,26 @@ private:
 	uint32_t     m_validateTraceIndex;
 	mutable bool m_gpuDrained;       //!< true after DrainGPU(), cleared on submit
 	unsigned int m_maxTSPerSubmit;   //!< Max timesteps per pure-GPU vkQueueSubmit
+
+	// ---- Temporal-blocking traffic proxy (OPENEMS_GPU_TEMPORAL_BLOCK) --
+	// EXPERIMENT ONLY, and knowingly not the physics.  It runs the Yee sweep
+	// on one x-slab for k consecutive timesteps before moving to the next
+	// slab, without the trapezoidal narrowing that would make the schedule
+	// equivalent to the flat one.  Field values are therefore wrong at slab
+	// boundaries; the point is the *access pattern*, which is what sets
+	// cache behaviour -- the same proxy trick python/Tests/bench_temporal_blocking.c
+	// uses on the CPU side.  Never enable this for a real simulation.
+	unsigned int m_tbK;      //!< timesteps per block; 0 = disabled
+	unsigned int m_tbW;      //!< tile width in x-lines; 0 = derive from m_tbTargetMB
+	unsigned int m_tbTargetMB; //!< bytes of field state one tile should occupy
+	bool         m_tbActive;   //!< blocking passed its guards for this run
+	bool         m_tbAnnounced;
+	std::vector<int> m_tbEdges; //!< tile boundaries, [0, e1, .., NX]
+	//! Excitation entries sorted by x, with a prefix table so an x-range maps
+	//! to a contiguous entry range.  m_excVoltXStart[x] is the first entry with
+	//! that x; it has numLines[0]+1 elements so [xStart[a], xStart[b]) is the
+	//! entry range of x in [a,b).
+	std::vector<uint32_t> m_excVoltXStart, m_excCurrXStart;
 	double       m_chunkProgressIntervalSec; //!< Minimum interval between chunk-progress prints
 	mutable bool m_chunkProgressHasLastPrint;
 	mutable std::chrono::steady_clock::time_point m_chunkProgressLastPrint;
@@ -361,6 +381,20 @@ private:
 	void UpdateSteadyStateResult();
 	void SetupGPU_LocalABC();
 	void RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) const;
+
+	//! Decide tile edges and depth for trapezoidal temporal blocking, or leave
+	//! m_tbActive false with a printed reason.  Called once, after the grid and
+	//! the extension set are known.
+	//! Build the x-prefix table that maps an x-range to a contiguous run of
+	//! excitation entries.  `order` is the x-sorted permutation, `xIdx` the
+	//! operator's per-entry x index; `xStart` comes back with numLines[0]+1
+	//! entries so [xStart[a], xStart[b]) is the entry range of x in [a,b).
+	void BuildExcitationSlabIndex(const std::vector<uint32_t>& order,
+	                              const unsigned int* xIdx,
+	                              std::vector<uint32_t>& xStart) const;
+
+	void ConfigureTemporalBlocking();
+
 	void CleanupVulkan();
 	void SetupProfiling();
 	void CollectProfileForSlot(int slot) const;
@@ -393,9 +427,22 @@ private:
 	void RunSingleCommand(std::function<void(VkCommandBuffer)> func) const;
 
 	//! Push constant structs matching the shader layouts.
-	struct GridPC   { uint32_t Nx, Ny, Nz, numComp; };
+	struct GridPC   { uint32_t Nx, Ny, Nz, numComp, gidBase, gidEnd; };
 	struct FusedPC  { uint32_t Nx, Ny, Nz, numComp, numPmlRegions; };
-	struct ExcPC    { uint32_t count; int32_t numTS; uint32_t sigLen; int32_t period; };
+	//! Excitation push constants.  The last two fields default so that the
+	//! flat path's brace-init `{count, ts, len, period}` keeps its old meaning
+	//! (whole list); only the blocked path narrows them.
+	struct ExcPC    { uint32_t count; int32_t numTS; uint32_t sigLen; int32_t period;
+	                  uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
+	//! Record one trapezoid of the blocked schedule: the x-interval [A0,B0)
+	//! advanced through k timesteps starting at t0, narrowing (dir=+1, a core
+	//! tile) or widening (dir=-1, a wedge over a tile boundary).  This is a
+	//! transcription of Engine_AVX2_Multithread::TrapezoidSweep, whose schedule
+	//! is verified bit-identical to the flat sweep; keep the two in step.
+	void RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, int dir,
+	                     uint32_t t0, const GridPC& gridV, const GridPC& gridC,
+	                     const VkMemoryBarrier& barrier,
+	                     bool hasExcVolt, bool hasExcCurr) const;
 
 	//! Push constant struct for UPML shaders (36 bytes = 9 × uint32).
 	struct PmlPC    { uint32_t Nx, Ny, Nz, pNx, pNy, pNz, pStartX, pStartY, pStartZ; };

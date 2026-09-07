@@ -494,6 +494,11 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 		m_fences[i] = VK_NULL_HANDLE;
 	m_utilFence = VK_NULL_HANDLE;
 	m_cmdIdx = 0;
+	m_tbK = 0;
+	m_tbW = 0;
+	m_tbTargetMB = 0;
+	m_tbActive = false;
+	m_tbAnnounced = false;
 	for (int i = 0; i < CMD_RING_SIZE; ++i)
 		m_gpuInFlight[i] = false;
 
@@ -569,6 +574,29 @@ void Engine_Vulkan::Init()
 		if (endPtr && *endPtr == '\0' && v > 0)
 			m_maxTSPerSubmit = (unsigned int)v;
 	}
+	// Trapezoidal temporal blocking: "<k>" or "<k>:<W>".  See the header.
+	if (const char* env = std::getenv("OPENEMS_GPU_TEMPORAL_BLOCK"))
+	{
+		int k = 0, w = 0;
+		if (std::sscanf(env, "%d:%d", &k, &w) >= 1 && k > 0)
+		{
+			m_tbK = (unsigned int)k;
+			m_tbW = (w > 0) ? (unsigned int)w : 0;
+		}
+	}
+	// How much field state one tile should occupy.  Vulkan exposes no
+	// last-level-cache size, so this is a tunable with a per-device-class
+	// default: the tile wants to be a fraction of the LLC it must stay in, and
+	// a discrete card's is far larger than an integrated one's share of the
+	// CPU LLC.  Measured optima on this host: 64 MB tiles on an RX 6800
+	// (128 MB Infinity Cache), 16 MB on a UHD 770 (36 MB shared L3).
+	// 0 here means "resolve from the device class in ConfigureTemporalBlocking".
+	if (const char* env = std::getenv("OPENEMS_GPU_TEMPORAL_BLOCK_MB"))
+	{
+		int mb = std::atoi(env);
+		if (mb > 0) m_tbTargetMB = (unsigned int)mb;
+	}
+
 	if (const char* env = std::getenv("OPENEMS_GPU_CHUNK_PROGRESS_SEC"))
 	{
 		char* endPtr = nullptr;
@@ -1802,8 +1830,15 @@ void Engine_Vulkan::SetupGPUExcitation()
 	m_excVoltCount = opExc->GetVoltCount();
 	if (m_excVoltCount > 0)
 	{
-		// Precompute linear indices
+		// Precompute linear indices, ordered by x.
+		//
+		// Temporal blocking dispatches the excitation per x-slab, so the
+		// entries of one slab have to be a contiguous run.  Sorting by x here
+		// costs nothing at setup and lets the blocked path address a slab with
+		// a base/end pair, exactly as the field sweep does with gidBase.
+		// Stable, so entries within one x keep the operator's order.
 		std::vector<uint32_t> linIdx(m_excVoltCount);
+		std::vector<uint32_t> order(m_excVoltCount);
 		for (unsigned int n = 0; n < m_excVoltCount; n++)
 		{
 			uint32_t dir = opExc->GetVoltDir()[n];
@@ -1814,6 +1849,20 @@ void Engine_Vulkan::SetupGPUExcitation()
 			    !std::isfinite(opExc->GetVoltAmp()[n]))
 				throw std::runtime_error("Engine_Vulkan: invalid voltage excitation entry");
 			linIdx[n] = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
+			order[n]  = n;
+		}
+		const unsigned int* vx = opExc->GetVoltIndex(0);
+		std::stable_sort(order.begin(), order.end(),
+		                 [vx](uint32_t a, uint32_t b) { return vx[a] < vx[b]; });
+		BuildExcitationSlabIndex(order, vx, m_excVoltXStart);
+
+		std::vector<uint32_t>   sIdx(m_excVoltCount), sDelay(m_excVoltCount);
+		std::vector<FDTD_FLOAT> sAmp(m_excVoltCount);
+		for (unsigned int n = 0; n < m_excVoltCount; n++)
+		{
+			sIdx[n]   = linIdx[order[n]];
+			sAmp[n]   = opExc->GetVoltAmp()[order[n]];
+			sDelay[n] = opExc->GetVoltDelay()[order[n]];
 		}
 
 		VkDeviceSize idxSize = m_excVoltCount * sizeof(uint32_t);
@@ -1821,9 +1870,9 @@ void Engine_Vulkan::SetupGPUExcitation()
 		CreateBufferWithMemory(idxSize, usage, dLoc, m_excVoltIdxBuf,   m_excVoltIdxMem);
 		CreateBufferWithMemory(ampSize, usage, dLoc, m_excVoltAmpBuf,   m_excVoltAmpMem);
 		CreateBufferWithMemory(idxSize, usage, dLoc, m_excVoltDelayBuf, m_excVoltDelayMem);
-		UploadToDeviceBuffer(m_excVoltIdxBuf,   linIdx.data(), idxSize);
-		UploadToDeviceBuffer(m_excVoltAmpBuf,   opExc->GetVoltAmp(), ampSize);
-		UploadToDeviceBuffer(m_excVoltDelayBuf, opExc->GetVoltDelay(), idxSize);
+		UploadToDeviceBuffer(m_excVoltIdxBuf,   sIdx.data(),   idxSize);
+		UploadToDeviceBuffer(m_excVoltAmpBuf,   sAmp.data(),   ampSize);
+		UploadToDeviceBuffer(m_excVoltDelayBuf, sDelay.data(), idxSize);
 	}
 
 	// --- Current excitation ---
@@ -1831,6 +1880,7 @@ void Engine_Vulkan::SetupGPUExcitation()
 	if (m_excCurrCount > 0)
 	{
 		std::vector<uint32_t> linIdx(m_excCurrCount);
+		std::vector<uint32_t> order(m_excCurrCount);
 		for (unsigned int n = 0; n < m_excCurrCount; n++)
 		{
 			uint32_t dir = opExc->GetCurrDir()[n];
@@ -1841,6 +1891,20 @@ void Engine_Vulkan::SetupGPUExcitation()
 			    !std::isfinite(opExc->GetCurrAmp()[n]))
 				throw std::runtime_error("Engine_Vulkan: invalid current excitation entry");
 			linIdx[n] = dir * (uint32_t)N + x * sYZ + y * numLines[2] + z;
+			order[n]  = n;
+		}
+		const unsigned int* cx = opExc->GetCurrIndex(0);
+		std::stable_sort(order.begin(), order.end(),
+		                 [cx](uint32_t a, uint32_t b) { return cx[a] < cx[b]; });
+		BuildExcitationSlabIndex(order, cx, m_excCurrXStart);
+
+		std::vector<uint32_t>   sIdx(m_excCurrCount), sDelay(m_excCurrCount);
+		std::vector<FDTD_FLOAT> sAmp(m_excCurrCount);
+		for (unsigned int n = 0; n < m_excCurrCount; n++)
+		{
+			sIdx[n]   = linIdx[order[n]];
+			sAmp[n]   = opExc->GetCurrAmp()[order[n]];
+			sDelay[n] = opExc->GetCurrDelay()[order[n]];
 		}
 
 		VkDeviceSize idxSize = m_excCurrCount * sizeof(uint32_t);
@@ -1848,9 +1912,9 @@ void Engine_Vulkan::SetupGPUExcitation()
 		CreateBufferWithMemory(idxSize, usage, dLoc, m_excCurrIdxBuf,   m_excCurrIdxMem);
 		CreateBufferWithMemory(ampSize, usage, dLoc, m_excCurrAmpBuf,   m_excCurrAmpMem);
 		CreateBufferWithMemory(idxSize, usage, dLoc, m_excCurrDelayBuf, m_excCurrDelayMem);
-		UploadToDeviceBuffer(m_excCurrIdxBuf,   linIdx.data(), idxSize);
-		UploadToDeviceBuffer(m_excCurrAmpBuf,   opExc->GetCurrAmp(), ampSize);
-		UploadToDeviceBuffer(m_excCurrDelayBuf, opExc->GetCurrDelay(), idxSize);
+		UploadToDeviceBuffer(m_excCurrIdxBuf,   sIdx.data(),   idxSize);
+		UploadToDeviceBuffer(m_excCurrAmpBuf,   sAmp.data(),   ampSize);
+		UploadToDeviceBuffer(m_excCurrDelayBuf, sDelay.data(), idxSize);
 	}
 
 	// --- Excitation signal ---
@@ -4105,6 +4169,274 @@ void Engine_Vulkan::ReportGPUFieldValidation(unsigned int timestep) const
 // IterateTS — the main time-stepping loop
 // ===========================================================================
 
+void Engine_Vulkan::BuildExcitationSlabIndex(const std::vector<uint32_t>& order,
+                                             const unsigned int* xIdx,
+                                             std::vector<uint32_t>& xStart) const
+{
+	const unsigned int NX = numLines[0];
+	xStart.assign(NX + 1, (uint32_t)order.size());
+	for (size_t n = order.size(); n-- > 0; )
+		xStart[xIdx[order[n]]] = (uint32_t)n;
+	// An x with no entries inherits the next populated one, which is what makes
+	// [xStart[a], xStart[b]) correct for every a <= b rather than only for
+	// populated bounds.
+	for (unsigned int x = NX; x-- > 0; )
+		if (xStart[x] > xStart[x + 1])
+			xStart[x] = xStart[x + 1];
+}
+
+// ---------------------------------------------------------------------------
+// Trapezoidal temporal blocking
+//
+// The GPU is at its DRAM roofline on any grid whose field state exceeds the
+// last-level cache (OPTIMIZATIONS.md §4.7/C4), and the only lever left is to
+// stop generating the traffic.  Advancing one x-slab through k timesteps
+// before moving on divides field traffic by roughly k, which turns a
+// DRAM-bound sweep into a cache-bound one.
+//
+// The schedule is the one Engine_AVX2_Multithread already runs and that
+// python/Tests/bench_temporal_blocking.c verifies element-for-element against
+// the flat sweep.  Two geometry details from that work carry over unchanged
+// and are the parts that are easy to get wrong:
+//
+//   * Domain edges are held, not sloped.  The slope exists because data
+//     outside the tile is at the wrong time; at x=0 and x=NX-1 there is no
+//     outside, so sloping there leaves edge cells un-advanced.
+//   * The E range is not symmetric between the two directions.  A narrowing
+//     core leaves gaps of width 2t+1 in E but 2t+2 in H, so a widening wedge
+//     sweeps E one cell narrower per side than looks natural.  The symmetric
+//     choice double-updates those cells.
+// ---------------------------------------------------------------------------
+
+void Engine_Vulkan::ConfigureTemporalBlocking()
+{
+	m_tbAnnounced = true;
+	m_tbActive    = false;
+	m_tbEdges.clear();
+	if (m_tbK == 0)
+		return;
+
+	// Refuse rather than risk: an extension without a slab path would be
+	// applied to the whole grid at a timestep only one tile has reached.  Name
+	// what refused, so adding a slab path later is an obvious next step rather
+	// than a mystery.
+	const char* refuse = nullptr;
+	if (m_hasCPUExtensions)                     refuse = "extensions are running on the CPU";
+	else if (m_hasFusedUPML || m_hasGPU_UPML)   refuse = "UPML has no slab path yet";
+	else if (m_hasGPU_Mur)                      refuse = "Mur ABC has no slab path yet";
+	else if (m_hasGPU_TFSF)                     refuse = "TF/SF has no slab path yet";
+	else if (m_hasGPU_RLC)                      refuse = "lumped RLC has no slab path yet";
+	else if (m_hasGPU_Dispersive)               refuse = "dispersive materials have no slab path yet";
+	else if (m_hasGPU_Probes)                   refuse = "GPU probes have no slab path yet";
+	else if (m_steadyPipeline != VK_NULL_HANDLE)
+		refuse = "steady-state detection integrates energy over the whole grid, "
+		         "which a blocked schedule never has at one timestep";
+	if (refuse)
+	{
+		cout << "Engine_Vulkan: temporal blocking disabled — " << refuse << endl;
+		return;
+	}
+
+	const int      NX         = (int)numLines[0];
+	const uint64_t planeBytes = (uint64_t)numLines[1] * numLines[2] * 24; // volt+curr, 3 comp, fp32
+	const uint64_t totalBytes = planeBytes * (uint64_t)NX;
+
+	// Vulkan exposes no last-level-cache size, so the tile target is a
+	// tunable.  Integrated GPUs share the CPU's LLC and get a smaller default.
+	unsigned int targetMB = m_tbTargetMB;
+	if (targetMB == 0)
+	{
+		VkPhysicalDeviceProperties props{};
+		vkGetPhysicalDeviceProperties(m_physDevice, &props);
+		targetMB = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 16 : 64;
+	}
+	const uint64_t target = (uint64_t)targetMB << 20;
+
+	if (totalBytes <= target)
+	{
+		cout << "Engine_Vulkan: temporal blocking disabled — grid already fits the "
+		          << targetMB << " MB tile target (" << (totalBytes >> 20)
+		          << " MB of field state)" << endl;
+		return;
+	}
+
+	int W = (int)m_tbW;
+	if (W <= 0)
+		W = (int)std::max<uint64_t>(1, target / std::max<uint64_t>(1, planeBytes));
+	if (W > NX) W = NX;
+
+	// W >= 2k is a hard constraint of the geometry: a core narrows by one line
+	// per side per timestep, so a tile narrower than 2k inverts and the wedges
+	// that fill behind it start to overlap — which double-updates cells.
+	int k = (int)m_tbK;
+	if (W < 2 * k)
+	{
+		const int kFit = W / 2;
+		if (kFit < 2)
+		{
+			cout << "Engine_Vulkan: temporal blocking disabled — a " << W
+			          << "-line tile cannot carry a depth-2 trapezoid; the y-z "
+			             "cross-section is too large for the "
+			          << targetMB << " MB target" << endl;
+			return;
+		}
+		cout << "Engine_Vulkan: temporal blocking — k reduced from " << k << " to "
+		          << kFit << " to fit a " << W << "-line tile (W >= 2k)" << endl;
+		k = kFit;
+	}
+
+	m_tbEdges.push_back(0);
+	for (int x = W; x < NX; x += W)
+		m_tbEdges.push_back(x);
+	m_tbEdges.push_back(NX);
+
+	// Fold a short tail into its neighbour.  A tile narrows from its left, so a
+	// tail shorter than the block depth can end up as a slab that reaches the
+	// last x-line after the line inward from it has already dropped out — fine
+	// for the Yee update, whose stencil wants the neighbour one timestep
+	// behind, and fatal for any boundary extension that reads one cell inward
+	// at the timestep it writes the edge.  Nothing here needs that yet; the
+	// fold is what will let Mur be blocked when it gets a slab path, and it
+	// costs one slightly wider tile.
+	if (m_tbEdges.size() >= 3)
+	{
+		const size_t last = m_tbEdges.size() - 1;
+		if (m_tbEdges[last] - m_tbEdges[last - 1] < k + 3)
+			m_tbEdges.erase(m_tbEdges.begin() + (long)last - 1);
+	}
+
+	if (m_tbEdges.size() < 3)
+	{
+		cout << "Engine_Vulkan: temporal blocking disabled — " << NX
+		          << " x-lines make only one tile of width " << W << endl;
+		return;
+	}
+
+	m_tbK      = (unsigned int)k;
+	m_tbW      = (unsigned int)W;
+	m_tbActive = true;
+
+	cout << "Engine_Vulkan: trapezoidal temporal blocking active — k=" << k
+	          << " W=" << W << " (" << (m_tbEdges.size() - 1) << " tiles, "
+	          << ((uint64_t)W * planeBytes >> 20) << " MB/tile, "
+	          << (totalBytes >> 20) << " MB of field state)" << endl;
+}
+
+void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, int dir,
+                                    uint32_t t0, const GridPC& gridV, const GridPC& gridC,
+                                    const VkMemoryBarrier& barrier,
+                                    bool hasExcVolt, bool hasExcCurr) const
+{
+	const int NX = (int)numLines[0];
+	// UpdateCurrents reads volt at x+1, so the engine never updates H on the
+	// last x-line. That line is therefore always "valid" and needs no slope.
+	const int NXH = NX - 1;
+
+	const uint32_t planeV = numLines[1] * numLines[2];
+	const uint32_t planeC = (numLines[1] - 1) * (numLines[2] - 1);
+
+	int A = A0, B = B0;
+	if (A < 0)  A = 0;
+	if (B > NX) B = NX;
+
+	for (int t = 0; t < k; ++t)
+	{
+		int An = (A <= 0)  ? 0  : A + dir;
+		int Bn = (B >= NX) ? NX : B - dir;
+		if (An < 0)  An = 0;
+		if (Bn > NX) Bn = NX;
+
+		int eLo, eHi;
+		if (dir > 0) { eLo = An;                     eHi = (Bn >= NX) ? NX : Bn + 1; }
+		else         { eLo = (An <= 0) ? 0 : An + 1; eHi = (Bn >= NX) ? NX : Bn; }
+		if (eHi > NX)  eHi = NX;
+		if (eHi < eLo) eHi = eLo;
+
+		const uint32_t ts = t0 + (uint32_t)t;
+
+		// --- Voltage update on [eLo, eHi) ---
+		if (eHi > eLo)
+		{
+			GridPC pv = gridV;
+			pv.gidBase = (uint32_t)eLo * planeV;
+			pv.gidEnd  = std::min((uint32_t)eHi * planeV, gridV.gidEnd);
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(GridPC), &pv);
+			vkCmdDispatch(cmd, (pv.gidEnd - pv.gidBase + 255) / 256, 1, 1);
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
+
+		// --- Voltage excitation, restricted to the same x-range ---
+		if (hasExcVolt && eHi > eLo)
+		{
+			const uint32_t b = m_excVoltXStart[eLo], e = m_excVoltXStart[eHi];
+			if (e > b)
+			{
+				ExcPC epc = {m_excVoltCount, (int32_t)ts, m_excSignalLen, m_excSignalPeriod, b, e};
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_excPipeLayout, 0, 1, &m_excVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(ExcPC), &epc);
+				vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+		}
+
+		// --- Current update on [An, min(Bn, NX-1)) ---
+		const int hHi = (Bn < NXH) ? Bn : NXH;
+		if (hHi > An)
+		{
+			GridPC pc = gridC;
+			pc.gidBase = (uint32_t)An * planeC;
+			pc.gidEnd  = std::min((uint32_t)hHi * planeC, gridC.gidEnd);
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(GridPC), &pc);
+			vkCmdDispatch(cmd, (pc.gidEnd - pc.gidBase + 255) / 256, 1, 1);
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
+
+		// --- Current excitation ---
+		// The H sweep stops at NX-1, but the flat path's Apply2Current runs over
+		// the whole entry list, so an entry on the last x-line is applied there.
+		// Extending the last tile's excitation range to NX is what keeps this
+		// path equal to the flat one.  (Engine_AVX2_Multithread's blocked path
+		// uses the H range here and therefore drops such an entry.)
+		const int hExc = (Bn >= NX) ? NX : hHi;
+		if (hasExcCurr && hExc > An)
+		{
+			const uint32_t b = m_excCurrXStart[An], e = m_excCurrXStart[hExc];
+			if (e > b)
+			{
+				ExcPC epc = {m_excCurrCount, (int32_t)ts, m_excSignalLen, m_excSignalPeriod, b, e};
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_excPipeLayout, 0, 1, &m_excCurrDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(ExcPC), &epc);
+				vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+		}
+
+		A = An;
+		B = Bn;
+	}
+}
 bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 {
 	if (iterTS == 0) return true;
@@ -4162,7 +4494,11 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	uint32_t N  = numLines[0] * numLines[1] * numLines[2];
 	uint32_t cN = (numLines[0]-1) * (numLines[1]-1) * (numLines[2]-1);
 	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
-	GridPC gridPC = {numLines[0], numLines[1], numLines[2], opVk->GetNumCompressed()};
+	// The voltage sweep covers the full grid, the current sweep the reduced
+	// (Nx-1)(Ny-1)(Nz-1) domain, so each needs its own end bound.  Both are
+	// the whole domain unless the temporal-blocking proxy narrows them.
+	GridPC gridPC  = {numLines[0], numLines[1], numLines[2], opVk->GetNumCompressed(), 0u, N};
+	GridPC gridPCc = {numLines[0], numLines[1], numLines[2], opVk->GetNumCompressed(), 0u, cN};
 	FusedPC fusedPC = {numLines[0], numLines[1], numLines[2], opVk->GetNumCompressed(),
 	                   m_hasFusedUPML ? (uint32_t)m_gpuUPML.size() : 0u};
 	uint32_t voltGroups = (N  + 255) / 256;
@@ -4277,6 +4613,34 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		}
 
 		// Append all FDTD timesteps
+		// ================= Trapezoidal temporal blocking ==================
+		// See ConfigureTemporalBlocking() for the schedule and its guards.  A
+		// block of kk timesteps is covered by one narrowing trapezoid per tile
+		// followed by one widening wedge per interior tile boundary; together
+		// they partition the domain, so every cell is updated exactly once per
+		// timestep and the result is bit-identical to the flat sweep.
+		if (!m_tbAnnounced)
+			const_cast<Engine_Vulkan*>(this)->ConfigureTemporalBlocking();
+		if (m_tbActive)
+		{
+			// k is clamped to the call's timestep count, so a short IterateTS
+			// (openems.cpp passes the number of steps until the next probe or
+			// dump) stays correct with no work on the caller's side: the grid
+			// is globally coherent at the end of every call.
+			const unsigned int k = std::min<unsigned int>(m_tbK, iterTS);
+			for (unsigned int base = 0; base < iterTS; base += k)
+			{
+				const int kk = (int)std::min<unsigned int>(k, iterTS - base);
+				const uint32_t t0 = numTS + base;
+				for (size_t i = 0; i + 1 < m_tbEdges.size(); ++i)
+					RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i + 1], kk, +1, t0,
+					                gridPC, gridPCc, barrier, hasExcVolt, hasExcCurr);
+				for (size_t i = 1; i + 1 < m_tbEdges.size(); ++i)
+					RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i], kk, -1, t0,
+					                gridPC, gridPCc, barrier, hasExcVolt, hasExcCurr);
+			}
+		}
+		else
 		for (unsigned int iter = 0; iter < iterTS; ++iter)
 		{
 			uint32_t ts = numTS + iter;
@@ -4682,7 +5046,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
 			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet,
 									0, nullptr);
-			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC), &gridPC);
+			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC), &gridPCc);
 			vkCmdDispatch(cmd, currGroups, 1, 1);
 
 			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
@@ -5008,7 +5372,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 				                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
 				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-				                   0, sizeof(GridPC), &gridPC);
+				                   0, sizeof(GridPC), &gridPCc);
 				vkCmdDispatch(cmd, currGroups, 1, 1);
 
 				vkCmdPipelineBarrier(cmd,

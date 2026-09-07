@@ -27,6 +27,10 @@ layout(set=0, binding=4) buffer VIBuf     { float vi_comp[]; };
 
 layout(push_constant) uniform PC {
     uint Nx, Ny, Nz, numComp;
+    // Temporal-blocking slab: this dispatch owns linear cell indices
+    // [gidBase, gidEnd).  The flat sweep passes (0, Nx*Ny*Nz), which is
+    // exactly the whole grid, so the flat path is unchanged.
+    uint gidBase, gidEnd;
 };
 
 // --- Compressed-operator index width -------------------------------------
@@ -56,9 +60,9 @@ uint fetchOpIdx(uint cell)
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + gidBase;
     uint N = Nx * Ny * Nz;
-    if (gid >= N) return;
+    if (gid >= gidEnd) return;
 
     // Decompose linear index → (x, y, z).  z changes fastest for coalescing.
     uint z = gid % Nz;

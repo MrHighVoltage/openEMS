@@ -25,6 +25,9 @@ layout(set=0, binding=4) buffer IVBuf     { float iv_comp[]; };
 
 layout(push_constant) uniform PC {
     uint Nx, Ny, Nz, numComp;
+    // Temporal-blocking slab, in reduced-domain linear indices.  The flat
+    // sweep passes (0, (Nx-1)*(Ny-1)*(Nz-1)).
+    uint gidBase, gidEnd;
 };
 
 // --- Compressed-operator index width -------------------------------------
@@ -54,14 +57,14 @@ uint fetchOpIdx(uint cell)
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + gidBase;
 
     // Current update domain is (Nx-1) × (Ny-1) × (Nz-1)
     uint cNx = Nx - 1u;
     uint cNy = Ny - 1u;
     uint cNz = Nz - 1u;
     uint cN  = cNx * cNy * cNz;
-    if (gid >= cN) return;
+    if (gid >= gidEnd) return;
 
     // Decompose within the reduced domain
     uint z = gid % cNz;

@@ -24,12 +24,16 @@ layout(push_constant) uniform PC {
     int  numTS;        // current timestep
     uint sigLen;       // signal length
     int  sigPeriod;    // signal period (<=0 if non-periodic)
+    // Temporal blocking: this dispatch owns entries [entryBase, entryEnd).
+    // The entry list is sorted by x on the host, so an x-slab is a contiguous
+    // run.  The flat sweep passes (0, 0xFFFFFFFF) and is unaffected.
+    uint entryBase, entryEnd;
 };
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= excCount) return;
+    uint gid = gl_GlobalInvocationID.x + entryBase;
+    if (gid >= excCount || gid >= entryEnd) return;
 
     int exc_pos = numTS - int(delay[gid]);
     // Clamp negative to zero
