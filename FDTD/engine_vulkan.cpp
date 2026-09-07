@@ -4222,7 +4222,6 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	// than a mystery.
 	const char* refuse = nullptr;
 	if (m_hasCPUExtensions)                     refuse = "extensions are running on the CPU";
-	else if (m_hasFusedUPML || m_hasGPU_UPML)   refuse = "UPML has no slab path yet";
 	else if (m_hasGPU_Mur)                      refuse = "Mur ABC has no slab path yet";
 	else if (m_hasGPU_TFSF)                     refuse = "TF/SF has no slab path yet";
 	else if (m_hasGPU_RLC)                      refuse = "lumped RLC has no slab path yet";
@@ -4322,9 +4321,53 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	          << (totalBytes >> 20) << " MB of field state)" << endl;
 }
 
+void Engine_Vulkan::RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const
+{
+	if (m_gpuUPML.empty() || x1 <= x0)
+		return;
+
+	VkPipeline       pipe   = VK_NULL_HANDLE;
+	VkPipelineLayout layout = VK_NULL_HANDLE;
+	switch (phase)
+	{
+	case 0: pipe = m_upmlPreVoltPipeline;  layout = m_upmlPrePipeLayout;  break;
+	case 1: pipe = m_upmlPostVoltPipeline; layout = m_upmlPostPipeLayout; break;
+	case 2: pipe = m_upmlPreCurrPipeline;  layout = m_upmlPrePipeLayout;  break;
+	default: pipe = m_upmlPostCurrPipeline; layout = m_upmlPostPipeLayout; break;
+	}
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+
+	for (const auto& u : m_gpuUPML)
+	{
+		// Clip the global slab against this region's own x-extent.  A region
+		// on the far side of the grid contributes nothing to this slab.
+		const int rLo = (int)u.pc.pStartX;
+		const int rHi = rLo + (int)u.pc.pNx;
+		const int lo  = std::max(x0, rLo);
+		const int hi  = std::min(x1, rHi);
+		if (hi <= lo)
+			continue;
+
+		// The shader's gid is region-local with lx slowest, so the clipped
+		// range is one contiguous run of it.
+		const uint32_t plane = u.pc.pNy * u.pc.pNz;
+		PmlPC pc = u.pc;
+		pc.gidBase = (uint32_t)(lo - rLo) * plane;
+		pc.gidEnd  = (uint32_t)(hi - rLo) * plane;
+
+		VkDescriptorSet desc = (phase == 0) ? u.preVoltDesc
+		                     : (phase == 1) ? u.postVoltDesc
+		                     : (phase == 2) ? u.preCurrDesc
+		                                    : u.postCurrDesc;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &desc, 0, nullptr);
+		vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &pc);
+		vkCmdDispatch(cmd, (pc.gidEnd - pc.gidBase + 255) / 256, 1, 1);
+	}
+}
+
 void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, int dir,
                                     uint32_t t0, const GridPC& gridV, const GridPC& gridC,
-                                    const VkMemoryBarrier& barrier,
+                                    const FusedPC& fused, const VkMemoryBarrier& barrier,
                                     bool hasExcVolt, bool hasExcCurr) const
 {
 	const int NX = (int)numLines[0];
@@ -4355,20 +4398,58 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		const uint32_t ts = t0 + (uint32_t)t;
 
 		// --- Voltage update on [eLo, eHi) ---
-		if (eHi > eLo)
+		// With UPML fused into the main kernel this is one dispatch: PML
+		// membership is derived per cell from the region metadata, so the
+		// fused shader does not care which subset of cells it is given.
+		if (m_hasFusedUPML)
 		{
-			GridPC pv = gridV;
-			pv.gidBase = (uint32_t)eLo * planeV;
-			pv.gidEnd  = std::min((uint32_t)eHi * planeV, gridV.gidEnd);
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-			                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
-			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(GridPC), &pv);
-			vkCmdDispatch(cmd, (pv.gidEnd - pv.gidBase + 255) / 256, 1, 1);
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			if (eHi > eLo)
+			{
+				FusedPC pf = fused;
+				pf.gidBase = (uint32_t)eLo * planeV;
+				pf.gidEnd  = (uint32_t)eHi * planeV;
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fusedPipeLayout, 0, 1, &m_fusedVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(FusedPC), &pf);
+				vkCmdDispatch(cmd, (pf.gidEnd - pf.gidBase + 255) / 256, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+		}
+		else
+		{
+			if (!m_gpuUPML.empty() && eHi > eLo)
+			{
+				RecordUPMLSlabPhase(cmd, 0, eLo, eHi);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+			if (eHi > eLo)
+			{
+				GridPC pv = gridV;
+				pv.gidBase = (uint32_t)eLo * planeV;
+				pv.gidEnd  = std::min((uint32_t)eHi * planeV, gridV.gidEnd);
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(GridPC), &pv);
+				vkCmdDispatch(cmd, (pv.gidEnd - pv.gidBase + 255) / 256, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+			if (!m_gpuUPML.empty() && eHi > eLo)
+			{
+				RecordUPMLSlabPhase(cmd, 1, eLo, eHi);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
 		}
 
 		// --- Voltage excitation, restricted to the same x-range ---
@@ -4391,21 +4472,69 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		}
 
 		// --- Current update on [An, min(Bn, NX-1)) ---
-		const int hHi = (Bn < NXH) ? Bn : NXH;
-		if (hHi > An)
+		// The Yee current update never touches the last x-line (it reads volt
+		// at x+1), but the flat path's UPML and excitation dispatches both run
+		// over the whole domain. The last tile therefore extends those to NX
+		// while the Yee sweep still stops at NX-1, so the union over tiles
+		// equals the flat dispatch exactly rather than nearly.
+		//
+		// For UPML this is belt-and-braces: H on that line is never written, so
+		// its flux recursion runs on zeros forever and produces zeros. Verified
+		// by negative control -- clamping the fused current dispatch to NX-1
+		// leaves the PML tests bit-identical. For the excitation it is not
+		// belt-and-braces: an entry there adds a nonzero value that the flat
+		// sweep applies, so clamping would drop it.
+		const int hHi  = (Bn < NXH) ? Bn : NXH;
+		const int hExc = (Bn >= NX) ? NX : hHi;
+		if (m_hasFusedUPML)
 		{
-			GridPC pc = gridC;
-			pc.gidBase = (uint32_t)An * planeC;
-			pc.gidEnd  = std::min((uint32_t)hHi * planeC, gridC.gidEnd);
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-			                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
-			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(GridPC), &pc);
-			vkCmdDispatch(cmd, (pc.gidEnd - pc.gidBase + 255) / 256, 1, 1);
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			if (hExc > An)
+			{
+				FusedPC pf = fused;
+				pf.gidBase = (uint32_t)An * planeV;
+				pf.gidEnd  = (uint32_t)hExc * planeV;
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedCurrPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fusedPipeLayout, 0, 1, &m_fusedCurrDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(FusedPC), &pf);
+				vkCmdDispatch(cmd, (pf.gidEnd - pf.gidBase + 255) / 256, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+		}
+		else
+		{
+			if (!m_gpuUPML.empty() && hExc > An)
+			{
+				RecordUPMLSlabPhase(cmd, 2, An, hExc);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+			if (hHi > An)
+			{
+				GridPC pc = gridC;
+				pc.gidBase = (uint32_t)An * planeC;
+				pc.gidEnd  = std::min((uint32_t)hHi * planeC, gridC.gidEnd);
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(GridPC), &pc);
+				vkCmdDispatch(cmd, (pc.gidEnd - pc.gidBase + 255) / 256, 1, 1);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
+			if (!m_gpuUPML.empty() && hExc > An)
+			{
+				RecordUPMLSlabPhase(cmd, 3, An, hExc);
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+			}
 		}
 
 		// --- Current excitation ---
@@ -4414,7 +4543,6 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		// Extending the last tile's excitation range to NX is what keeps this
 		// path equal to the flat one.  (Engine_AVX2_Multithread's blocked path
 		// uses the H range here and therefore drops such an entry.)
-		const int hExc = (Bn >= NX) ? NX : hHi;
 		if (hasExcCurr && hExc > An)
 		{
 			const uint32_t b = m_excCurrXStart[An], e = m_excCurrXStart[hExc];
@@ -4634,10 +4762,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				const uint32_t t0 = numTS + base;
 				for (size_t i = 0; i + 1 < m_tbEdges.size(); ++i)
 					RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i + 1], kk, +1, t0,
-					                gridPC, gridPCc, barrier, hasExcVolt, hasExcCurr);
+					                gridPC, gridPCc, fusedPC, barrier, hasExcVolt, hasExcCurr);
 				for (size_t i = 1; i + 1 < m_tbEdges.size(); ++i)
 					RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i], kk, -1, t0,
-					                gridPC, gridPCc, barrier, hasExcVolt, hasExcCurr);
+					                gridPC, gridPCc, fusedPC, barrier, hasExcVolt, hasExcCurr);
 			}
 		}
 		else

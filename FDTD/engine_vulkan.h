@@ -428,7 +428,8 @@ private:
 
 	//! Push constant structs matching the shader layouts.
 	struct GridPC   { uint32_t Nx, Ny, Nz, numComp, gidBase, gidEnd; };
-	struct FusedPC  { uint32_t Nx, Ny, Nz, numComp, numPmlRegions; };
+	struct FusedPC  { uint32_t Nx, Ny, Nz, numComp, numPmlRegions;
+	                  uint32_t gidBase = 0; uint32_t gidEnd = 0xFFFFFFFFu; };
 	//! Excitation push constants.  The last two fields default so that the
 	//! flat path's brace-init `{count, ts, len, period}` keeps its old meaning
 	//! (whole list); only the blocked path narrows them.
@@ -441,11 +442,18 @@ private:
 	//! is verified bit-identical to the flat sweep; keep the two in step.
 	void RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, int dir,
 	                     uint32_t t0, const GridPC& gridV, const GridPC& gridC,
-	                     const VkMemoryBarrier& barrier,
+	                     const FusedPC& fused, const VkMemoryBarrier& barrier,
 	                     bool hasExcVolt, bool hasExcCurr) const;
 
-	//! Push constant struct for UPML shaders (36 bytes = 9 × uint32).
-	struct PmlPC    { uint32_t Nx, Ny, Nz, pNx, pNy, pNz, pStartX, pStartY, pStartZ; };
+	//! Record the UPML pre/post dispatches of one phase over the global x-range
+	//! [x0,x1), clipping the range against each region's own x-extent.
+	//! `phase` is 0=pre-volt, 1=post-volt, 2=pre-curr, 3=post-curr.
+	void RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const;
+
+	//! Push constant struct for UPML shaders.  The trailing slab range
+	//! defaults to "everything", so the flat path is unaffected.
+	struct PmlPC    { uint32_t Nx, Ny, Nz, pNx, pNy, pNz, pStartX, pStartY, pStartZ;
+	                  uint32_t gidBase = 0; uint32_t gidEnd = 0xFFFFFFFFu; };
 	//! Push constant struct for dispersive material shaders.
 	struct DispPC   { uint32_t count, Nx, Ny, Nz, hasLorADE; };
 	//! Push constant struct for TF/SF shaders (same as ExcPC).

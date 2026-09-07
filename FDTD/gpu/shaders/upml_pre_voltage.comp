@@ -25,6 +25,11 @@ layout(push_constant) uniform PC {
     uint Nx, Ny, Nz;         // global grid size
     uint pNx, pNy, pNz;      // PML region size (number of PML lines)
     uint pStartX, pStartY, pStartZ; // PML region start position in global grid
+    // Temporal blocking: this dispatch owns PML-region-local linear indices
+    // [gidBase, gidEnd).  lx is the slowest axis of that index, so a global
+    // x-slab is a contiguous run here too; the host clips the slab against
+    // this region's x-extent.  The flat sweep passes (0, 0xFFFFFFFF).
+    uint gidBase, gidEnd;
 };
 
 // --- PML coefficient index -----------------------------------------------
@@ -51,9 +56,9 @@ uint fetchPmlIdx(uint cell)
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + gidBase;
     uint pN = pNx * pNy * pNz;
-    if (gid >= pN) return;
+    if (gid >= pN || gid >= gidEnd) return;
 
     // Decompose PML-local linear index → (lx, ly, lz)
     uint lz = gid % pNz;

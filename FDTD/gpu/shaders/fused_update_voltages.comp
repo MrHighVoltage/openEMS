@@ -56,6 +56,9 @@ layout(set=0, binding=10) buffer PmlVVFNBuf { float pml_vvfn[];   };  // RO
 layout(push_constant) uniform PC {
     uint Nx, Ny, Nz, numComp;
     uint numPmlRegions;
+    // Temporal blocking: this dispatch owns linear cell indices
+    // [gidBase, gidEnd).  The flat sweep passes (0, 0xFFFFFFFF).
+    uint gidBase, gidEnd;
 };
 
 // --- Compressed-operator index width -------------------------------------
@@ -107,9 +110,9 @@ uint fetchPmlIdx(uint cell)
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + gidBase;
     uint N = Nx * Ny * Nz;
-    if (gid >= N) return;
+    if (gid >= N || gid >= gidEnd) return;
 
     // Decompose linear index → (x, y, z).  z changes fastest for coalescing.
     uint z = gid % Nz;

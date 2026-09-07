@@ -90,7 +90,7 @@ FDTD.Run({sim_path!r}, cleanup=True, engine="gpu")
 """
 
 
-def _run(tag, boundary, block_env):
+def _run(tag, boundary, block_env, extra_env=None):
     """Run one small GPU simulation in a subprocess.
 
     Returns (output, E_time_series, H_time_series). `block_env` is the value
@@ -116,6 +116,7 @@ def _run(tag, boundary, block_env):
     if block_env:
         env["OPENEMS_GPU_TEMPORAL_BLOCK"] = block_env
         env["OPENEMS_GPU_TEMPORAL_BLOCK_MB"] = "1"
+    env.update(extra_env or {})
 
     proc = subprocess.run([sys.executable, script_path], cwd=repo_root, env=env,
                           capture_output=True, text=True, timeout=300)
@@ -188,12 +189,64 @@ class GPUTemporalBlockingTest(unittest.TestCase):
                 self.assertTrue(np.array_equal(self.flat_E, E) and np.array_equal(self.flat_H, H),
                                 "schedule %s is not bit-identical to the flat sweep" % env)
 
+    def test_pml_fused_bit_identical(self):
+        """UPML through the fused kernel, which is the default path.
+
+        The fused shader derives PML membership per cell from the region
+        metadata, so it needs no slab logic of its own -- but its current pass
+        does real work on the last x-line (flux recursion with a zero curl)
+        where the Yee sweep does none, which is why the last tile extends the
+        current range to NX. This test is what would catch getting that wrong.
+        """
+        flat_out, flat_E, flat_H = _run("pmlf_flat", ["PML_8"] * 6, None)
+        self.assertGreater(float(np.max(np.abs(flat_E))), 0.0,
+                           "flat PML run produced an all-zero field")
+        out, E, H = _run("pmlf_blocked", ["PML_8"] * 6, BLOCK_ENV)
+        self.assertIn(ACTIVE_MARK, out, _relevant_lines(out))
+        self.assertTrue(np.array_equal(flat_E, E),
+                        "blocked E differs from flat under fused UPML: max |delta| = %g"
+                        % float(np.max(np.abs(flat_E - E))))
+        self.assertTrue(np.array_equal(flat_H, H),
+                        "blocked H differs from flat under fused UPML: max |delta| = %g"
+                        % float(np.max(np.abs(flat_H - H))))
+
+    def test_pml_unfused_bit_identical(self):
+        """The same, through the separate upml_pre/post dispatches.
+
+        OPENEMS_GPU_DISABLE_FUSED_UPML=1 selects the fallback path, where the
+        PML pre/post passes are their own per-region dispatches indexed in
+        region-local coordinates. Both arms set it, so this compares the
+        unfused flat sweep against the unfused blocked one.
+        """
+        unfused = {"OPENEMS_GPU_DISABLE_FUSED_UPML": "1"}
+        flat_out, flat_E, flat_H = _run("pmlu_flat", ["PML_8"] * 6, None, unfused)
+        self.assertGreater(float(np.max(np.abs(flat_E))), 0.0,
+                           "unfused flat PML run produced an all-zero field")
+        out, E, H = _run("pmlu_blocked", ["PML_8"] * 6, BLOCK_ENV, unfused)
+        self.assertIn(ACTIVE_MARK, out, _relevant_lines(out))
+        self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
+                        "blocked run differs from flat under unfused UPML")
+
+    def test_fused_and_unfused_pml_agree(self):
+        """Guards against both PML arms being wrong in the same way.
+
+        The two tests above each compare a path against itself. If the slab
+        range were wrong in a way both the fused and unfused blocked paths
+        shared, they would both still pass. This compares across paths.
+        """
+        _, fused_E, _ = _run("pmlx_fused", ["PML_8"] * 6, BLOCK_ENV)
+        _, unfused_E, _ = _run("pmlx_unfused", ["PML_8"] * 6, BLOCK_ENV,
+                               {"OPENEMS_GPU_DISABLE_FUSED_UPML": "1"})
+        self.assertTrue(np.allclose(fused_E, unfused_E, rtol=0, atol=1e-9),
+                        "fused and unfused blocked PML disagree: max |delta| = %g"
+                        % float(np.max(np.abs(fused_E - unfused_E))))
+
     def test_refuses_unsupported_extension_and_stays_correct(self):
-        """PML has no slab path yet: blocking must decline, not silently differ."""
-        flat_out, flat_E, flat_H = _run("pml_flat", ["PML_8"] * 6, None)
-        out, E, H = _run("pml_blocked", ["PML_8"] * 6, BLOCK_ENV)
+        """Mur has no slab path yet: blocking must decline, not silently differ."""
+        flat_out, flat_E, flat_H = _run("mur_flat", ["MUR"] * 6, None)
+        out, E, H = _run("mur_blocked", ["MUR"] * 6, BLOCK_ENV)
         self.assertNotIn(ACTIVE_MARK, out,
-                         "blocking engaged with UPML active, which has no slab path")
+                         "blocking engaged with Mur active, which has no slab path")
         self.assertIn("temporal blocking disabled", out, _relevant_lines(out))
         self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
                         "the fallback path changed results")
