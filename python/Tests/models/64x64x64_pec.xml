@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<openEMS>
+    <FDTD NumberOfTimesteps="40000" endCriteria="1e-300" OverSampling="4" TimeStepMethod="3">
+        <Excitation Type="0" f0="1e+09" fc="5e+08" />
+        <BoundaryCond xmin="PEC" xmax="PEC" ymin="PEC" ymax="PEC" zmin="PEC" zmax="PEC" />
+    </FDTD>
+    <ContinuousStructure CoordSystem="0">
+        <RectilinearGrid DeltaUnit="0.001" CoordSystem="0">
+            <XLines Qty="64">0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63</XLines>
+            <YLines Qty="64">0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63</YLines>
+            <ZLines Qty="64">0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63</ZLines>
+        </RectilinearGrid>
+        <BackgroundMaterial Epsilon="1" Mue="1" Kappa="0" Sigma="0" />
+        <ParameterSet />
+        <Properties>
+            <Excitation ID="0" Name="benchmark_excitation" Number="0" Enabled="1" Frequency="0.000000e+00" Delay="0.000000e+00" Type="0" Excite="1.000000e+00,0.000000e+00,0.000000e+00" PropDir="0.000000e+00,0.000000e+00,0.000000e+00">
+                <FillColor R="103" G="198" B="105" a="255" />
+                <EdgeColor R="103" G="198" B="105" a="255" />
+                <Primitives>
+                    <Box Priority="10">
+                        <P1 X="3.200000e+01" Y="9.000000e+00" Z="9.000000e+00" />
+                        <P2 X="3.300000e+01" Y="5.400000e+01" Z="5.400000e+01" />
+                    </Box>
+                </Primitives>
+                <Weight X="1.000000e+00" Y="1.000000e+00" Z="1.000000e+00" />
+            </Excitation>
+        </Properties>
+    </ContinuousStructure>
+</openEMS>

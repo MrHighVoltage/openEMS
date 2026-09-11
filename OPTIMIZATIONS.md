@@ -4,11 +4,15 @@ Running record of optimization work on the Vulkan GPU engine and the AVX2
 engines: what was done, what it was worth, and — just as important — what was
 tried and rejected, so it is not rediscovered blind.
 
-Scope of this document is deliberately narrow: `Engine_Vulkan` /
-`Operator_Vulkan` and `Engine_AVX2` / `Engine_AVX2_Multithread`. The SSE and
-basic engines are out of scope.
+Scope is the two fast engines — `Engine_Vulkan` / `Operator_Vulkan` and
+`Engine_AVX2` / `Engine_AVX2_Multithread` — plus the host-side paths they
+share with every other engine: field dumping, probe readback and operator
+construction. The SSE and basic engines are out of scope as *engines*, but
+they benefit from everything in §1.1.
 
-Measurements come from three hosts and are not comparable across them:
+Measurements come from three hosts here — plus five more used only for the
+fork-vs-upstream matrix, listed at the end — and are not comparable across
+them:
 
 - **Host A** — i7-6700K, 4 cores / 8 threads (SMT2), 8 MB L3, dual-channel
   DDR4. Practical STREAM-Triad ceiling ~29 GB/s. Everything in §1's AVX2 table
@@ -27,8 +31,18 @@ Measurements come from three hosts and are not comparable across them:
   still no resizable BAR, so `fbd95a6` is load-bearing here too — and an
   integrated **Intel UHD 770**. Mesa 26.2.1, RADV and ANV. §4 re-verifies
   everything here.
+- **Hosts D–H (2026-09-11, CPU only)** — compute5 (Ryzen 9 3950X, 16C, 4×16 MB
+  L3), loki (2× Xeon Gold 6130, 32C, 2×22 MB), maxwell (2× Xeon E5-2630,
+  Sandy Bridge, 12C, **no AVX2**), saturn (i5-8500, 6C, 9 MB, CentOS 7),
+  tierwater (2× Xeon E5-2620 v3, 12C, 2×15 MB). Servers with no Vulkan driver
+  and no openEMS dependencies, benchmarked from a self-contained bundle built
+  in a glibc-2.17 container (`python/Tests/build_portable_bench.sh`). They are
+  not used for any tuning decision in this document, but two of its
+  assumptions do not survive them — see §4.8 and
+  [PERFORMANCE.md](PERFORMANCE.md) §5.7–§5.8.
 
 Benchmark drivers: `python/Tests/benchmark_avx2_engine.py`,
+`python/Tests/benchmark_field_dump.py` (dump-path A/B, see §1.0),
 `python/Tests/bench_temporal_blocking.c` (standalone, see its header),
 `python/Tests/benchmark_gpu_engine.py` (`--gpu-index` selects the device),
 `python/Tests/test_gpu_engine.py`, `python/Tests/test_upml_engines.py`,
@@ -38,7 +52,191 @@ Benchmark drivers: `python/Tests/benchmark_avx2_engine.py`,
 
 ## 1. Completed work
 
-### GPU
+Reconciled against the complete diff from the upstream merge base
+(`d3d2a49..HEAD`, 159 files): every source file that differs from upstream is
+either accounted for below, or is a build, packaging or compatibility change —
+the boost removal (`28f65db`), CI and CMake, vcpkg, the CSXCAD API updates
+(`c5760e0`, `284f532`, `7b417f4`), and legacy-compiler fixes in `tools/sar_calc.cpp`
+(`af06ecf`).
+
+### 1.0 The engines
+
+The two engines this fork adds are the largest optimization in it. Everything
+else in this document tunes them; this entry is what they are worth against a
+from-scratch build of upstream on the same machine, with the same compiler and
+the same models. Full matrix and method in [PERFORMANCE.md](PERFORMANCE.md)
+§1–§3; "upstream best" there is the fastest of three upstream configurations,
+usually its SSE multithreaded engine at a hand-picked thread count.
+
+| Commit | Change | Measured against upstream's best |
+|---|---|---|
+| `7effdfb`, `4e6530c` | **`Operator_AVX2` / `Engine_AVX2`** and `_Multithread`: 256-bit AVX2+FMA with an interleaved z-layout (8 z-cells per vector) and `std::map` operator deduplication | Single-threaded against upstream's SSE engine, where the width shows directly: **1.31×–2.04×** on Host C, **1.65×–2.59×** on Host A, lowest on PML where the passes vectorize least well. Multithreaded against upstream's best: **0.90×–1.72×** flat on Host C — it loses on PML, PERFORMANCE.md §5.1 — and **1.70×–4.45×** with temporal blocking |
+| `63b2e49`, `4e6530c` | **`Operator_Vulkan` / `Engine_Vulkan`**: coefficient compression into compact `opIdx` + `vv`/`vi`/`ii`/`iv` tables, double-buffered command submission, ReBAR support, pre-recorded multi-timestep command buffers | **6.1×–39.0×** on an RX 6800 with temporal blocking (Host C). On Host A's integrated HD 530, **0.85×–1.61×** — below upstream on cache-resident PEC grids, above it on PML and Mur, where it is the fastest engine in that machine |
+| `28f65db` | boost → C++17: `std::thread`/`std::jthread`, a `std::mutex`/`condition_variable` barrier (`tools/barrier.h`), a lightweight option parser. Drops the boost dependency | Not a throughput change; it is what the AVX2 multithread engine's barrier and thread control are built on |
+| `84551fe` | The regression `28f65db` caused: the worker loop tested `m_stopThreads` at the top, so a worker could wake from `m_stopBarrier`, observe the flag set by `Reset()`/`changeNumThreads()`, and exit without ever arriving at `m_startBarrier` — leaving the controller waiting forever for `m_numThreads+1` arrivals. `boost::thread_group::interrupt_all()` had unblocked workers wherever they were, so the barrier was never a shutdown path before | Hit in CI whenever thread auto-tuning called `changeNumThreads()`; reproduced 5/8 runs pinned to 2 cores, 0/8 after the fix |
+| `987fcb7` | AVX2 dispatch made architecture-aware **at compile time**, so a non-x86 build never parses `<immintrin.h>` and never selects the AVX2 engine. It does **not** guard the run host: the test is on `CMAKE_SYSTEM_PROCESSOR` and the compiler, so an x86-64 binary still selects AVX2 on a pre-AVX2 CPU and dies with SIGILL. Measured on maxwell — §4.8, PERFORMANCE.md §5.8 | Correctness of engine selection for cross-*architecture* builds only |
+
+**GPU extension coverage is a performance property, not a feature checkbox.**
+An extension without a shader has to run on the CPU, which means draining the
+queue, downloading the fields it touches, running it, and uploading again —
+every timestep — and it disqualifies the pipelined main loop (§1.1). So each
+extension ported to Vulkan is an optimization of the models that use it. The
+engine currently covers UPML, Mur ABC, local absorbing sheets, TF/SF,
+dispersive materials, lumped RLC, excitation, steady-state detection, probe
+gather and energy reduction (`FDTD/gpu/shaders/`).
+
+| Commit | Change | Measured |
+|---|---|---|
+| `fb2049c` | **Local absorbing sheets on the GPU.** All localized first-order Mur phases as sparse surface dispatches with device-resident coefficients and E/H history, covering both the voltage-only `MUR_1ST` form and the current-side super-absorption of `MUR_1ST_SA`, including on the fused UPML path. `OPENEMS_GPU_CPU_LOCAL_ABC` keeps the CPU path for native-vs-hybrid validation | **7165 MC/s native vs 0.34 MC/s hybrid** — see below |
+| `ed6f590` | **Steady-state detection as a GPU observer** rather than a CPU extension — electric probes sampled into a three-period coherent history ring after each voltage phase, convergence evaluated only when the control path asks for it | Enablement: as a CPU extension it defeats GPU batching entirely |
+
+**What a missing shader costs** (Host C, RX 6800, 2026-09-08).
+`python/Tests/benchmark_gpu_engine.py --local-abc mur`, A/B through
+`OPENEMS_GPU_CPU_LOCAL_ABC=1`, which is the only extension with a switchable
+CPU path:
+
+| Grid | native GPU | CPU fallback | |
+|---|---|---|---|
+| 64³, 200 TS | 7165 MC/s | 0.34 MC/s | **~21,000×** |
+| 64³, 400 TS | — | 0.34 MC/s | rate is flat in run length, so it is not a startup artifact |
+| 160×128×192, 200 TS | 15519 MC/s | did not finish in 9 minutes (<1.5 MC/s) | — |
+
+That is far more than the bulk transfer explains: at 64³ the fields are 6.3 MB,
+which is milliseconds per timestep, while a hybrid timestep takes ~0.77 s. The
+cost is in the per-cell host access the CPU extension makes against
+GPU-resident memory, not in the copy — the same class of problem as the
+`HOST_CACHED` staging bug in §1.1. Root cause not isolated further, because
+the conclusion does not depend on it: **an extension without a shader takes
+the Vulkan engine out of contention entirely**, so shader coverage is not a
+convenience, it is the difference between the GPU engine being usable on a
+model and not.
+
+### 1.1 Host paths: dumping, GPU interaction, startup
+
+None of these touch an update kernel; all of them show up in wall clock.
+
+#### Host-side field dumping
+
+Every engine dumps fields through `Common/processfields*`, so this path is
+shared with SSE and basic. Before this work it was fully synchronous: compute
+the field, open the HDF5 file, write, close, resume stepping.
+
+| Commit | Change | Measured |
+|---|---|---|
+| `d17da2c` | **Asynchronous ring-buffer writer.** `ProcessFieldsTD::Process()` hands the freshly extracted field plus a write-lambda to `AsyncFieldWriter::Submit()` and returns to the engine immediately; a background thread performs the HDF5/VTK write. Four ring slots by default, `Submit()` blocking when they are full, so memory is bounded to `(slots+1)` snapshots | **1.7–1.9×** wall clock on a dump-every-timestep run — see below |
+| `92de381` | **Persistent HDF5 handle.** `OpenFile()`/`CloseFile()`/`FlushFile()` plus an `AcquireFile()`/`ReleaseFile()` access pattern; without a persistent handle the old open-use-close behaviour is preserved for every other caller. This is what lets the writer thread write without re-opening the file per timestep | Not isolated (no toggle); it is a precondition for `d17da2c`, not an independent lever |
+| `d39cda0`, `7a9343d` | **Template-based `CalcField` with threaded extraction.** A compile-time switch on the concrete engine type replaces per-cell virtual `GetVolt`/`GetCurr` dispatch — 12N–24N virtual calls per dump — and the i-dimension is split across `std::thread` workers. Falls back to the virtual-dispatch loop for engine types it does not know | Not isolated (no toggle) |
+| `586a8ac` | The AVX2 engine's missing fast extraction path, so AVX2 reaches the template path above rather than the fallback | 336 → 426 MC/s, dump every timestep — also in the AVX2 table below |
+| `7364d69` | **Global HDF5 mutex.** Not an optimization but the price of one: libhdf5 as distributions ship it is not thread-safe, so the writer thread racing the main thread could corrupt file state. Every HDF5 C API call now goes through one process-wide recursive mutex | Correctness. It also caps what the async writer can ever be worth: two HDF5 users never overlap |
+
+**The async writer measurement** (Host C, 2026-09-08). Fixture:
+`python/Tests/benchmark_field_dump.py`, 128³ = 2.1 M cells,
+`avx2-multithreaded`, 200 timesteps, full-domain E dump on *every* timestep
+(25 MB per dump, 5.06 GB per run) to ext4 on NVMe. A/B through the
+`OPENEMS_ASYNC_DUMP_BUFFERS` gate added for this measurement, three
+alternating repeats each:
+
+| | engine-loop speed | wall clock |
+|---|---|---|
+| `OPENEMS_ASYNC_DUMP_BUFFERS=0` (synchronous) | 109 / 123 / 115 MC/s | 4.70 / 4.30 / 4.53 s |
+| default, 4 ring slots | 231 / 214 / 237 MC/s | 2.69 / 2.82 / 2.62 s |
+
+**1.9× on the engine loop, 1.7× on wall clock**, or ~9.6 ms of stepping time
+returned per dump. Two caveats on reading that number. It is buffered I/O —
+the writes land in page cache, so this measures HDF5 serialization and
+`memcpy`, not storage; on a filesystem slow enough to make the ring
+back-pressure, the win is larger but bounded by the disk. And it scales with
+dump *cadence*: this fixture forces `OverSampling` above the Nyquist rate to
+dump every timestep, which is the worst case. At openEMS's normal cadence
+(`Nyquist/OverSampling`, 173 timesteps on this fixture) the same absolute
+saving is amortized over 173 steps and is not measurable.
+
+#### GPU host interaction
+
+The Vulkan engine's early problem was not its kernels but everything around
+them: a sequential main loop that left the GPU idle at ~2.5% utilization while
+the CPU processed the previous timestep, and two operations that forced a full
+drain and a PCIe download every few seconds.
+
+| Commit | Change | Measured |
+|---|---|---|
+| `41afbf5`, `3df17eb` | **Energy reduction on the GPU** (`reduce_energy.comp`). `CalcTotalEnergyEstimate()` used to scan all `3·Nx·Ny·Nz` floats — ~650 MB at 27 M cells — over the BAR aperture with random access. Now 256 workgroups reduce in shared memory and the CPU sums 256 partial pairs | **~300 ms → ~1 ms** per energy evaluation (Host B) |
+| `3df17eb` | **Probe cache and gather shader.** Probe cell accesses are recorded during the first `PA->Process()`, deduplicated, and thereafter gathered on-GPU into a small buffer, so a line integral no longer drains the queue and downloads the field | Structural; the end-to-end effect is in the pipelined loop below |
+| `3df17eb` | **Fused UPML + Yee dispatches**, per-region PML buffers concatenated into shared allocations. 28 dispatches + 7 barriers per timestep become 2 + 2 | **1.53×–1.65×** on PML models, see below. The design estimate at the time was 1.3–1.5×, so it was, unusually, an underestimate |
+| `3df17eb` | **Pipelined main loop with speculative submission** in `RunFDTD()`: the GPU computes timestep N+1 while the CPU processes N out of the probe cache. Falls back to the sequential loop when the preconditions do not hold | Design estimate ~40× at the 2.5%-utilization starting point; the honest end-to-end number is the fork-vs-upstream matrix in [PERFORMANCE.md](PERFORMANCE.md) |
+| `e05bc8e` | **Energy reduction only when asked for.** The reduction had been dispatched after every submitted batch, scanning all six field components whether or not anything read the result; it now runs when convergence checking or a status code actually requests it | Removes one full-grid pass per batch from every run that is not energy-limited |
+| `e05bc8e` | Tiny probe and energy outputs kept in coherent host-visible memory, avoiding dedicated transfer-queue ownership transfers for a few hundred bytes; sorted probe keys and direct mapped snapshots on the CPU side; missing compute memory dependencies added between excitation, post/apply extensions, current updates and the next timestep; ReBAR allocation made recoverable, so a compatible-but-undersized host-visible aperture falls back to device-local fields instead of failing | Mixed correctness and overhead; not separately quantified. The ReBAR fallback is the precursor to `fbd95a6`, which found the aperture was the dominant cost |
+| `4eec325` | Persistently mapped field allocations for hybrid host sync (no staging copies or utility submissions on unified-memory/host-visible devices); per-region UPML coefficient uploads batched into one startup command; duplicate per-region flux/coefficient allocations released once fused resources exist | Startup time and footprint; not separately quantified |
+| `66aca92` | Command-ring handling, a dedicated transfer queue for probe readback with per-slot sync, compute barriers tightened to the extensions actually dispatched, optional phase-level GPU timestamp profiling | Not separately quantified; the profiling hooks are what later measurements used |
+| `55c9375`, `52730d3` | Device-side finite-value validation with stage/trace reporting; field sync before CPU extraction; UPML region packing that accounts for all three components; validation of compressed/UPML/excitation data at upload | Correctness. `validate_fields.comp` is why numerical failures stop the run instead of producing plausible garbage |
+
+**The fused-UPML measurement** (Host C, RX 6800, 2026-09-08).
+`python/Tests/benchmark_gpu_engine.py --boundary pml`,
+A/B through `OPENEMS_GPU_DISABLE_FUSED_UPML=1`, no probes and no temporal
+blocking, so the sequential main loop is on both arms and only the dispatch
+structure differs:
+
+| Grid | separate dispatches | fused | |
+|---|---|---|---|
+| 160×128×192, 3.9 M cells, 2000 TS | 5673 / 5516 MC/s | 9104 / 9386 MC/s | **1.65×** |
+| 256×224×224, 12.8 M cells, 1000 TS | 3008 MC/s | 4609 MC/s | **1.53×** |
+
+**Most of that is not dispatch overhead.** Removing ~26 dispatches at
+§4.7/C3's measured ~5.6 µs each is ~145 µs per timestep, which is a fixed
+cost. Against the measured per-timestep differences it accounts for about half
+the gain on the small grid (419 → 693 µs/TS, 274 µs saved) and about a tenth
+on the large one (2787 → 4270 µs/TS, 1483 µs saved). The rest is memory
+traffic: the separate path makes extra full passes over `volt` and
+`volt_flux` — the pre-pass stores the flux to VRAM, the Yee and post passes
+load it back — while the fused kernel carries those intermediates in
+registers. G3 later closed the *remaining* `volt_flux` traffic as a floor of
+the UPML formulation; what fusion removed was the traffic above that floor.
+That also explains the direction of the two numbers: the smaller grid has
+proportionally more PML cells (31% vs 19% of the domain) and its 94 MB
+working set fits the 128 MB Infinity Cache, so it gains more in ratio, while
+the larger grid gains more in absolute time.
+
+`ea82f59` (async field-dump download, ~18× on a dump-heavy GPU run) belongs to
+this group chronologically but is already in the GPU table below, and its full
+write-up — including the `HOST_CACHED` staging-memory bug that turned out to
+be the whole story — is in
+[FDTD/GPU_PIPELINE_OPTIMIZATION.md](FDTD/GPU_PIPELINE_OPTIMIZATION.md) §4.
+The fusion and pipelining design is in
+[FDTD/GPU_FUSION_AND_PIPELINING.md](FDTD/GPU_FUSION_AND_PIPELINING.md).
+
+#### Startup: operator construction
+
+| Commit | Change | Measured |
+|---|---|---|
+| `d9b00bb` | **Parallel operator coefficient preparation.** Coefficient generation is split into x-ranges and run on the SSE/AVX2 operators' existing worker threads, with flat coefficient indices computed directly so workers never race through the stateful `AdrOp` cursor. The Vulkan operator gets the same range parallelism, and its serial ordered-map compression pass is replaced with exact-bit sharded hash tables plus parallel table packing — same coefficient identity, far less startup contention | **8.2 s → 5.6 s** (Host C, 224³ PML_8) and **17.3 s → 14.3 s** (Host A) versus upstream — see [PERFORMANCE.md](PERFORMANCE.md) §6 |
+| `55c9375` | Vulkan material, PEC, coefficient and UPML construction parallelized with worker-local grading parsers | Included in the figures above |
+| — | Controls: `OPENEMS_OPERATOR_THREADS` (`OPENEMS_GPU_OPERATOR_THREADS`), `OPENEMS_GPU_COMPRESS_THREADS`, `OPENEMS_OPERATOR_PROFILE`, `OPENEMS_GPU_STARTUP_TRACE` | — |
+
+Operator build is not a footnote on the GPU: at 224³ on Host C it costs ~7.0 s
+against ~1.1 s for 1200 blocked timesteps. Everything above is what keeps the
+crossover against upstream's best CPU configuration at ~55 timesteps.
+
+#### Not measured
+
+- The **persistent HDF5 handle** and the **template/threaded field
+  extraction** have no A/B number. Neither has a runtime toggle, so isolating
+  them means a rebuild per arm. Note that the 1.7× above does *not* bound
+  them: both were already present in both arms of that A/B, so the async
+  writer's win is measured on top of them, not inclusive of them.
+- The **pipelined main loop with speculative submission** carries only its
+  design estimate (~40× from a 2.5%-utilization starting point). Unlike
+  fused UPML it has no disable switch — it engages whenever probe gather is
+  set up and no CPU-side extension forces a drain — so an A/B needs a code
+  change, not an environment variable. The end-to-end evidence that it works
+  is the fork-vs-upstream matrix in [PERFORMANCE.md](PERFORMANCE.md).
+- `4eec325`, `66aca92` and the second `e05bc8e` row are unquantified entirely.
+- **GPU extension coverage** is measured only for local absorbers (§1.0),
+  the one extension with a switchable CPU path. The other extensions have no
+  fallback to compare against, so their coverage is argued from that one
+  measurement rather than measured.
+- Everything in §1.1's dump and startup tables was measured on Host C only.
+
+### 1.2 GPU
 
 | Commit | Change | Measured |
 |---|---|---|
@@ -65,7 +263,7 @@ Two structural results worth carrying forward:
   lines. Table *size relative to cache* is the thing that matters, not the
   compression ratio.
 
-### AVX2
+### 1.3 AVX2
 
 | Commit | Change | Measured |
 |---|---|---|
@@ -104,6 +302,16 @@ single-threaded and low-thread-count configurations still respond.
   fixture artifact, not a lever.
 - **Shrinking the GPU coefficient tables themselves** (as opposed to the
   index): they are a few KB and already cache-resident.
+- **A background CPU thread for `PA->Process()` on the GPU engine.** An
+  earlier design added a `std::thread` with mutex/condvar handshaking to run
+  post-processing concurrently with the next GPU batch. It was built but never
+  wired into `RunFDTD()`, and was superseded by the pipelined main loop with
+  speculative submission (§1.1), which achieves the same overlap with no
+  second OS thread and no thread-safety surface. The scaffolding
+  (`StartAsyncProcessing()`, `AsyncWorkerLoop()`, `TriggerAsyncProcessing()`,
+  `WaitAsyncProcessing()`) was removed. Note this is *not* the same as the
+  field-dump writer thread (`d17da2c`), which is alive, on the CPU dump path,
+  and measured at 1.7× in §1.1.
 - **Transferring the AVX2 UPML vectorization findings to the GPU.**
   Investigated and rejected on inspection: the GPU is already coalesced and
   already fuses UPML, and its PML penalty is 2.0× versus the CPU's 4.8×. The
@@ -556,6 +764,11 @@ this host's 36 MB. Getting this wrong is expensive rather than fatal: at 224³ a
 tile sized for the *other* grid (W=64, 77 MB) gives 1267 MC/s where W=32 gives
 2249.
 
+> **Superseded on multi-cache hosts.** "One L3" is read from
+> `sysconf(_SC_LEVEL3_CACHE_SIZE)`, which is one cache *instance*. On a
+> multi-CCX or multi-socket machine a full-machine run has several, and the
+> derived width is short by that factor — worth up to 2× where it bites. §4.8.
+
 **It refuses rather than risks.** Blocking engages only when every active
 engine extension reports `SupportsSlabApply()`. An extension that has not
 implemented the slab hooks returns false — the default — and sends the whole run
@@ -813,6 +1026,43 @@ and on a card whose real cache is larger than the default the guard engages on
 a grid that was already cache-resident and **costs ~5%**. A device-ID table or
 a startup micro-probe would fix it.
 
+### 4.8 What five more hosts changed (2026-09-11)
+
+Hosts D–H were added to [PERFORMANCE.md](PERFORMANCE.md) as a portability and
+generality check on §4's conclusions, which were all drawn on Hosts A and C —
+both single-socket parts with one monolithic last-level cache. Two of those
+conclusions do not survive a machine shaped differently, and both are recorded
+here because they are cheap to rediscover the hard way.
+
+**The C2 tile width is derived from the wrong quantity.** §4.7/C2 sizes one
+tile to one last-level cache, taking the size from
+`sysconf(_SC_LEVEL3_CACHE_SIZE)`, and §4.4 above is the measurement that
+justified it. Both are correct on a chip with one shared L3 and wrong on a chip
+with several: `sysconf` reports one instance, while a run spanning *n* of them
+has roughly *n* times that capacity, because the tile is split across cores in
+x and each core's slab lands in its own cache. Measured on 224³ PEC, setting
+the width by hand to the aggregate is worth **1.99×** on compute5 at 16 threads
+(4 CCXs), **2.01×** on loki at 32 (2 sockets) and **1.60×** on tierwater at 12
+(2 sockets) — and is a *loss* on every configuration whose threads fit inside a
+single instance, which is why the defect hides at low thread counts. The
+corrected widths also show the right quantity is aggregate capacity across the
+hierarchy, not the L3 line alone: loki's non-inclusive L3 plus 1 MB of L2 per
+core wants a 43.6 MB tile on a 22 MB socket. Full sweep in
+`python/Tests/results/tile_width_sweep_2026-09-11.txt`; consequences in
+PERFORMANCE.md §5.7. This is the same class of mistake as §4.7/C5's GPU tile
+target above — a cache size treated as a constant rather than as a property of
+the device and of how much of it the run is using.
+
+**`987fcb7` does not do what §1.0 says it does.** Its guard is a CMake-time
+test of the *build* machine's `CMAKE_SYSTEM_PROCESSOR` and compiler, so an
+x86-64 binary built with any modern GCC always has `OPENEMS_ENABLE_AVX2=1` —
+including the copy that then runs on a pre-AVX2 host, where the default engine
+and every `--engine=avx2*` selection die with SIGILL before the first timestep.
+maxwell is that host and all 30 fork rows of its matrix crash. The `#else`
+branch carrying the "AVX2+FMA engine is unavailable on this platform; using
+multithreaded engine" fallback is compiled out in exactly the builds that need
+it. A runtime `__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")`
+at engine selection is the fix; it has not been made. PERFORMANCE.md §5.8.
 
 ---
 
@@ -901,6 +1151,14 @@ repo.
   first cut of the bandwidth benchmark in §4.3 reported 14 *million* GB/s,
   because nothing read the output array and GCC deleted the loop. Consume the
   result and print it.
+- **A dump-path A/B writes into page cache, not onto disk.** The §1.0
+  async-writer measurement writes 5 GB per run and finishes in under three
+  seconds, which no consumer NVMe sustains — the writes are buffered and the
+  process exits before they are flushed. That is the right experiment for
+  isolating HDF5 serialization and `memcpy` from the stepping thread, and the
+  wrong one for claiming anything about storage. Do not run it on tmpfs
+  (`/tmp` is tmpfs on Host C), where even the page-cache pressure disappears,
+  and state which filesystem a dump number came from.
 - **Speed benchmarks do not find footprint bugs.** §4.6 was 515 MB of VRAM
   allocated and never touched, invisible to every timing measurement in this
   document. Sample `mem_info_vram_used` and `mem_info_gtt_used` under

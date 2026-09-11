@@ -1,0 +1,19 @@
+# Paired toolchain control on Host C: native GCC 16 build vs the portable GCC 10
+# bundle, arms alternating run by run, best of 2. 224^3/160x128x192, MCells/s.
+model                      config                    gcc16      gcc10    ratio
+224x224x224_pec            sse 1t                   234.52     234.32    0.999
+224x224x224_pec            avx2 1t                  439.47     437.83    0.996
+224x224x224_pec            avx2-multithreaded 8t     612.40     618.75    1.010
+224x224x224_pec            avx2-multithreaded +tblock 8t    2638.73    2703.30    1.024
+160x128x192_pec            sse 1t                   260.07     261.30    1.005
+160x128x192_pec            avx2 1t                  482.25     472.21    0.979
+160x128x192_pec            avx2-multithreaded 8t     868.41     873.15    1.005
+160x128x192_pec            avx2-multithreaded +tblock 8t    3207.38    3333.32    1.039
+224x224x224_pml            sse 1t                   108.21     111.05    1.026
+224x224x224_pml            avx2 1t                  143.92     146.53    1.018
+224x224x224_pml            avx2-multithreaded 8t     231.55     232.88    1.006
+224x224x224_pml            avx2-multithreaded +tblock 8t     789.56     794.66    1.006
+224x224x224_mur            sse 1t                   208.48     212.00    1.017
+224x224x224_mur            avx2 1t                  356.31     358.85    1.007
+224x224x224_mur            avx2-multithreaded 8t     559.88     554.99    0.991
+224x224x224_mur            avx2-multithreaded +tblock 8t    1809.85    1815.79    1.003

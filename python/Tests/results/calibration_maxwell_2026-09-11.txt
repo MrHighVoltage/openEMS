@@ -1,0 +1,7 @@
+# thread-count calibration, 224^3 PEC, 600 timesteps, MCells/s (best of 1)
+host           point    cpus         upstream-mt  fork-avx2 fork-tblock
+maxwell        4        0-3              332.20 FAIL(rc=132) FAIL(rc=132)
+maxwell        6s0      0-5              351.33 FAIL(rc=132) FAIL(rc=132)
+maxwell        6sp      0-2,6-8          439.24 FAIL(rc=132) FAIL(rc=132)
+maxwell        12       0-11             537.90 FAIL(rc=132) FAIL(rc=132)
+maxwell        smt      0-23             421.14 FAIL(rc=132) FAIL(rc=132)

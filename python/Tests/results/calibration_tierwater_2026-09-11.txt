@@ -1,0 +1,7 @@
+# thread-count calibration, 224^3 PEC, 600 timesteps, MCells/s (best of 1)
+host           point    cpus         upstream-mt  fork-avx2 fork-tblock
+tierwater      4        0-3              206.34     285.46     308.19
+tierwater      6s0      0-5              250.82     290.52     360.54
+tierwater      6sp      0-2,6-8          302.81     454.86     324.15
+tierwater      12       0-11             433.19     470.73     357.94
+tierwater      smt      0-23             370.45     432.93     283.57

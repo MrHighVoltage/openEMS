@@ -1,0 +1,971 @@
+[
+ {
+  "ok": true,
+  "mcells_s": 100.28,
+  "loop_s": 104.57,
+  "notes": [],
+  "setup_s": 0.98,
+  "cells": 262144,
+  "wall_s": 105.55171322822571,
+  "samples": [
+   99.1,
+   100.3,
+   100.0,
+   78.5,
+   99.6,
+   81.7
+  ],
+  "config": "64x64x64 pec",
+  "engine": "upstream sse 1t",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 192.48,
+  "loop_s": 54.48,
+  "notes": [],
+  "setup_s": 0.79,
+  "cells": 262144,
+  "wall_s": 55.27012753486633,
+  "samples": [
+   190.6,
+   191.4,
+   191.2,
+   192.0,
+   191.4,
+   192.5
+  ],
+  "config": "64x64x64 pec",
+  "engine": "upstream mt 12t",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": true,
+  "mcells_s": 222.36,
+  "loop_s": 47.16,
+  "notes": [],
+  "setup_s": 0.71,
+  "cells": 262144,
+  "wall_s": 47.87066984176636,
+  "samples": [
+   203.6,
+   222.4,
+   155.8,
+   123.7,
+   111.9,
+   66.0
+  ],
+  "config": "64x64x64 pec",
+  "engine": "upstream mt default",
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA engine\nCreate FDTD operator (AVX2 + FMA)\nFDTD simulation size: 64x64x64 --> 262144 FDTD cells \nFDTD timestep is: 1.92583e-12 s; Nyquist rate: 173 timesteps @1.50074e+09 Hz\nExcitation signal length is: 2976 timesteps (5.73128e-09s)\nMax. number of timesteps: 40000 ( --> 13.4409 * Excitation signal length)\nCreate FDTD engine (AVX2 + FMA, compressed flat arrays)\nRunning FDTD engine... this may take a while... grab a cup of coffee?!?\n",
+  "config": "64x64x64 pec",
+  "engine": "fork avx2 1t",
+  "cells": 262144,
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "64x64x64 pec",
+  "engine": "fork avx2-mt 12t",
+  "cells": 262144,
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "64x64x64 pec",
+  "engine": "fork avx2-mt default",
+  "cells": 262144,
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "64x64x64 pec",
+  "engine": "fork tblock 12t",
+  "cells": 262144,
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "64x64x64 pec",
+  "engine": "fork tblock default",
+  "cells": 262144,
+  "timesteps": 40000,
+  "boundary": "pec",
+  "grid": [
+   64,
+   64,
+   64
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 98.54,
+  "loop_s": 119.72,
+  "notes": [],
+  "setup_s": 16.33,
+  "cells": 3932160,
+  "wall_s": 136.05045247077942,
+  "samples": [
+   98.5,
+   97.5,
+   97.4
+  ],
+  "config": "160x128x192 pec",
+  "engine": "upstream sse 1t",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 549.31,
+  "loop_s": 21.48,
+  "notes": [],
+  "setup_s": 9.02,
+  "cells": 3932160,
+  "wall_s": 30.499520301818848,
+  "samples": [
+   546.3,
+   537.0,
+   549.3
+  ],
+  "config": "160x128x192 pec",
+  "engine": "upstream mt 12t",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": true,
+  "mcells_s": 283.17,
+  "loop_s": 41.66,
+  "notes": [],
+  "setup_s": 8.16,
+  "cells": 3932160,
+  "wall_s": 49.816508293151855,
+  "samples": [
+   283.2,
+   281.1,
+   282.9
+  ],
+  "config": "160x128x192 pec",
+  "engine": "upstream mt default",
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA engine\nCreate FDTD operator (AVX2 + FMA)\nFDTD simulation size: 160x128x192 --> 3.93216e+06 FDTD cells \nFDTD timestep is: 1.92583e-12 s; Nyquist rate: 173 timesteps @1.50074e+09 Hz\nExcitation signal length is: 2976 timesteps (5.73128e-09s)\nMax. number of timesteps: 3000 ( --> 1.00806 * Excitation signal length)\nopenEMS::SetupFDTD: Warning, max. number of timesteps is smaller than three times the excitation. \n\tYou may want to choose a higher number of max. timesteps... \nCreate FDTD engine (AVX2 + FMA, compressed flat arrays)\nRunning FDTD engine... this may take a while... grab a cup of coffee?!?\n",
+  "config": "160x128x192 pec",
+  "engine": "fork avx2 1t",
+  "cells": 3932160,
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pec",
+  "engine": "fork avx2-mt 12t",
+  "cells": 3932160,
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pec",
+  "engine": "fork avx2-mt default",
+  "cells": 3932160,
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pec",
+  "engine": "fork tblock 12t",
+  "cells": 3932160,
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pec",
+  "engine": "fork tblock default",
+  "cells": 3932160,
+  "timesteps": 3000,
+  "boundary": "pec",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 98.39,
+  "loop_s": 137.08,
+  "notes": [],
+  "setup_s": 47.2,
+  "cells": 11239424,
+  "wall_s": 184.28102564811707,
+  "samples": [
+   98.2,
+   98.4,
+   97.1
+  ],
+  "config": "224x224x224 pec",
+  "engine": "upstream sse 1t",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 566.4,
+  "loop_s": 23.81,
+  "notes": [],
+  "setup_s": 26.21,
+  "cells": 11239424,
+  "wall_s": 50.01573944091797,
+  "samples": [
+   524.3,
+   566.4,
+   505.9
+  ],
+  "config": "224x224x224 pec",
+  "engine": "upstream mt 12t",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": true,
+  "mcells_s": 238.25,
+  "loop_s": 56.61,
+  "notes": [],
+  "setup_s": 24.46,
+  "cells": 11239424,
+  "wall_s": 81.07080030441284,
+  "samples": [
+   238.2,
+   232.9,
+   236.2
+  ],
+  "config": "224x224x224 pec",
+  "engine": "upstream mt default",
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA engine\nCreate FDTD operator (AVX2 + FMA)\nOperator::CalcGaussianPulsExcitation: Requested excitation pusle would be 2976 timesteps or 5.73128e-09 s long. Cutting to max number of timesteps!\nFDTD simulation size: 224x224x224 --> 1.12394e+07 FDTD cells \nFDTD timestep is: 1.92583e-12 s; Nyquist rate: 173 timesteps @1.50074e+09 Hz\nExcitation signal length is: 1200 timesteps (2.311e-09s)\nMax. number of timesteps: 1200 ( --> 1 * Excitation signal length)\nopenEMS::SetupFDTD: Warning, max. number of timesteps is smaller than three times the excitation. \n\tYou may want to choose a higher number of max. timesteps... \nCreate FDTD engine (AVX2 + FMA, compressed flat arrays)\nRunning FDTD engine... this may take a while... grab a cup of coffee?!?\n",
+  "config": "224x224x224 pec",
+  "engine": "fork avx2 1t",
+  "cells": 11239424,
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pec",
+  "engine": "fork avx2-mt 12t",
+  "cells": 11239424,
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pec",
+  "engine": "fork avx2-mt default",
+  "cells": 11239424,
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pec",
+  "engine": "fork tblock 12t",
+  "cells": 11239424,
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pec",
+  "engine": "fork tblock default",
+  "cells": 11239424,
+  "timesteps": 1200,
+  "boundary": "pec",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 32.65,
+  "loop_s": 180.62,
+  "notes": [],
+  "setup_s": 20.32,
+  "cells": 3932160,
+  "wall_s": 200.93964862823486,
+  "samples": [
+   32.5,
+   32.6,
+   32.6
+  ],
+  "config": "160x128x192 pml",
+  "engine": "upstream sse 1t",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 191.12,
+  "loop_s": 30.86,
+  "notes": [],
+  "setup_s": 13.66,
+  "cells": 3932160,
+  "wall_s": 44.51706099510193,
+  "samples": [
+   187.7,
+   189.9,
+   191.1
+  ],
+  "config": "160x128x192 pml",
+  "engine": "upstream mt 12t",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": true,
+  "mcells_s": 74.73,
+  "loop_s": 78.93,
+  "notes": [],
+  "setup_s": 12.26,
+  "cells": 3932160,
+  "wall_s": 91.18520951271057,
+  "samples": [
+   74.3,
+   74.7,
+   63.9
+  ],
+  "config": "160x128x192 pml",
+  "engine": "upstream mt default",
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA engine\nCreate FDTD operator (AVX2 + FMA)\nOperator::CalcGaussianPulsExcitation: Requested excitation pusle would be 2976 timesteps or 5.73128e-09 s long. Cutting to max number of timesteps!\nFDTD simulation size: 160x128x192 --> 3.93216e+06 FDTD cells \nFDTD timestep is: 1.92583e-12 s; Nyquist rate: 173 timesteps @1.50074e+09 Hz\nExcitation signal length is: 1500 timesteps (2.88875e-09s)\nMax. number of timesteps: 1500 ( --> 1 * Excitation signal length)\nopenEMS::SetupFDTD: Warning, max. number of timesteps is smaller than three times the excitation. \n\tYou may want to choose a higher number of max. timesteps... \nCreate FDTD engine (AVX2 + FMA, compressed flat arrays)\n",
+  "config": "160x128x192 pml",
+  "engine": "fork avx2 1t",
+  "cells": 3932160,
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pml",
+  "engine": "fork avx2-mt 12t",
+  "cells": 3932160,
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pml",
+  "engine": "fork avx2-mt default",
+  "cells": 3932160,
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pml",
+  "engine": "fork tblock 12t",
+  "cells": 3932160,
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "160x128x192 pml",
+  "engine": "fork tblock default",
+  "cells": 3932160,
+  "timesteps": 1500,
+  "boundary": "pml",
+  "grid": [
+   160,
+   128,
+   192
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 37.02,
+  "loop_s": 182.15,
+  "notes": [],
+  "setup_s": 55.77,
+  "cells": 11239424,
+  "wall_s": 237.92237401008606,
+  "samples": [
+   37.0,
+   36.9,
+   36.8
+  ],
+  "config": "224x224x224 pml",
+  "engine": "upstream sse 1t",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 231.34,
+  "loop_s": 29.15,
+  "notes": [],
+  "setup_s": 33.61,
+  "cells": 11239424,
+  "wall_s": 62.76043391227722,
+  "samples": [
+   222.5,
+   231.3,
+   198.3
+  ],
+  "config": "224x224x224 pml",
+  "engine": "upstream mt 12t",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": true,
+  "mcells_s": 59.07,
+  "loop_s": 114.16,
+  "notes": [],
+  "setup_s": 33.06,
+  "cells": 11239424,
+  "wall_s": 147.22146725654602,
+  "samples": [
+   58.5,
+   58.6,
+   59.1
+  ],
+  "config": "224x224x224 pml",
+  "engine": "upstream mt default",
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA engine\nCreate FDTD operator (AVX2 + FMA)\nOperator::CalcGaussianPulsExcitation: Requested excitation pusle would be 2976 timesteps or 5.73128e-09 s long. Cutting to max number of timesteps!\nFDTD simulation size: 224x224x224 --> 1.12394e+07 FDTD cells \nFDTD timestep is: 1.92583e-12 s; Nyquist rate: 173 timesteps @1.50074e+09 Hz\nExcitation signal length is: 600 timesteps (1.1555e-09s)\nMax. number of timesteps: 600 ( --> 1 * Excitation signal length)\nopenEMS::SetupFDTD: Warning, max. number of timesteps is smaller than three times the excitation. \n\tYou may want to choose a higher number of max. timesteps... \nCreate FDTD engine (AVX2 + FMA, compressed flat arrays)\n",
+  "config": "224x224x224 pml",
+  "engine": "fork avx2 1t",
+  "cells": 11239424,
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pml",
+  "engine": "fork avx2-mt 12t",
+  "cells": 11239424,
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pml",
+  "engine": "fork avx2-mt default",
+  "cells": 11239424,
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pml",
+  "engine": "fork tblock 12t",
+  "cells": 11239424,
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 pml",
+  "engine": "fork tblock default",
+  "cells": 11239424,
+  "timesteps": 600,
+  "boundary": "pml",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 77.33,
+  "loop_s": 145.35,
+  "notes": [],
+  "setup_s": 47.44,
+  "cells": 11239424,
+  "wall_s": 192.78773880004883,
+  "samples": [
+   77.2,
+   77.3,
+   76.6
+  ],
+  "config": "224x224x224 mur",
+  "engine": "upstream sse 1t",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": true,
+  "mcells_s": 406.77,
+  "loop_s": 27.63,
+  "notes": [],
+  "setup_s": 25.52,
+  "cells": 11239424,
+  "wall_s": 53.15071988105774,
+  "samples": [
+   343.9,
+   406.8,
+   310.9
+  ],
+  "config": "224x224x224 mur",
+  "engine": "upstream mt 12t",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": true,
+  "mcells_s": 157.17,
+  "loop_s": 71.51,
+  "notes": [],
+  "setup_s": 24.54,
+  "cells": 11239424,
+  "wall_s": 96.04925489425659,
+  "samples": [
+   155.9,
+   130.4,
+   157.2
+  ],
+  "config": "224x224x224 mur",
+  "engine": "upstream mt default",
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA engine\nCreate FDTD operator (AVX2 + FMA)\nOperator::CalcGaussianPulsExcitation: Requested excitation pusle would be 2976 timesteps or 5.73128e-09 s long. Cutting to max number of timesteps!\nFDTD simulation size: 224x224x224 --> 1.12394e+07 FDTD cells \nFDTD timestep is: 1.92583e-12 s; Nyquist rate: 173 timesteps @1.50074e+09 Hz\nExcitation signal length is: 1000 timesteps (1.92583e-09s)\nMax. number of timesteps: 1000 ( --> 1 * Excitation signal length)\nopenEMS::SetupFDTD: Warning, max. number of timesteps is smaller than three times the excitation. \n\tYou may want to choose a higher number of max. timesteps... \nCreate FDTD engine (AVX2 + FMA, compressed flat arrays)\nRunning FDTD engine... this may take a while... grab a cup of coffee?!?\n",
+  "config": "224x224x224 mur",
+  "engine": "fork avx2 1t",
+  "cells": 11239424,
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0",
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 mur",
+  "engine": "fork avx2-mt 12t",
+  "cells": 11239424,
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 mur",
+  "engine": "fork avx2-mt default",
+  "cells": 11239424,
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nopenEMS - fixed number of threads: 12\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 mur",
+  "engine": "fork tblock 12t",
+  "cells": 11239424,
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": "0-11",
+  "num_threads": 12
+ },
+ {
+  "ok": false,
+  "error": "exit -4",
+  "tail": " ---------------------------------------------------------------------- \n | openEMS 64bit -- version v0.37.0-rc1-111-g6998a73\n | (C) 2010-2025 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license\n ---------------------------------------------------------------------- \n\tUsed external libraries:\n\t\tCSXCAD -- Version: v0.7.0-rc1-16-ga3a6e4b\n\t\thdf5   -- Version: 1.14.6\n\t\t          compiled against: HDF5 library version: 1.14.6\n\t\ttinyxml -- compiled against: 2.6.2\n\t\tfparser\n\t\tvtk -- Version: 9.3.1\n\t\t       compiled against: 9.3.1\n\nopenEMS - enabled AVX2+FMA multithreaded engine\nCreate FDTD operator (AVX2 + FMA + multi-threading)\n",
+  "config": "224x224x224 mur",
+  "engine": "fork tblock default",
+  "cells": 11239424,
+  "timesteps": 1000,
+  "boundary": "mur",
+  "grid": [
+   224,
+   224,
+   224
+  ],
+  "cpus": null,
+  "num_threads": 0
+ }
+]

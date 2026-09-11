@@ -1,0 +1,7 @@
+# maxwell (no AVX2): fork vs upstream portable 'multithreaded' engine, 12 threads on 0-11, MCells/s
+224x224x224_pec.xml          upstream      556.21
+224x224x224_pec.xml          fork          589.69
+224x224x224_pml.xml          upstream      227.60
+224x224x224_pml.xml          fork          226.38
+224x224x224_mur.xml          upstream      381.13
+224x224x224_mur.xml          fork          400.98

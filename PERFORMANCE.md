@@ -10,6 +10,18 @@ Everything here was re-measured after the GPU engine gained the blocked
 schedule: Host C on **2026-09-07**, Host A on **2026-09-08** from a clean
 rebuild of the same commit.
 
+On **2026-09-11** the CPU half of the matrix was extended to five more
+machines — Hosts D–H, §2 — chosen because they are *unlike* the first two:
+an AMD Zen 2 desktop part, three dual-socket servers and a six-core client
+CPU, spanning last-level caches from 9 MB to 4×16 MB and including one host
+with no AVX2 at all. They cost the document two of its conclusions. CPU
+temporal blocking does not simply track last-level cache size (§5.4); it
+tracks the cache the running threads *collectively* have, and the tile width
+is derived from one cache instance, which is wrong on every machine whose LLC
+is partitioned — worth up to **2×** where it bites (§5.7). And the fork's
+AVX2 engine has no runtime ISA check, so on a pre-Haswell host it does not run
+slowly, it dies (§5.8).
+
 The engineering record behind these numbers — including what was tried and
 rejected — is in [OPTIMIZATIONS.md](OPTIMIZATIONS.md). This document is the
 summary; that one is the evidence.
@@ -85,6 +97,39 @@ weak CPU: the HD 530 is the **fastest engine on this machine** on the 224&sup3;
 PML_8 and Mur models, which the much stronger UHD 770 never is on Host C
 (§5.3).
 
+### Hosts D–H — five servers, CPU only
+
+None of these five has a Vulkan driver stack, so the GPU engine is out of the
+picture and these are CPU-only numbers. Best fork configuration against best
+upstream configuration, both as defined above:
+
+| Model | compute5<br>Zen 2, 16C | loki<br>2&times;Skylake-SP, 32C | maxwell<br>2&times;Sandy Bridge, 12C | saturn<br>Coffee Lake, 6C | tierwater<br>2&times;Haswell, 12C |
+|---|---|---|---|---|---|
+| 64&sup3; PEC | **2.52&times;** | **2.35&times;** | *does not run* | **2.16&times;** | **1.89&times;** |
+| 160&times;128&times;192 PEC | **2.68&times;** | 1.35&times; | *does not run* | **2.53&times;** | 1.36&times; |
+| 224&sup3; PEC | 1.57&times; | 1.18&times; | *does not run* | 1.59&times; | 1.15&times; |
+| 160&times;128&times;192 PML_8 | 2.16&times; | 1.32&times; | *does not run* | 1.85&times; | 1.16&times; |
+| 224&sup3; PML_8 | 1.68&times; | 1.09&times; | *does not run* | 1.60&times; | 1.08&times; |
+| 224&sup3; Mur | 1.19&times; | 1.37&times; | *does not run* | 1.46&times; | 1.10&times; |
+
+Three things to read out of that table, in descending order of how much they
+should change what anyone does:
+
+- **maxwell runs nothing.** It is a pre-Haswell host, the AVX2 engine is
+  selected at compile time with no runtime check, and every fork configuration
+  — including the *default* one — terminates with SIGILL. Not a slow row, an
+  absent one. §5.8.
+- **The two hosts that gain least, loki and tierwater, are the two whose
+  last-level cache is split across sockets** — and the loss is not inherent to
+  them. Told the cache its threads actually have, loki's blocked schedule goes
+  from 636 to 1280 MC/s and tierwater's from 356 to 569 on the 224&sup3; PEC
+  model. The matrix above reports the defaults, so it reports the defect.
+  §5.7.
+- **saturn, the weakest machine here, gains the most consistently**
+  (1.46&times;–2.53&times;) for the same reason in reverse: six cores behind a
+  single undivided 9 MB L3 is exactly the shape the tile heuristic was written
+  for.
+
 ---
 
 ## 2. What was measured, and how
@@ -109,9 +154,30 @@ copy. The two agree to **1.7% worst case** and to 0.8% on every DRAM-bound
 row; the tables here are the second run, and the first is committed alongside
 it as the corroborating repeat (§7).
 
-**Builds.** All four configured from scratch and compiled with the same
-toolchain (GCC 16.2.1, CMake Release, `-O3 -DNDEBUG`) against each host's own
-CSXCAD, HDF5, VTK and Boost:
+**Hosts D–H** are five servers added on 2026-09-11, all running only the
+benchmark and otherwise idle (loki had other users logged in but no load).
+None of them has a Vulkan ICD installed, so all five are CPU-only. They were
+picked for cache and socket topology, which is what §5.4 and §5.7 turn on:
+
+| | machine | cores | last-level cache | `getconf LEVEL3_CACHE_SIZE` | OS |
+|---|---|---|---|---|---|
+| **D** | compute5 — Ryzen 9 3950X | 16C/32T, 1 socket | 4 &times; 16 MB (one per CCX), **64 MB total** | 16 MB | Rocky 8.10, glibc 2.28 |
+| **E** | loki — 2&times; Xeon Gold 6130 | 32C/64T, 2 sockets | 2 &times; 22 MB, non-inclusive, **+ 1 MB L2 per core** | 22 MB | Rocky 8.10, glibc 2.28 |
+| **F** | maxwell — 2&times; Xeon E5-2630 | 12C/24T, 2 sockets | 2 &times; 15 MB | 15 MB | Rocky 8.10, glibc 2.28 |
+| **G** | saturn — Core i5-8500 | 6C/6T, 1 socket | 9 MB, undivided | 9 MB | CentOS 7.9, glibc 2.17, **kernel 3.10** |
+| **H** | tierwater — 2&times; Xeon E5-2620 v3 | 12C/24T, 2 sockets | 2 &times; 15 MB | 15 MB | Rocky 8.10, glibc 2.28 |
+
+That fifth column is the whole of §5.7: on D, E, F and H it is the size of
+*one* cache instance, not of the cache a full-machine run has.
+
+**maxwell (F) is pre-Haswell** — it has AVX and SSE4.2 but no AVX2 and no FMA.
+It is in this document precisely for that: it is the only machine here that can
+answer what a binary carrying an AVX2 engine does on hardware that cannot
+execute one. §5.8.
+
+**Builds.** For Hosts A and C, all four builds were configured from scratch and
+compiled with the same toolchain (GCC 16.2.1, CMake Release, `-O3 -DNDEBUG`)
+against each host's own CSXCAD, HDF5, VTK and Boost:
 
 | | commit | engines available |
 |---|---|---|
@@ -121,9 +187,50 @@ CSXCAD, HDF5, VTK and Boost:
 The fork's merge-base with upstream *is* upstream's head, so this is exactly
 upstream plus 99 commits, with no divergence to account for.
 
+**Hosts D–H could not be built on**, and that constraint shaped the method.
+They are shared machines that must not be modified, none of them has CSXCAD,
+HDF5, VTK, CGAL or Boost installed, and saturn is a CentOS 7 box — glibc 2.17,
+kernel 3.10 — which no binary from a current distribution will even start on.
+So both sides were built *once*, on the workstation, inside a glibc-2.17
+container (`quay.io/pypa/manylinux2014_x86_64`, GCC 10.2.1) against a
+dependency stack compiled from source in the same container, and linked
+statically against everything except libc. The resulting bundle needs nothing
+on the target but a glibc ≥ 2.17 x86-64 system: its highest versioned symbol
+requirement is exactly `GLIBC_2.17`, and its only dynamic dependencies are
+`libc`, `libm`, `libdl`, `libpthread` and the three project libraries shipped
+beside it. `python/Tests/build_portable_bench.sh` is that build, end to end.
+
+Nothing was installed on any of the five hosts. The bundle was copied to the
+NFS home they share and staged to node-local `/tmp` for the runs, so no NFS
+round trip is anywhere near a measurement.
+
+**The older compiler is not a variable.** GCC 10 against the GCC 16 used for
+Hosts A and C is a real difference, and since it applies to both sides of every
+comparison it cannot manufacture a fork-vs-upstream result — but it could
+still distort the *absolute* numbers this document quotes. It does not. The
+two builds were compared on Host C in a paired test, the arms alternating run
+by run on the same model so that machine state cancels:
+
+| Host C, 224&sup3; PEC | GCC 16 | GCC 10 | |
+|---|---|---|---|
+| `sse` 1 thread | 235 | 234 | 1.00&times; |
+| `avx2` 1 thread | 439 | 438 | 1.00&times; |
+| `avx2-multithreaded` 8t | 612 | 619 | 1.01&times; |
+| `avx2-multithreaded` +tblock 8t | 2639 | 2703 | 1.02&times; |
+
+Across all sixteen model/engine combinations tested the ratio stays within
+**0.98–1.04**, with no systematic direction. Full output in
+`python/Tests/results/toolchain_gcc16_vs_gcc10_2026-09-11.txt`. Note the form
+of that control: two *matrix runs* on different days would have conflated the
+toolchain with the machine's state, and an attempt at exactly that comparison
+came out 15–29% low on the PEC rows purely because the workstation was busy
+that afternoon. Alternating arms is what makes it a measurement.
+
 **Method.** Both builds' `openEMS` **binaries** are driven over byte-identical
-XML models, written once with `Write2XML()` and then copied to the second host,
-so the two machines run the same bytes. Nothing depends on which Python
+XML models, written once with `Write2XML()` and then copied to the other hosts,
+so every machine runs the same bytes. The models are committed as
+`python/Tests/models/*.xml` for that reason — on Hosts D–H nothing could
+regenerate them, since none of them has the Python bindings. Nothing depends on which Python
 bindings happen to be installed, and the models contain nothing a stock
 upstream build cannot parse — a uniform Cartesian grid, one excitation box, a
 boundary condition. There are **no probes, no field dumps and no
@@ -155,11 +262,32 @@ sweep on the 224&sup3; PEC model (600–1200 timesteps, unpinned):
 |---|---|---|---|---|
 | C | `-c 0,2,4,6,8,10,12,14`, 8 threads | 543 / 570 / **572** / 499 at 4/6/8/12 | 600 / 621 / **622** / 552 | 1765 / **2305** / 2109 at 4/8/12 |
 | A | `-c 0,2,4,6`, 4 threads | 384 / **441** / 394 / 377 at 2/4/6/8 | **487** / 480 / 431 / 391 | 484 / 554 / **592** / 575 |
+| D compute5 | `-c 0-15`, 16 threads | 423 / 410 / **424** / 422 / 372 at 4/8/12/16/32 | 436 / 424 / **441** / 439 / 392 | **1132** / 584 / 570 / 520 / 447 |
+| E loki | `-c 0-31`, 32 threads | 559 / 856 / 856 / 929 / **1006** / 614 at 4/8/16&nbsp;s0/16&nbsp;spread/32/64 | 707 / 952 / 935 / 1048 / **1144** / 912 | 769 / **989** / 986 / 742 / 620 / 425 |
+| F maxwell | `-c 0-11`, 12 threads | 332 / 351 / 439 / **538** / 421 at 4/6&nbsp;s0/6&nbsp;spread/12/24 | *SIGILL* | *SIGILL* |
+| G saturn | `-c 0-1`, 2 threads | **207** / 201 / 180 at 2/4/6 | **225** / 211 / 190 | 304 / 316 / **337** |
+| H tierwater | `-c 0-11`, 12 threads | 206 / 251 / 303 / **433** / 370 at 4/6&nbsp;s0/6&nbsp;spread/12/24 | 285 / 291 / 455 / **471** / 433 | 308 / **361** / 324 / 358 / 284 |
 
 Host C's two engines agree on 8, and both roll off past it for the same reason:
 a plain OpenMP STREAM-Triad on that host peaks at 6–8 threads and loses ~20% by
 16 ([OPTIMIZATIONS.md](OPTIMIZATIONS.md) §4.3). The memory controller sets that
 curve, not the engines.
+
+The dual-socket rows carry an extra column the single-socket hosts do not: on
+maxwell and tierwater, six threads *spread across both sockets*
+(`-c 0-2,6-8`) beat six threads on one (`-c 0-5`) by **25%** and **21%** — two
+memory controllers rather than one, for the same core count. That is why the
+pinned sets for those hosts span both sockets.
+
+**Three of the five hosts' blocked schedules peak somewhere other than their
+flat ones, and by a lot**: compute5 at 4 threads against 16, loki at 8 against
+32, saturn at 6 against 2. On Host A the same disagreement was read as SMT
+helping a less bandwidth-bound kernel (§2.1 above). That reading does not
+survive these hosts: the blocked schedule prefers *fewer* threads here, and
+§5.7 shows why — at low thread counts the run fits inside one cache instance,
+which is the only case in which the derived tile width is the right one. The
+pinned `+tblock` columns in §3 therefore understate the schedule on Hosts D, E
+and H, and §5.7 is where the corrected figures are.
 
 **Host A's engines do not agree**, and that is itself a result. Its flat AVX2
 engine peaks at **2** threads, upstream's SSE engine at **4**, and the
@@ -209,10 +337,92 @@ reason in §8.
 | 224&sup3; PML_8 | 600 | 83 | 168 | 133 | 137 | 183 | 186 | 205 | 227 | 270 | 269 |
 | 224&sup3; Mur | 1000 | 173 | 358 | 321 | 286 | 388 | 406 | 339 | 382 | 503 | 502 |
 
-Raw output for both, including every individual repeat and the engine's own
-"temporal blocking active / disabled — …" line for each blocked row, is
-committed as `python/Tests/results/fork_vs_upstream_hostC_2026-09-07.json` and
-`…_hostA_2026-09-07.json`.
+### Hosts D–H — CPU only
+
+Same matrix, same models, same binaries; no GPU columns because none of these
+machines has a Vulkan driver. The pinned thread count per host is the one
+§2.1 derives.
+
+**D — compute5, Ryzen 9 3950X, 16C/32T, 4&times;16 MB L3**
+
+| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 16t | upstream<br>default | fork<br>AVX2 1t | fork<br>AVX2-MT 16t | fork<br>default | fork<br>+tblock 16t | fork<br>+tblock default |
+|---|---|---|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 40000 | 273 | 586 | 631 | 588 | 990 | 1588 | 964 | 1587 |
+| 160&times;128&times;192 PEC | 3000 | 207 | 430 | 403 | 338 | 473 | 616 | 705 | 1153 |
+| 224&sup3; PEC | 1200 | 212 | 422 | 390 | 348 | 440 | 460 | 513 | 661 |
+| 160&times;128&times;192 PML_8 | 1500 | 73 | 184 | 153 | 96 | 175 | 177 | 292 | 397 |
+| 224&sup3; PML_8 | 600 | 82 | 201 | 128 | 109 | 174 | 171 | 270 | 337 |
+| 224&sup3; Mur | 1000 | 193 | 376 | 335 | 289 | 388 | 400 | 319 | 446 |
+
+**E — loki, 2&times; Xeon Gold 6130, 32C/64T, 2&times;22 MB L3**
+
+| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 32t | upstream<br>default | fork<br>AVX2 1t | fork<br>AVX2-MT 32t | fork<br>default | fork<br>+tblock 32t | fork<br>+tblock default |
+|---|---|---|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 40000 | 181 | 184 | 488 | 335 | 370 | 1002 | 374 | 1148 |
+| 160&times;128&times;192 PEC | 3000 | 128 | 1057 | 473 | 221 | 1426 | 1242 | 909 | 1324 |
+| 224&sup3; PEC | 1200 | 128 | 1083 | 371 | 200 | 1282 | 992 | 637 | 807 |
+| 160&times;128&times;192 PML_8 | 1500 | 49 | 275 | 139 | 74 | 364 | 344 | 190 | 294 |
+| 224&sup3; PML_8 | 600 | 55 | 396 | 100 | 77 | 432 | 309 | 160 | 261 |
+| 224&sup3; Mur | 1000 | 108 | 608 | 271 | 153 | 835 | 696 | 221 | 455 |
+
+**F — maxwell, 2&times; Xeon E5-2630, 12C/24T, no AVX2**
+
+| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 12t | upstream<br>default | every fork AVX2 row |
+|---|---|---|---|---|---|
+| 64&sup3; PEC | 40000 | 100 | 192 | 222 | **SIGILL** |
+| 160&times;128&times;192 PEC | 3000 | 99 | 549 | 283 | **SIGILL** |
+| 224&sup3; PEC | 1200 | 98 | 566 | 238 | **SIGILL** |
+| 160&times;128&times;192 PML_8 | 1500 | 33 | 191 | 75 | **SIGILL** |
+| 224&sup3; PML_8 | 600 | 37 | 231 | 59 | **SIGILL** |
+| 224&sup3; Mur | 1000 | 77 | 407 | 157 | **SIGILL** |
+
+All 30 fork rows on this host exit with status 132 — 128 + SIGILL — including
+the two `default` ones. §5.8. What the fork's *portable* engine does there,
+which is the question the crash hides, is in §5.8's second table.
+
+**G — saturn, Core i5-8500, 6C/6T, 9 MB L3**
+
+| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 2t | upstream<br>default | fork<br>AVX2 1t | fork<br>AVX2-MT 2t | fork<br>default | fork<br>+tblock 2t | fork<br>+tblock default |
+|---|---|---|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 40000 | 166 | 430 | 530 | 436 | 772 | 1144 | 782 | 1128 |
+| 160&times;128&times;192 PEC | 3000 | 124 | 210 | 206 | 226 | 230 | 230 | 474 | 531 |
+| 224&sup3; PEC | 1200 | 123 | 208 | 201 | 221 | 225 | 225 | 303 | 332 |
+| 160&times;128&times;192 PML_8 | 1500 | 53 | 78 | 78 | 71 | 74 | 75 | 140 | 144 |
+| 224&sup3; PML_8 | 600 | 59 | 88 | 83 | 79 | 83 | 84 | 142 | 141 |
+| 224&sup3; Mur | 1000 | 110 | 182 | 175 | 179 | 192 | 190 | 265 | 259 |
+
+**H — tierwater, 2&times; Xeon E5-2620 v3, 12C/24T, 2&times;15 MB L3**
+
+| Model | TS | upstream<br>SSE 1t | upstream<br>SSE-MT 12t | upstream<br>default | fork<br>AVX2 1t | fork<br>AVX2-MT 12t | fork<br>default | fork<br>+tblock 12t | fork<br>+tblock default |
+|---|---|---|---|---|---|---|---|---|---|
+| 64&sup3; PEC | 40000 | 143 | 238 | 175 | 338 | 449 | 364 | 446 | 358 |
+| 160&times;128&times;192 PEC | 3000 | 114 | 430 | 244 | 194 | 519 | 440 | 583 | 461 |
+| 224&sup3; PEC | 1200 | 114 | 447 | 201 | 187 | 514 | 422 | 365 | 320 |
+| 160&times;128&times;192 PML_8 | 1500 | 41 | 145 | 61 | 62 | 168 | 150 | 148 | 133 |
+| 224&sup3; PML_8 | 600 | 46 | 175 | 67 | 66 | 190 | 156 | 118 | 112 |
+| 224&sup3; Mur | 1000 | 87 | 349 | 136 | 125 | 383 | 332 | 204 | 219 |
+
+Two rows in there are worth pausing on because they are not engine results:
+
+- **loki's 64&sup3; row collapses when pinned** — 184 MC/s at 32 threads
+  against 488 for the same build left to auto-tune. A 6 MB grid spread over 32
+  cores on two sockets is barrier traffic and cross-socket coherence, nothing
+  else; both builds suffer it equally, so the column is still a controlled
+  comparison, but the absolute number says more about the pinning than the
+  engine. The `default` columns are the ones to read on that row.
+- **tierwater and loki's `+tblock` columns are below their flat ones** on the
+  large grids — 365 against 514, 637 against 1282. That is the §5.7 defect, not
+  a property of the schedule; corrected, the same configurations reach 569 and
+  1280.
+
+Raw output for all seven hosts, including every individual repeat and the
+engine's own "temporal blocking active / disabled — …" line for each blocked
+row, is committed under `python/Tests/results/`:
+`fork_vs_upstream_hostC_2026-09-07.json`, `…_hostA_2026-09-07.json`,
+`…_hostA_2026-09-08.json` and
+`fork_vs_upstream_{compute5,loki,maxwell,saturn,tierwater}_2026-09-11.json`.
+The thread-count sweeps behind §2.1 are beside them as
+`calibration_<host>_2026-09-11.txt`.
 
 ---
 
@@ -286,6 +496,29 @@ controlled. Host A's blocked schedule prefers 6 threads and reaches
 1.18&times;–1.75&times; when allowed them on the four models where it helps at
 all; on Mur it still loses, 406 → 382. See §2.1 and the `+tblock default`
 column in §3.)
+
+The five hosts added later put the same comparison on a wider range of cache
+topologies, and split it in two. Flat → blocked at each host's pinned thread
+count, 224&sup3; PEC:
+
+| host | last-level cache | flat → blocked | | |
+|---|---|---|---|---|
+| C | 36 MB, one cache | 632 → 2607 | **4.13&times;** | |
+| G saturn | 9 MB, one cache | 225 → 303 | 1.35&times; | |
+| A | 8 MB, one cache | 475 → 497 | 1.05&times; | |
+| D compute5 | 4 &times; 16 MB | 440 → 513 | 1.17&times; | → **2.27&times;** corrected |
+| H tierwater | 2 &times; 15 MB | 514 → 365 | **0.71&times;** | → 1.11&times; corrected |
+| E loki | 2 &times; 22 MB | 1282 → 637 | **0.50&times;** | → 1.00&times; corrected |
+
+The first three rows are the story §5.4 already tells: gains scale with how big
+a tile the cache allows, and 8–9 MB is near the bottom of what pays. The last
+three are a different story, and the "corrected" column is the point — those
+are the same hosts with the tile width set by hand to the cache their threads
+actually have, and that is §5.7. Taken at face value the bottom two rows say
+temporal blocking is a 30–50% *regression* on a dual-socket server; corrected,
+they say it is roughly break-even there. Neither is the 3–4&times; of Host C,
+but the difference between "loses half your throughput" and "does nothing"
+matters, and only one of them is a property of the schedule.
 
 The 64&sup3; row is the schedule declining to engage, and saying so:
 
@@ -536,7 +769,7 @@ second Vulkan driver — ANV rather than RADV, which is how driver-specific
 assumptions get caught — and little more. Device selection already prefers the
 discrete GPU where one exists.
 
-### 5.4 CPU temporal blocking needs a large last-level cache
+### 5.4 CPU temporal blocking needs a large — and undivided — last-level cache
 
 On Host A's 8 MB L3, the schedule's gains collapse and one model regresses:
 
@@ -559,6 +792,13 @@ The schedule is opt-in (§5.5), so this costs nothing unless it is asked for.
 But it does mean the 3–4&times; figures in §4.2 should be read as a property of
 a 36 MB L3, not of the method: **check it on your own hardware before relying
 on it**, which is a two-command exercise (§7).
+
+saturn (Host G) is the same story on a 9 MB L3 and confirms it —
+k=3, W=7, 8.0 MB per tile, and 1.35&times; on 224&sup3; PEC. What it adds is
+that the floor is not as low as Host A suggested: at the same tile geometry
+saturn gains where Host A barely did, so "small cache" is not on its own a
+prediction. The variable this section names — *cache size* — turned out to be
+the wrong one, or at least an incomplete one. §5.7 names the other half.
 
 ### 5.5 Temporal blocking is opt-in, and capped by probe cadence
 
@@ -611,6 +851,133 @@ where it was already fine.
 Note what this means for reading §3: **comparing the two `default` columns
 measures the auto-tune as much as the engines.** That is why the pinned columns
 exist.
+
+On Hosts D–H the auto-tune is no longer uniformly the safer choice, and on the
+two biggest machines it is the *worse* one: loki's default reaches 992 MC/s on
+224&sup3; PEC against 1282 pinned, and tierwater's 422 against 514. Both are
+dual-socket, and the search scores thread counts without any notion of socket
+placement, so it settles on a count that a NUMA-aware placement would beat. In
+the other direction the 64&sup3; row on loki has the default at 1002 against
+370 pinned, because there the pinned count is the bad choice (§3). The honest
+summary is that on a dual-socket host neither column is reliably the one a user
+should expect; on the single-socket hosts D and G the default lands within
+0–5% of pinned, as it does on A and C.
+
+### 5.7 The blocking tile is sized from one cache, not from the cache the run has
+
+This is the largest defect these five hosts exposed, and it is worth up to
+**2&times;**.
+
+The tile width comes from `sysconf(_SC_LEVEL3_CACHE_SIZE)`
+(`FDTD/engine_avx2_multithread.cpp`), which reports the size of **one**
+last-level cache instance. On a machine whose LLC is a single shared cache —
+Hosts A, C and G — that is also the cache the whole run has, and the derived
+width is right. On a machine whose LLC is partitioned it is off by the number
+of partitions the threads span: a quarter of the truth on a Ryzen 3950X
+(4 CCXs), a half on any dual-socket server.
+
+The tile is divided across cores in x, so each core's slab lands in its own
+cache instance; the capacity a run has is the *sum* over the instances its
+threads occupy, not one of them. Sweeping the width by hand
+(`OPENEMS_AVX2_TEMPORAL_BLOCK=k:W`) against thread count says so directly —
+224&sup3; PEC, MC/s, single runs:
+
+| host | LLC the threads span | auto (derived) | best hand-set | |
+|---|---|---|---|---|
+| C, 8t | 36 MB &times; 1 | **2544** (35.6 MB) | 2160 (52.8 MB) | auto is best |
+| G saturn, 2t | 9 MB &times; 1 | **306** (8.0 MB) | 274 (18.4 MB) | auto is best |
+| G saturn, 6t | 9 MB &times; 1 | **335** (8.0 MB) | 252 (18.4 MB) | auto is best |
+| H tierwater, 6t — one socket | 15 MB &times; 1 | **363** (14.9 MB) | 326 (29.9 MB) | auto is best |
+| H tierwater, 12t — two sockets | 15 MB &times; 2 | 356 (14.9 MB) | **569** (44.8 MB) | **1.60&times;** |
+| D compute5, 4t — one CCX | 16 MB &times; 1 | **1133** (14.9 MB) | 600 (29.9 MB) | auto is best |
+| D compute5, 16t — four CCXs | 16 MB &times; 4 | 504 (14.9 MB) | **1000** (59.7 MB) | **1.99&times;** |
+| E loki, 16t — one socket | 22 MB &times; 1 | 983 (21.8 MB) | **1430** (43.6 MB) | **1.46&times;** |
+| E loki, 32t — two sockets | 22 MB &times; 2 | 636 (21.8 MB) | **1280** (59.7 MB) | **2.01&times;** |
+
+Every row where the thread set fits inside one cache instance picks the derived
+width, and every row where it spans several wants a wider one. tierwater makes
+the point without leaving the machine: the *same* binary on the *same* model
+has the derived width optimal at 6 threads on one socket and 60% short at
+12 threads across two.
+
+Two details keep this from being a one-line fix. The optimum tracks the
+aggregate capacity but not exactly — loki at 16 threads on a single 22 MB
+socket prefers a 43.6 MB tile, which is explained by Skylake-SP's
+**non-inclusive** L3 and 1 MB private L2 per core (16 &times; 1 + 22 ≈ 38 MB of
+real capacity, not 22), so the right quantity is aggregate capacity across the
+whole hierarchy the threads own, not the L3 line from `sysconf`. And the
+trapezoid's live set is smaller than *W* planes — it shrinks from *W* to
+*W*&nbsp;−&nbsp;2*k* as the tile advances — so the mapping from capacity to *W*
+already carries a fudge factor that these hosts show is not universal.
+
+**Until it is fixed, one environment variable recovers it per host.** Set the
+width explicitly to about (number of LLC instances the run spans) &times; the
+derived width:
+
+```bash
+OPENEMS_AVX2_TEMPORAL_BLOCK=16:52 openEMS model.xml --engine=avx2-multithreaded
+```
+
+Raw sweep output is `python/Tests/results/tile_width_sweep_2026-09-11.txt`.
+This is the CPU twin of §5.2, which is the same mistake on the GPU: a tile
+target that is a constant where it should be a property of the device and of
+how much of the device the run is using.
+
+### 5.8 The AVX2 engine has no runtime ISA guard — it does not fall back, it crashes
+
+maxwell (Host F) is a 2&times; Xeon E5-2630, Sandy Bridge: SSE4.2 and AVX, no
+AVX2 and no FMA. On it, **every** fork configuration in the matrix terminates
+with SIGILL — exit status 132 — including `--engine=fastest`, which is what a
+user gets by typing nothing:
+
+```
+$ openEMS model.xml
+...
+Create FDTD operator (AVX2 + FMA + multi-threading)
+Illegal instruction (core dumped)        # exit 132
+```
+
+It does not even reach the stepping loop: the default path dies in operator
+construction. Asked for `--engine=avx2` explicitly it gets one line further,
+printing `Create FDTD engine (AVX2 + FMA, compressed flat arrays)` and
+`Running FDTD engine...` before the same signal.
+
+The guard that exists (`987fcb7`) is `OPENEMS_ENABLE_AVX2`, set by CMake from
+`CMAKE_SYSTEM_PROCESSOR` and a `check_cxx_compiler_flag("-mavx2 -mfma")` probe.
+Both questions are about the **build** machine and its compiler, not about the
+machine that will run the binary. So the guard does what it was written for —
+it keeps `<immintrin.h>` out of an ARM build — and does nothing at all for the
+case that actually bites: an x86-64 binary built anywhere with a modern GCC and
+run on a pre-Haswell host. `openems.cpp` then makes AVX2-multithreaded the
+default engine unconditionally, and the `--engine=avx2` fallback message
+(`"AVX2+FMA engine is unavailable on this platform; using multithreaded
+engine"`) is inside `#if OPENEMS_ENABLE_AVX2 … #else`, so on this binary it is
+compiled out.
+
+This matters beyond one old server: it is every distribution package, every
+container image and every shared cluster filesystem — anywhere the build host
+and the run host are not the same machine.
+
+**The capability is not missing, only the dispatch.** Asking maxwell for the
+portable engine explicitly, on both builds, at 12 threads:
+
+| 224&sup3; model | upstream `multithreaded` | fork `multithreaded` | |
+|---|---|---|---|
+| PEC | 556 | 590 | 1.06&times; |
+| PML_8 | 228 | 226 | 0.99&times; |
+| Mur | 381 | 401 | 1.05&times; |
+
+So the fork is a small gain on this host, from the host-side work in
+[OPTIMIZATIONS.md](OPTIMIZATIONS.md) §1.1 and the thread auto-tune — it just
+cannot be reached without `--engine=multithreaded` on the command line. The fix
+is a runtime check (`__builtin_cpu_supports("avx2") && …("fma")`) at engine
+selection, falling back the way the compile-time path already does; that is a
+code change and has not been made here. Raw output:
+`python/Tests/results/maxwell_non_avx2_2026-09-11.txt`.
+
+**Practical guidance until then:** on any pre-Haswell x86 host, pass
+`--engine=multithreaded` explicitly, or build on that host so CMake's probe
+matches it.
 
 ---
 
@@ -672,6 +1039,51 @@ writes incrementally and skips configurations already present in the output
 file, so it can be interrupted and resumed. `--only <substring>` runs a single
 cell of the matrix.
 
+### 7.1 On a machine you cannot build on
+
+Hosts D–H had no openEMS dependencies and could not have any installed, and one
+of them is old enough (CentOS 7, glibc 2.17) that a binary from a current
+distribution will not start. Both builds therefore come out of one container
+and travel as a self-contained bundle:
+
+```bash
+# 1. build fork + upstream + every dependency inside a glibc-2.17 container.
+#    ~40 min from cold; stages are stamped, so a rerun resumes.
+python/Tests/build_portable_bench.sh            # -> ~/openems-portable/bundle
+
+# 2. copy the bundle to the target and run it there. Nothing is installed;
+#    the bundle only needs a glibc >= 2.17 x86-64 host.
+rsync -a ~/openems-portable/bundle/ target:openems-bench/
+ssh target 'cp -a ~/openems-bench /tmp/oebench && cd /tmp/oebench &&
+            ./run_portable_bench.sh calib 4:4:0-3 8:8:0-7 12:12:0-11 &&
+            ./run_portable_bench.sh matrix 12 0-11 0'
+```
+
+`run_portable_bench.sh calib <label>:<threads>:<cpulist> …` is the thread sweep
+behind §2.1 and prints upstream-MT, fork-AVX2 and fork-+tblock at each point;
+`matrix <threads> <pin_tuned> [pin_single]` then runs the full matrix with
+`--gpu none` and writes `results-<hostname>.json`. Staging to node-local disk
+matters if `$HOME` is on NFS, as it was here.
+
+The bundle is deliberately boring to verify: `ldd` on either binary should show
+only `libc`, `libm`, `libdl`, `libpthread` and the three project libraries, and
+
+```bash
+objdump -T bundle/fork/openEMS | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1
+```
+
+should print no more than the oldest target's glibc. Everything else — VTK,
+HDF5, CGAL, Boost, TinyXML, fparser, GMP, MPFR, libstdc++ — is linked in
+statically. GMP is built `--disable-assembly` on purpose: its configure script
+otherwise selects assembly for the *build* host's microarchitecture, which is
+exactly the portability bug this bundle exists to avoid.
+
+**The toolchain differs from Hosts A and C** (GCC 10.2.1 against 16.2.1),
+because glibc 2.17 constrains it. §2 shows that costs 0.98–1.04&times; in a
+paired test, with no systematic direction. If you repeat that control, pair the
+arms run by run — two matrix runs on different days measure the machine's
+afternoon, not the compiler.
+
 The raw output behind every table in this document is committed as
 `python/Tests/results/fork_vs_upstream_hostC_2026-09-07.json` and
 `python/Tests/results/fork_vs_upstream_hostA_2026-09-08.json`, including the
@@ -681,6 +1093,15 @@ taken on trust. Host A's first, independently built run is kept beside it as
 `fork_vs_upstream_hostA_2026-09-07.json` — the two are a full-matrix
 reproducibility check, not a duplicate. The previous single-host revision is
 preserved as `fork_vs_upstream_2026-09-05.json`.
+
+Hosts D–H are
+`fork_vs_upstream_{compute5,loki,maxwell,saturn,tierwater}_2026-09-11.json`,
+with `calibration_<host>_2026-09-11.txt` for the thread sweeps,
+`tile_width_sweep_2026-09-11.txt` for §5.7,
+`maxwell_non_avx2_2026-09-11.txt` for §5.8 and
+`toolchain_gcc16_vs_gcc10_2026-09-11.txt` for the toolchain control. The models
+themselves are committed as `python/Tests/models/*.xml`, so all seven hosts
+demonstrably ran the same bytes.
 
 Related drivers: `python/Tests/benchmark_avx2_engine.py`,
 `python/Tests/benchmark_gpu_engine.py` (`--gpu-index` selects the device),
@@ -718,6 +1139,31 @@ single-threaded in the run tabulated here, and 199 vs 146 in the repeat), on a
 completely different microarchitecture, which weakens any explanation specific
 to Raptor Lake.
 
+Hosts D–H weaken it further: the same bimodality appears on the 64&sup3;
+single-threaded rows of **maxwell** (100 / 100 / 100 / 78.5 / 99.6 / 81.7
+MC/s), **tierwater** (142 / 142 / 143 / 106 / 143 / 97.7) and **saturn**
+(128 / 166 / 160 / 166 / 160 / 142), and on saturn's `upstream default` row
+(266 among five repeats at 521–530). That is now five microarchitectures —
+Sandy Bridge, Haswell, Skylake, Coffee Lake, Raptor Lake — and it never
+appears on a DRAM-bound row on any of them. Whatever it is, it is a property of
+cache-resident FDTD work on x86 generally and not of any one part, which makes
+the uncore-clock hypothesis more plausible without confirming it. compute5
+(Zen 2) is the one exception: its 64&sup3; repeats are tight throughout.
+
+**A second, unrelated source of spread on the 64&sup3; row** shows up on the
+`default` columns of the dual-socket hosts, and should not be mistaken for the
+above: upstream's thread auto-tune lands somewhere different on each run.
+loki's six repeats of `upstream default` are 225 / 488 / 483 / 234 / 172 / 176
+MC/s and maxwell's are 204 / 222 / 156 / 124 / 112 / 66 — a 2.2&times; and
+3.4&times; spread, on the pinned-thread-count *sibling* of a row that is stable
+to a percent. That is a search converging to different thread counts on a
+cache-resident grid where the right count is small and the penalty for
+overshooting is large, and it is the same weakness §5.6 describes; it is
+visible here rather than there because the 64&sup3; grid punishes it hardest.
+The fork's search is not immune on these hosts either — tierwater's
+`fork tblock default` repeats spread 252–358 — but it is consistently
+narrower.
+
 What matters for reading this document is the scope, and that *is* established:
 only the cache-resident grid is affected. Every DRAM-bound configuration is
 stable to **0.5–4%** across repeats — visible directly in the committed JSON,
@@ -736,6 +1182,23 @@ that noise compounds with the bimodality above: its 8-thread repeats spread
 491–512 MC/s in the run tabulated here and 380–512 in the repeat, which is why
 that row moved 1.4% between the two while every other row moved under 0.8%.
 Nothing in §1 or §5 turns on it.
+
+**Hosts D–H were idle**, which is the one thing that makes them easier to read
+than Hosts A and C. All five are servers with no desktop session; load average
+was 0.00–0.19 before each run started, they ran one matrix at a time, and the
+binaries were staged to node-local disk so that no NFS traffic could land in a
+measurement. loki had other users logged in but none of them running anything.
+
+**Do not compare a matrix run on one day against one on another to answer a
+build question.** That was tried here — the portable bundle against the
+2026-09-07 Host C run, to check the compiler — and it produced a confident,
+entirely spurious 15–29% deficit on the PEC rows, because the workstation was
+busy that afternoon and the PEC rows are the most bandwidth-sensitive in the
+matrix. The PML and Mur rows of the same comparison agreed to 2–5%, which is
+exactly how such an artefact looks when it is not recognised: partly
+consistent. The paired alternating test in §2 put the same two builds within
+0.98–1.04&times;. The general lesson is the one already implicit in §2.1's
+pinning: when the question is about the binary, vary only the binary.
 
 **Never A/B a GPU change by disabling the excitation.** With no source the
 fields stay exactly zero, and an all-zero grid runs ~28% faster than the

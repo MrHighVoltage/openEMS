@@ -1,0 +1,7 @@
+# thread-count calibration, 224^3 PEC, 600 timesteps, MCells/s (best of 1)
+host           point    cpus         upstream-mt  fork-avx2 fork-tblock
+compute5       4        0-3              422.79     436.45    1131.56
+compute5       8        0-7              410.19     424.40     583.69
+compute5       12       0-11             423.83     440.85     569.82
+compute5       16       0-15             422.30     439.48     520.02
+compute5       smt      0-31             372.20     391.83     446.74

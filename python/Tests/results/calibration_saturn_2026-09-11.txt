@@ -1,0 +1,5 @@
+# thread-count calibration, 224^3 PEC, 600 timesteps, MCells/s (best of 1)
+host           point    cpus         upstream-mt  fork-avx2 fork-tblock
+saturn         2        0-1              207.33     225.03     303.55
+saturn         4        0-3              200.97     210.77     315.58
+saturn         6        0-5              180.44     190.24     337.48

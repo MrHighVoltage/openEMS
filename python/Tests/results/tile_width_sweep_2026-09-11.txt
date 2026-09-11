@@ -1,0 +1,52 @@
+# Temporal-blocking tile width vs thread count, 224^3 PEC, 600 timesteps, MCells/s.
+# 'auto'/16 derives the width from sysconf(_SC_LEVEL3_CACHE_SIZE); k:W sets both by hand.
+
+## hostC
+8t       16          2543.83  k=15, tile width 31 x-lines, 35.6016 MB per tile
+8t       16:20       2131.83  k=10, tile width 20 x-lines, 22.9688 MB per tile
+8t       16:46       2160.32  k=16, tile width 46 x-lines, 52.8281 MB per tile
+8t       16:62       1348.83  k=16, tile width 62 x-lines, 71.2031 MB per tile
+
+## compute5
+auto      4t    1133.19  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
+auto     16t     503.71  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
+16:26     4t     599.92  AVX2 temporal blocking ACTIVE (prototype): k=13, tile width 26 x-lines, 29.8594 MB per til
+16:26    16t     706.71  AVX2 temporal blocking ACTIVE (prototype): k=13, tile width 26 x-lines, 29.8594 MB per til
+16:39     4t     494.81  AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 39 x-lines, 44.7891 MB per til
+16:39    16t     919.97  AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 39 x-lines, 44.7891 MB per til
+16:52     4t     453.56  AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 52 x-lines, 59.7188 MB per til
+16:52    16t    1000.04  AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 52 x-lines, 59.7188 MB per til
+8:52      4t     499.84  AVX2 temporal blocking ACTIVE (prototype): k=8, tile width 52 x-lines, 59.7188 MB per tile
+8:52     16t     974.38  AVX2 temporal blocking ACTIVE (prototype): k=8, tile width 52 x-lines, 59.7188 MB per tile
+6:13      4t    1125.52  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
+6:13     16t     491.56  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
+
+## loki
+0-7 (8t)     16             984.68  k=9, tile width 19 x-lines, 21.8203 MB per tile
+0-7 (8t)     16:29         1113.81  k=14, tile width 29 x-lines, 33.3047 MB per tile
+0-7 (8t)     16:38         1117.43  k=16, tile width 38 x-lines, 43.6406 MB per tile
+0-7 (8t)     16:52          987.11  k=16, tile width 52 x-lines, 59.7188 MB per tile
+0-15 (16t)   16             983.04  k=9, tile width 19 x-lines, 21.8203 MB per tile
+0-15 (16t)   16:29         1310.68  k=14, tile width 29 x-lines, 33.3047 MB per tile
+0-15 (16t)   16:38         1430.20  k=16, tile width 38 x-lines, 43.6406 MB per tile
+0-15 (16t)   16:52         1117.32  k=16, tile width 52 x-lines, 59.7188 MB per tile
+0-31 (32t)   16             635.67  k=9, tile width 19 x-lines, 21.8203 MB per tile
+0-31 (32t)   16:29          847.76  k=14, tile width 29 x-lines, 33.3047 MB per tile
+0-31 (32t)   16:38         1025.37  k=16, tile width 38 x-lines, 43.6406 MB per tile
+0-31 (32t)   16:52         1280.28  k=16, tile width 52 x-lines, 59.7188 MB per tile
+
+## tierwater
+0-5 (6t)     16             363.08  k=6, tile width 13 x-lines, 14.9297 MB per tile
+0-5 (6t)     16:26          326.13  k=13, tile width 26 x-lines, 29.8594 MB per tile
+0-5 (6t)     16:39          305.17  k=16, tile width 39 x-lines, 44.7891 MB per tile
+0-11 (12t)   16             356.49  k=6, tile width 13 x-lines, 14.9297 MB per tile
+0-11 (12t)   16:26          544.73  k=13, tile width 26 x-lines, 29.8594 MB per tile
+0-11 (12t)   16:39          568.73  k=16, tile width 39 x-lines, 44.7891 MB per tile
+
+## saturn
+0-1 (2t)     16             306.43  k=3, tile width 7 x-lines, 8.03906 MB per tile
+0-1 (2t)     16:16          273.80  k=8, tile width 16 x-lines, 18.375 MB per tile
+0-1 (2t)     16:26          243.88  k=13, tile width 26 x-lines, 29.8594 MB per tile
+0-5 (6t)     16             335.25  k=3, tile width 7 x-lines, 8.03906 MB per tile
+0-5 (6t)     16:16          251.77  k=8, tile width 16 x-lines, 18.375 MB per tile
+0-5 (6t)     16:26          209.00  k=13, tile width 26 x-lines, 29.8594 MB per tile

@@ -106,7 +106,10 @@ def run_once(build, xml, engine, env_extra=None, num_threads=0, cpus=None,
         t0 = time.time()
         proc = subprocess.run(cmd, cwd=cwd, env=env, timeout=timeout,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True)
+                              # universal_newlines, not text=: the remote hosts
+                              # this matrix also runs on ship Python 3.6, where
+                              # text= does not exist yet.
+                              universal_newlines=True)
         wall = time.time() - t0
 
     out = proc.stdout

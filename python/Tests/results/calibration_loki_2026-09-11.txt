@@ -1,0 +1,8 @@
+# thread-count calibration, 224^3 PEC, 600 timesteps, MCells/s (best of 1)
+host           point    cpus         upstream-mt  fork-avx2 fork-tblock
+loki           4        0-3              558.65     706.98     769.21
+loki           8        0-7              855.92     952.35     989.13
+loki           16s0     0-15             856.06     934.54     985.74
+loki           16sp     0-7,16-23        929.43    1048.11     741.85
+loki           32       0-31            1006.35    1143.74     619.80
+loki           smt      0-63             613.82     911.98     425.44
