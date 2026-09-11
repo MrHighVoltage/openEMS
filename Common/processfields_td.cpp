@@ -20,6 +20,8 @@
 #include "Common/operator_base.h"
 #include "tools/vtk_file_writer.h"
 #include "tools/hdf5_file_writer.h"
+#include <algorithm>
+#include <cstdlib>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -30,6 +32,9 @@ ProcessFieldsTD::ProcessFieldsTD(Engine_Interface_Base* eng_if) : ProcessFields(
 {
 	pad_length = 8;
 	m_asyncBuffers = 4;
+	// A/B gate: OPENEMS_ASYNC_DUMP_BUFFERS=0 falls back to synchronous writes.
+	if (const char* env = std::getenv("OPENEMS_ASYNC_DUMP_BUFFERS"))
+		m_asyncBuffers = (unsigned int)std::max(0, atoi(env));
 	m_AsyncWriter = NULL;
 }
 
