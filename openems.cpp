@@ -793,8 +793,29 @@ void openEMS::SetupCylinderMultiGrid(std::string val)
 	m_CC_MultiGrid = SplitString2Double(val,',');
 }
 
+#if OPENEMS_ENABLE_AVX2
+// OPENEMS_ENABLE_AVX2 only says the build machine could compile the AVX2 engine;
+// check the run host too. __builtin_cpu_supports also requires OS YMM support
+// (OSXSAVE/XGETBV). OPENEMS_FORCE_NO_AVX2=1 pretends the CPU lacks AVX2 (testing).
+static bool CPU_Supports_AVX2_FMA()
+{
+	const char* envNoAVX2 = std::getenv("OPENEMS_FORCE_NO_AVX2");
+	if (envNoAVX2 && envNoAVX2[0] && std::string(envNoAVX2) != "0")
+		return false;
+	__builtin_cpu_init();
+	return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+}
+#endif
+
 bool openEMS::SetupOperator()
 {
+#if OPENEMS_ENABLE_AVX2
+	if (((m_engine == EngineType_AVX2) || (m_engine == EngineType_AVX2_Multithreaded)) && !CPU_Supports_AVX2_FMA())
+	{
+		cerr << "openEMS - AVX2+FMA engine is unsupported by this CPU; using multithreaded engine" << endl;
+		m_engine = EngineType_Multithreaded;
+	}
+#endif
 	if (CylinderCoords)
 	{
 		if (m_CC_MultiGrid.size()>0)

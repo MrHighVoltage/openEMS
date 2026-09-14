@@ -70,7 +70,7 @@ usually its SSE multithreaded engine at a hand-picked thread count.
 | `63b2e49`, `4e6530c` | **`Operator_Vulkan` / `Engine_Vulkan`**: coefficient compression into compact `opIdx` + `vv`/`vi`/`ii`/`iv` tables, double-buffered command submission, ReBAR support, pre-recorded multi-timestep command buffers | **6.1×–39.0×** on an RX 6800 with temporal blocking (i9-13900K). On the i7-6700K's integrated HD 530, **0.85×–1.61×** — below upstream on cache-resident PEC grids, above it on PML and Mur, where it is the fastest engine in that machine |
 | `28f65db` | boost → C++17: `std::thread`/`std::jthread`, a `std::mutex`/`condition_variable` barrier (`tools/barrier.h`), a lightweight option parser. Drops the boost dependency | Not a throughput change; it is what the AVX2 multithread engine's barrier and thread control are built on |
 | `84551fe` | The regression `28f65db` caused: the worker loop tested `m_stopThreads` at the top, so a worker could wake from `m_stopBarrier`, observe the flag set by `Reset()`/`changeNumThreads()`, and exit without ever arriving at `m_startBarrier` — leaving the controller waiting forever for `m_numThreads+1` arrivals. `boost::thread_group::interrupt_all()` had unblocked workers wherever they were, so the barrier was never a shutdown path before | Hit in CI whenever thread auto-tuning called `changeNumThreads()`; reproduced 5/8 runs pinned to 2 cores, 0/8 after the fix |
-| `987fcb7` | AVX2 dispatch made architecture-aware **at compile time**, so a non-x86 build never parses `<immintrin.h>` and never selects the AVX2 engine. It does **not** guard the run host: the test is on `CMAKE_SYSTEM_PROCESSOR` and the compiler, so an x86-64 binary still selects AVX2 on a pre-AVX2 CPU and dies with SIGILL. Measured on the 2× Xeon E5-2630 — §4.8, PERFORMANCE.md §6 | Correctness of engine selection for cross-*architecture* builds only |
+| `987fcb7` | AVX2 dispatch made architecture-aware **at compile time**, so a non-x86 build never parses `<immintrin.h>` and never selects the AVX2 engine. It does **not** guard the run host: the test is on `CMAKE_SYSTEM_PROCESSOR` and the compiler, so an x86-64 binary still selects AVX2 on a pre-AVX2 CPU and dies with SIGILL. Measured on the 2× Xeon E5-2630 — §4.8, PERFORMANCE.md §6. A runtime CPU check added later closes this | Correctness of engine selection for cross-*architecture* builds only |
 
 **GPU extension coverage is a performance property, not a feature checkbox.**
 An extension without a shader has to run on the CPU, which means draining the
@@ -1062,7 +1062,10 @@ The 2× Xeon E5-2630 is that host and all 30 fork rows of its matrix crash. The 
 branch carrying the "AVX2+FMA engine is unavailable on this platform; using
 multithreaded engine" fallback is compiled out in exactly the builds that need
 it. A runtime `__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")`
-at engine selection is the fix; it has not been made. PERFORMANCE.md §6.
+at engine selection is the fix, and `openEMS::SetupOperator()` now makes it: an
+AVX2 engine, default or explicit, falls back to the multithreaded engine with a
+one-line warning (`OPENEMS_FORCE_NO_AVX2=1` exercises the path on AVX2 hosts).
+Not yet re-run on the E5-2630. PERFORMANCE.md §6.
 
 ---
 

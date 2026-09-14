@@ -99,6 +99,8 @@ This is the one-page answer. §2 onward is the detail and the method.
   `--engine=fastest` (the default). Every fork AVX2 row on the 2× Xeon E5-2630
   host is absent for this reason. The capability is not missing, only the
   dispatch: `--engine=multithreaded` runs fine there and is a small win (§6).
+  A runtime CPU check now falls back to that engine with a warning instead;
+  the matrix below predates it.
 - **Thread auto-tune on dual-socket hosts is unreliable in both directions.**
   It scores thread counts without any notion of socket placement, so it can land
   below the pinned optimum (the 2× Xeon Gold 6130's default reaches 992 MC/s
@@ -1018,8 +1020,10 @@ So the fork is a small gain on this host, from the host-side work in
 [OPTIMIZATIONS.md](OPTIMIZATIONS.md) §1.1 and the thread auto-tune — it just
 cannot be reached without `--engine=multithreaded` on the command line. The fix
 is a runtime check (`__builtin_cpu_supports("avx2") && …("fma")`) at engine
-selection, falling back the way the compile-time path already does; that is a
-code change and has not been made here. Raw output:
+selection, falling back the way the compile-time path already does. That check
+now exists in `openEMS::SetupOperator()` (`OPENEMS_FORCE_NO_AVX2=1` simulates a
+pre-AVX2 CPU); the measurements above predate it and have not been re-run on
+this host. Raw output:
 `python/Tests/results/e5-2630_non_avx2_2026-09-11.txt`.
 
 **Practical guidance until then:** on any pre-Haswell x86 host, pass
