@@ -1,0 +1,8 @@
+# thread-count calibration, 224^3 PEC, 600 timesteps, MCells/s (best of 1)
+host           point    cpus         upstream-mt  fork-avx2 fork-tblock
+ryzen5-5600g   t1       0                271.24     415.61     532.35
+ryzen5-5600g   t2       0-1              405.50     474.24     797.67
+ryzen5-5600g   t4       0-3              424.11     427.14    1056.42
+ryzen5-5600g   t6       0-5              373.06     388.17    1150.81
+ryzen5-5600g   t8       0-7              351.23     367.20    1079.74
+ryzen5-5600g   t12      0-11             307.38     326.50    1084.74

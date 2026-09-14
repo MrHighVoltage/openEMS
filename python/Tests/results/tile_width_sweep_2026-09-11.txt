@@ -1,13 +1,13 @@
 # Temporal-blocking tile width vs thread count, 224^3 PEC, 600 timesteps, MCells/s.
 # 'auto'/16 derives the width from sysconf(_SC_LEVEL3_CACHE_SIZE); k:W sets both by hand.
 
-## hostC
+## 13900K
 8t       16          2543.83  k=15, tile width 31 x-lines, 35.6016 MB per tile
 8t       16:20       2131.83  k=10, tile width 20 x-lines, 22.9688 MB per tile
 8t       16:46       2160.32  k=16, tile width 46 x-lines, 52.8281 MB per tile
 8t       16:62       1348.83  k=16, tile width 62 x-lines, 71.2031 MB per tile
 
-## compute5
+## 3950X
 auto      4t    1133.19  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
 auto     16t     503.71  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
 16:26     4t     599.92  AVX2 temporal blocking ACTIVE (prototype): k=13, tile width 26 x-lines, 29.8594 MB per til
@@ -21,7 +21,7 @@ auto     16t     503.71  AVX2 temporal blocking ACTIVE (prototype): k=6, tile wi
 6:13      4t    1125.52  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
 6:13     16t     491.56  AVX2 temporal blocking ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB per tile
 
-## loki
+## Gold6130
 0-7 (8t)     16             984.68  k=9, tile width 19 x-lines, 21.8203 MB per tile
 0-7 (8t)     16:29         1113.81  k=14, tile width 29 x-lines, 33.3047 MB per tile
 0-7 (8t)     16:38         1117.43  k=16, tile width 38 x-lines, 43.6406 MB per tile
@@ -35,7 +35,7 @@ auto     16t     503.71  AVX2 temporal blocking ACTIVE (prototype): k=6, tile wi
 0-31 (32t)   16:38         1025.37  k=16, tile width 38 x-lines, 43.6406 MB per tile
 0-31 (32t)   16:52         1280.28  k=16, tile width 52 x-lines, 59.7188 MB per tile
 
-## tierwater
+## E5-2620v3
 0-5 (6t)     16             363.08  k=6, tile width 13 x-lines, 14.9297 MB per tile
 0-5 (6t)     16:26          326.13  k=13, tile width 26 x-lines, 29.8594 MB per tile
 0-5 (6t)     16:39          305.17  k=16, tile width 39 x-lines, 44.7891 MB per tile
@@ -43,7 +43,7 @@ auto     16t     503.71  AVX2 temporal blocking ACTIVE (prototype): k=6, tile wi
 0-11 (12t)   16:26          544.73  k=13, tile width 26 x-lines, 29.8594 MB per tile
 0-11 (12t)   16:39          568.73  k=16, tile width 39 x-lines, 44.7891 MB per tile
 
-## saturn
+## i5-8500
 0-1 (2t)     16             306.43  k=3, tile width 7 x-lines, 8.03906 MB per tile
 0-1 (2t)     16:16          273.80  k=8, tile width 16 x-lines, 18.375 MB per tile
 0-1 (2t)     16:26          243.88  k=13, tile width 26 x-lines, 29.8594 MB per tile

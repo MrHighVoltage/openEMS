@@ -1,4 +1,4 @@
-# Paired toolchain control on Host C: native GCC 16 build vs the portable GCC 10
+# Paired toolchain control on the i9-13900K: native GCC 16 build vs the portable GCC 10
 # bundle, arms alternating run by run, best of 2. 224^3/160x128x192, MCells/s.
 model                      config                    gcc16      gcc10    ratio
 224x224x224_pec            sse 1t                   234.52     234.32    0.999

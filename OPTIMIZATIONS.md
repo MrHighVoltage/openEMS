@@ -10,36 +10,32 @@ share with every other engine: field dumping, probe readback and operator
 construction. The SSE and basic engines are out of scope as *engines*, but
 they benefit from everything in §1.1.
 
-Measurements come from three hosts here — plus five more used only for the
+Measurements come from two workstations here — plus five more used only for the
 fork-vs-upstream matrix, listed at the end — and are not comparable across
 them:
 
-- **Host A** — i7-6700K, 4 cores / 8 threads (SMT2), 8 MB L3, dual-channel
-  DDR4. Practical STREAM-Triad ceiling ~29 GB/s. Everything in §1's AVX2 table
-  was measured here. It was believed lost when §4 was written; it is a remote
-  server, it is still available, and it also carries an integrated
-  **Intel HD Graphics 530** (Skylake GT2, ANV). Re-measured 2026-09-08 —
-  see [PERFORMANCE.md](PERFORMANCE.md), where it is the second host and where
-  its small L3 is what shows which §4 conclusions are properties of the code
-  and which are properties of a 36 MB cache.
-- **Host B (historic, GPU)** — Radeon RX 6800, 512 GB/s peak, 128 MB Infinity
-  Cache, **256 MB BAR** (no resizable BAR). Everything in §1's GPU table was
-  measured here.
-- **Host C (current, 2026-09-04)** — i9-13900K (8 P-cores + 16 E-cores,
-  32 threads), 32 GB dual-channel DDR5, STREAM-Triad ceiling **~49 GB/s** at
-  6–8 threads. Two GPUs: the same **Radeon RX 6800** — still a 256 MB BAR,
-  still no resizable BAR, so `fbd95a6` is load-bearing here too — and an
-  integrated **Intel UHD 770**. Mesa 26.2.1, RADV and ANV. §4 re-verifies
-  everything here.
-- **Hosts D–H (2026-09-11, CPU only)** — compute5 (Ryzen 9 3950X, 16C, 4×16 MB
-  L3), loki (2× Xeon Gold 6130, 32C, 2×22 MB), maxwell (2× Xeon E5-2630,
-  Sandy Bridge, 12C, **no AVX2**), saturn (i5-8500, 6C, 9 MB, CentOS 7),
-  tierwater (2× Xeon E5-2620 v3, 12C, 2×15 MB). Servers with no Vulkan driver
-  and no openEMS dependencies, benchmarked from a self-contained bundle built
-  in a glibc-2.17 container (`python/Tests/build_portable_bench.sh`). They are
-  not used for any tuning decision in this document, but two of its
-  assumptions do not survive them — see §4.8 and
-  [PERFORMANCE.md](PERFORMANCE.md) §5.7–§5.8.
+- **i7-6700K** — 4 cores / 8 threads (SMT2), 8 MB L3, dual-channel DDR4.
+  Practical STREAM-Triad ceiling ~29 GB/s. Everything in §1's AVX2 table was
+  measured here. It was believed lost when §4 was written; it is a remote
+  server, it is still available, and it also carries an integrated **Intel HD
+  Graphics 530** (Skylake GT2, ANV). Re-measured 2026-09-08 — see
+  [PERFORMANCE.md](PERFORMANCE.md), where its small L3 is what shows which §4
+  conclusions are properties of the code and which are properties of a 36 MB
+  cache.
+- **i9-13900K** (2026-09-04) — 8 P-cores + 16 E-cores, 32 threads, 32 GB
+  dual-channel DDR5, STREAM-Triad ceiling **~49 GB/s** at 6–8 threads. Two
+  GPUs: **Radeon RX 6800**, 512 GB/s peak, 128 MB Infinity Cache, **256 MB
+  BAR** (no resizable BAR, so `fbd95a6` is load-bearing here), and an integrated
+  **Intel UHD 770**. Mesa 26.2.1, RADV and ANV. Everything in §1's GPU table
+  and all of §4 were measured here.
+- **The five servers** (2026-09-11, CPU only) — Ryzen 9 3950X (16C, 4×16 MB
+  L3), 2× Xeon Gold 6130 (32C, 2×22 MB), 2× Xeon E5-2630 (Sandy Bridge, 12C,
+  **no AVX2**), Core i5-8500 (6C, 9 MB, CentOS 7), 2× Xeon E5-2620 v3 (12C,
+  2×15 MB). Servers with no Vulkan driver and no openEMS dependencies,
+  benchmarked from a self-contained bundle built in a glibc-2.17 container
+  (`python/Tests/build_portable_bench.sh`). They are not used for any tuning
+  decision in this document, but two of its assumptions do not survive them —
+  see §4.8 and [PERFORMANCE.md](PERFORMANCE.md) §5.3 and §6.
 
 Benchmark drivers: `python/Tests/benchmark_avx2_engine.py`,
 `python/Tests/benchmark_field_dump.py` (dump-path A/B, see §1.0),
@@ -65,16 +61,16 @@ The two engines this fork adds are the largest optimization in it. Everything
 else in this document tunes them; this entry is what they are worth against a
 from-scratch build of upstream on the same machine, with the same compiler and
 the same models. Full matrix and method in [PERFORMANCE.md](PERFORMANCE.md)
-§1–§3; "upstream best" there is the fastest of three upstream configurations,
+§1–§8; "upstream best" there is the fastest of three upstream configurations,
 usually its SSE multithreaded engine at a hand-picked thread count.
 
 | Commit | Change | Measured against upstream's best |
 |---|---|---|
-| `7effdfb`, `4e6530c` | **`Operator_AVX2` / `Engine_AVX2`** and `_Multithread`: 256-bit AVX2+FMA with an interleaved z-layout (8 z-cells per vector) and `std::map` operator deduplication | Single-threaded against upstream's SSE engine, where the width shows directly: **1.31×–2.04×** on Host C, **1.65×–2.59×** on Host A, lowest on PML where the passes vectorize least well. Multithreaded against upstream's best: **0.90×–1.72×** flat on Host C — it loses on PML, PERFORMANCE.md §5.1 — and **1.70×–4.45×** with temporal blocking |
-| `63b2e49`, `4e6530c` | **`Operator_Vulkan` / `Engine_Vulkan`**: coefficient compression into compact `opIdx` + `vv`/`vi`/`ii`/`iv` tables, double-buffered command submission, ReBAR support, pre-recorded multi-timestep command buffers | **6.1×–39.0×** on an RX 6800 with temporal blocking (Host C). On Host A's integrated HD 530, **0.85×–1.61×** — below upstream on cache-resident PEC grids, above it on PML and Mur, where it is the fastest engine in that machine |
+| `7effdfb`, `4e6530c` | **`Operator_AVX2` / `Engine_AVX2`** and `_Multithread`: 256-bit AVX2+FMA with an interleaved z-layout (8 z-cells per vector) and `std::map` operator deduplication | Single-threaded against upstream's SSE engine, where the width shows directly: **1.31×–2.04×** on the i9-13900K, **1.65×–2.59×** on the i7-6700K, lowest on PML where the passes vectorize least well. Multithreaded against upstream's best: **0.90×–1.72×** flat on the i9-13900K — it loses on PML, PERFORMANCE.md §3.4 — and **1.70×–4.45×** with temporal blocking |
+| `63b2e49`, `4e6530c` | **`Operator_Vulkan` / `Engine_Vulkan`**: coefficient compression into compact `opIdx` + `vv`/`vi`/`ii`/`iv` tables, double-buffered command submission, ReBAR support, pre-recorded multi-timestep command buffers | **6.1×–39.0×** on an RX 6800 with temporal blocking (i9-13900K). On the i7-6700K's integrated HD 530, **0.85×–1.61×** — below upstream on cache-resident PEC grids, above it on PML and Mur, where it is the fastest engine in that machine |
 | `28f65db` | boost → C++17: `std::thread`/`std::jthread`, a `std::mutex`/`condition_variable` barrier (`tools/barrier.h`), a lightweight option parser. Drops the boost dependency | Not a throughput change; it is what the AVX2 multithread engine's barrier and thread control are built on |
 | `84551fe` | The regression `28f65db` caused: the worker loop tested `m_stopThreads` at the top, so a worker could wake from `m_stopBarrier`, observe the flag set by `Reset()`/`changeNumThreads()`, and exit without ever arriving at `m_startBarrier` — leaving the controller waiting forever for `m_numThreads+1` arrivals. `boost::thread_group::interrupt_all()` had unblocked workers wherever they were, so the barrier was never a shutdown path before | Hit in CI whenever thread auto-tuning called `changeNumThreads()`; reproduced 5/8 runs pinned to 2 cores, 0/8 after the fix |
-| `987fcb7` | AVX2 dispatch made architecture-aware **at compile time**, so a non-x86 build never parses `<immintrin.h>` and never selects the AVX2 engine. It does **not** guard the run host: the test is on `CMAKE_SYSTEM_PROCESSOR` and the compiler, so an x86-64 binary still selects AVX2 on a pre-AVX2 CPU and dies with SIGILL. Measured on maxwell — §4.8, PERFORMANCE.md §5.8 | Correctness of engine selection for cross-*architecture* builds only |
+| `987fcb7` | AVX2 dispatch made architecture-aware **at compile time**, so a non-x86 build never parses `<immintrin.h>` and never selects the AVX2 engine. It does **not** guard the run host: the test is on `CMAKE_SYSTEM_PROCESSOR` and the compiler, so an x86-64 binary still selects AVX2 on a pre-AVX2 CPU and dies with SIGILL. Measured on the 2× Xeon E5-2630 — §4.8, PERFORMANCE.md §6 | Correctness of engine selection for cross-*architecture* builds only |
 
 **GPU extension coverage is a performance property, not a feature checkbox.**
 An extension without a shader has to run on the CPU, which means draining the
@@ -90,7 +86,7 @@ gather and energy reduction (`FDTD/gpu/shaders/`).
 | `fb2049c` | **Local absorbing sheets on the GPU.** All localized first-order Mur phases as sparse surface dispatches with device-resident coefficients and E/H history, covering both the voltage-only `MUR_1ST` form and the current-side super-absorption of `MUR_1ST_SA`, including on the fused UPML path. `OPENEMS_GPU_CPU_LOCAL_ABC` keeps the CPU path for native-vs-hybrid validation | **7165 MC/s native vs 0.34 MC/s hybrid** — see below |
 | `ed6f590` | **Steady-state detection as a GPU observer** rather than a CPU extension — electric probes sampled into a three-period coherent history ring after each voltage phase, convergence evaluated only when the control path asks for it | Enablement: as a CPU extension it defeats GPU batching entirely |
 
-**What a missing shader costs** (Host C, RX 6800, 2026-09-08).
+**What a missing shader costs** (the i9-13900K, RX 6800, 2026-09-08).
 `python/Tests/benchmark_gpu_engine.py --local-abc mur`, A/B through
 `OPENEMS_GPU_CPU_LOCAL_ABC=1`, which is the only extension with a switchable
 CPU path:
@@ -129,7 +125,7 @@ the field, open the HDF5 file, write, close, resume stepping.
 | `586a8ac` | The AVX2 engine's missing fast extraction path, so AVX2 reaches the template path above rather than the fallback | 336 → 426 MC/s, dump every timestep — also in the AVX2 table below |
 | `7364d69` | **Global HDF5 mutex.** Not an optimization but the price of one: libhdf5 as distributions ship it is not thread-safe, so the writer thread racing the main thread could corrupt file state. Every HDF5 C API call now goes through one process-wide recursive mutex | Correctness. It also caps what the async writer can ever be worth: two HDF5 users never overlap |
 
-**The async writer measurement** (Host C, 2026-09-08). Fixture:
+**The async writer measurement** (the i9-13900K, 2026-09-08). Fixture:
 `python/Tests/benchmark_field_dump.py`, 128³ = 2.1 M cells,
 `avx2-multithreaded`, 200 timesteps, full-domain E dump on *every* timestep
 (25 MB per dump, 5.06 GB per run) to ext4 on NVMe. A/B through the
@@ -160,7 +156,7 @@ drain and a PCIe download every few seconds.
 
 | Commit | Change | Measured |
 |---|---|---|
-| `41afbf5`, `3df17eb` | **Energy reduction on the GPU** (`reduce_energy.comp`). `CalcTotalEnergyEstimate()` used to scan all `3·Nx·Ny·Nz` floats — ~650 MB at 27 M cells — over the BAR aperture with random access. Now 256 workgroups reduce in shared memory and the CPU sums 256 partial pairs | **~300 ms → ~1 ms** per energy evaluation (Host B) |
+| `41afbf5`, `3df17eb` | **Energy reduction on the GPU** (`reduce_energy.comp`). `CalcTotalEnergyEstimate()` used to scan all `3·Nx·Ny·Nz` floats — ~650 MB at 27 M cells — over the BAR aperture with random access. Now 256 workgroups reduce in shared memory and the CPU sums 256 partial pairs | **~300 ms → ~1 ms** per energy evaluation (i9-13900K) |
 | `3df17eb` | **Probe cache and gather shader.** Probe cell accesses are recorded during the first `PA->Process()`, deduplicated, and thereafter gathered on-GPU into a small buffer, so a line integral no longer drains the queue and downloads the field | Structural; the end-to-end effect is in the pipelined loop below |
 | `3df17eb` | **Fused UPML + Yee dispatches**, per-region PML buffers concatenated into shared allocations. 28 dispatches + 7 barriers per timestep become 2 + 2 | **1.53×–1.65×** on PML models, see below. The design estimate at the time was 1.3–1.5×, so it was, unusually, an underestimate |
 | `3df17eb` | **Pipelined main loop with speculative submission** in `RunFDTD()`: the GPU computes timestep N+1 while the CPU processes N out of the probe cache. Falls back to the sequential loop when the preconditions do not hold | Design estimate ~40× at the 2.5%-utilization starting point; the honest end-to-end number is the fork-vs-upstream matrix in [PERFORMANCE.md](PERFORMANCE.md) |
@@ -170,7 +166,7 @@ drain and a PCIe download every few seconds.
 | `66aca92` | Command-ring handling, a dedicated transfer queue for probe readback with per-slot sync, compute barriers tightened to the extensions actually dispatched, optional phase-level GPU timestamp profiling | Not separately quantified; the profiling hooks are what later measurements used |
 | `55c9375`, `52730d3` | Device-side finite-value validation with stage/trace reporting; field sync before CPU extraction; UPML region packing that accounts for all three components; validation of compressed/UPML/excitation data at upload | Correctness. `validate_fields.comp` is why numerical failures stop the run instead of producing plausible garbage |
 
-**The fused-UPML measurement** (Host C, RX 6800, 2026-09-08).
+**The fused-UPML measurement** (the i9-13900K, RX 6800, 2026-09-08).
 `python/Tests/benchmark_gpu_engine.py --boundary pml`,
 A/B through `OPENEMS_GPU_DISABLE_FUSED_UPML=1`, no probes and no temporal
 blocking, so the sequential main loop is on both arms and only the dispatch
@@ -208,11 +204,11 @@ The fusion and pipelining design is in
 
 | Commit | Change | Measured |
 |---|---|---|
-| `d9b00bb` | **Parallel operator coefficient preparation.** Coefficient generation is split into x-ranges and run on the SSE/AVX2 operators' existing worker threads, with flat coefficient indices computed directly so workers never race through the stateful `AdrOp` cursor. The Vulkan operator gets the same range parallelism, and its serial ordered-map compression pass is replaced with exact-bit sharded hash tables plus parallel table packing — same coefficient identity, far less startup contention | **8.2 s → 5.6 s** (Host C, 224³ PML_8) and **17.3 s → 14.3 s** (Host A) versus upstream — see [PERFORMANCE.md](PERFORMANCE.md) §6 |
+| `d9b00bb` | **Parallel operator coefficient preparation.** Coefficient generation is split into x-ranges and run on the SSE/AVX2 operators' existing worker threads, with flat coefficient indices computed directly so workers never race through the stateful `AdrOp` cursor. The Vulkan operator gets the same range parallelism, and its serial ordered-map compression pass is replaced with exact-bit sharded hash tables plus parallel table packing — same coefficient identity, far less startup contention | **8.2 s → 5.6 s** (i9-13900K, 224³ PML_8) and **17.3 s → 14.3 s** (i7-6700K) versus upstream — see [PERFORMANCE.md](PERFORMANCE.md) §7 |
 | `55c9375` | Vulkan material, PEC, coefficient and UPML construction parallelized with worker-local grading parsers | Included in the figures above |
 | — | Controls: `OPENEMS_OPERATOR_THREADS` (`OPENEMS_GPU_OPERATOR_THREADS`), `OPENEMS_GPU_COMPRESS_THREADS`, `OPENEMS_OPERATOR_PROFILE`, `OPENEMS_GPU_STARTUP_TRACE` | — |
 
-Operator build is not a footnote on the GPU: at 224³ on Host C it costs ~7.0 s
+Operator build is not a footnote on the GPU: at 224³ on the i9-13900K it costs ~7.0 s
 against ~1.1 s for 1200 blocked timesteps. Everything above is what keeps the
 crossover against upstream's best CPU configuration at ~55 timesteps.
 
@@ -234,7 +230,7 @@ crossover against upstream's best CPU configuration at ~55 timesteps.
   the one extension with a switchable CPU path. The other extensions have no
   fallback to compare against, so their coverage is argued from that one
   measurement rather than measured.
-- Everything in §1.1's dump and startup tables was measured on Host C only.
+- Everything in §1.1's dump and startup tables was measured on the i9-13900K only.
 
 ### 1.2 GPU
 
@@ -271,7 +267,7 @@ Two structural results worth carrying forward:
 | `586a8ac` | Add the missing AVX2 fast field-extraction path | Full-domain dump every timestep: **336 → 426 MC/s**; removes an AVX2-specific tax SSE never paid |
 | `574f714` | Document the MT bandwidth ceiling (comment only) | — |
 | `08fa968` | Vectorize the UPML passes | See below |
-| `fd555ee` | Calibrate the thread count on real timesteps instead of on 4 s `NextInterval` callbacks | **+50%** on a 400-timestep run (507 → 759 MC/s), **+6.4%** at 20000 timesteps. Host C only; Host A was never hurt by the old search |
+| `fd555ee` | Calibrate the thread count on real timesteps instead of on 4 s `NextInterval` callbacks | **+50%** on a 400-timestep run (507 → 759 MC/s), **+6.4%** at 20000 timesteps. The i9-13900K only; the i7-6700K was never hurt by the old search |
 | *(prototype, opt-in)* | Trapezoidal temporal blocking of the update sweep, `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` | **3.2×–3.6×** on grids that exceed L3 (873 → 2805, 613 → 2171, 610 → 2194 MC/s). Bit-identical to the flat sweep. Carries every engine extension except steady-state detection: **3.13×** PEC, **2.96×** UPML, **2.60×** Mur at 224³ — see §4.7/C2 |
 
 **The multithreaded AVX2 engine is memory-bound and already at the host
@@ -281,10 +277,10 @@ against a ~29 GB/s STREAM ceiling; IPC ~1.06. Thread count peaks at 4 and
 optimizations for the multithreaded AVX2 engine on this class of host**;
 single-threaded and low-thread-count configurations still respond.
 
-> **Amended on Host C.** The bandwidth-bound conclusion survives — the engine
+> **Amended on the i9-13900K.** The bandwidth-bound conclusion survives — the engine
 > still tracks the STREAM curve, including its roll-off past 8 threads. The
 > clause *"the runtime auto-tune already converges to 3–4 threads unassisted"*
-> did not: it was true only because Host A's optimum is near the search's
+> did not: it was true only because the i7-6700K's optimum is near the search's
 > starting point. See §4.2.
 
 ---
@@ -393,8 +389,9 @@ scheme). Listed for completeness; **do not start here.**
 
 ### Hardware caveat — historic, and now lifted
 
-> **Superseded on 2026-09-04.** The RX 6800 is on Host C, and §4.1 reproduces
-> the headline §1 figure to within 0.2%. The caveat below is kept because G1
+> **Superseded on 2026-09-04.** The RX 6800's measurements were repeated on the
+> same machine with its CPU and both GPUs together, and §4.1 reproduces the
+> headline §1 figure to within 0.2%. The caveat below is kept because G1
 > and G2 were written under it: those two were deliberately argued from
 > dispatch and barrier *counts* rather than from throughput, and that
 > reasoning is still sound. §4.7/C3 has since measured what the minimal
@@ -456,7 +453,7 @@ inefficiency.
 ## 3b. Status of the candidates above
 
 Every candidate in §3 was either implemented or closed on evidence, and none of
-those closures is reopened by the Host C re-verification:
+those closures is reopened by the i9-13900K re-verification:
 
 - AVX2 — at the traffic floor. The update kernels (`574f714`), and the
   dispersive extension (§A1b), are both bandwidth-bound with no addressing
@@ -465,35 +462,36 @@ those closures is reopened by the Host C re-verification:
   is already minimal (G2), and the two remaining structural costs (PML flux
   traffic, dispersive passes) are inherent to their algorithms (G1, G3).
 
-Both GPU closures were re-tested directly on Host C rather than taken on
+Both GPU closures were re-tested directly on the i9-13900K rather than taken on
 trust, and both hold: the Yee kernel runs at 89% of a *measured* bandwidth
 ceiling (§4.7/C4), and an extra dispatch plus barrier is free to within noise,
 so dispatch count is not merely minimal but not a lever at all (§4.7/C3).
 
 The one claim that did not survive was not a candidate at all but an aside in
 §1 — that the runtime thread auto-tune needs no help. It needed a lot; see
-§4.2. **New candidates opened by the Host C measurements are in §4.7. All are
+§4.2. **New candidates opened by the i9-13900K measurements are in §4.7. All are
 now resolved; the one that pays is C2 — temporal blocking of the AVX2 sweep,
 validated at 3–4× with a bit-identical reference schedule, and awaiting
 its engine port.**
 
 ---
 
-## 4. Re-verification on Host C (2026-09-04)
+## 4. Re-verification on the i9-13900K (2026-09-04)
 
-Host A (i7-6700K) was believed gone when this section was written; it was not
+The i7-6700K was believed gone when this section was written; it was not
 (see the host list above, and PERFORMANCE.md, which re-measures it on
-2026-09-07). Host C is an i9-13900K carrying **both** the RX 6800 from Host B
-and an integrated UHD 770, so for the first time the GPU and CPU numbers come
-from one machine and the two GPUs are directly comparable.
+2026-09-07). This section's machine is the same i9-13900K the earlier GPU-only
+measurements used, now measured with its CPU and integrated UHD 770 as well, so
+the GPU and CPU numbers come from one machine and the two GPUs are directly
+comparable.
 
-Every number below is a fresh measurement on Host C. Benchmark drivers are
+Every number below is a fresh measurement on the i9-13900K. Benchmark drivers are
 unchanged: `python/Tests/benchmark_avx2_engine.py` and
 `python/Tests/benchmark_gpu_engine.py`, 300–400 timesteps, PEC unless stated.
 
 ### 4.1 The GPU results reproduce exactly
 
-| Grid | cells | doc value (Host B) | Host C | |
+| Grid | cells | doc value | this run | |
 |---|---|---|---|---|
 | 256×224×224 | 12.8 M | 5115 MC/s | **5126 MC/s** | reproduced |
 
@@ -530,13 +528,13 @@ Three things to read off it:
 ### 4.2 The AVX2 thread auto-tune was badly wrong on a many-core host
 
 This is the one place the document was actively misleading. §1 asserted that
-"the runtime auto-tune already converges to 3–4 threads unassisted." On Host A
-that was true. On Host C the same code cost **43%** of throughput.
+"the runtime auto-tune already converges to 3–4 threads unassisted." On the i7-6700K
+that was true. On the i9-13900K the same code cost **43%** of throughput.
 
 The old search hill-climbed inside `NextInterval()`, which `openems.cpp` calls
 only when four seconds of wall time have elapsed, adding one thread per call
-from a start of one. Reaching Host A's optimum of 3–4 takes a few intervals.
-Reaching Host C's takes 44 s, during which the run is nowhere near peak:
+from a start of one. Reaching the i7-6700K's optimum of 3–4 takes a few intervals.
+Reaching the i9-13900K's takes 44 s, during which the run is nowhere near peak:
 
 | run length | old auto-tune | hand-pinned best | new calibration |
 |---|---|---|---|
@@ -547,7 +545,7 @@ Reaching Host C's takes 44 s, during which the run is nowhere near peak:
 inside `IterateTS()` — legitimate because thread count cannot change results —
 walking a geometric ladder and then bisecting around the winner. It settles in
 about 250 timesteps rather than 44 s. The rewrite is worth roughly nothing on
-Host A and 1.5× on Host C, which is the whole point.
+the i7-6700K and 1.5× on the i9-13900K, which is the whole point.
 
 One implementation detail that mattered more than expected: the first batch
 after each thread respawn must be discarded. Fresh threads start with cold
@@ -562,7 +560,7 @@ threads run to run, and with it, 8 every time.
 | MC/s | 486 | 706 | 814 | 865 | 884 | 884 | 707 | 673 | 677 | 702 |
 
 Single-threaded `avx2` (not `avx2-multithreaded` at width 1) reaches
-**535 MC/s**, up from Host A's 365.
+**535 MC/s**, up from the i7-6700K's 365.
 
 The 20% collapse past 12 threads is *not* an engine defect and not a P-core /
 E-core scheduling artifact. A plain OpenMP STREAM-Triad on the same host has
@@ -586,7 +584,7 @@ At a fixed 8 threads, throughput against grid size:
 
 A 96³ grid runs **3.9× faster per cell** than a 160×128×192 one. The field
 state at 96³ is a few tens of MB and lives in the 36 MB L3; past that
-everything streams from DDR5. Host A's 8 MB L3 could not show this — its
+everything streams from DDR5. The i7-6700K's 8 MB L3 could not show this — its
 in-cache regime was too small to be interesting — which is why §1 concluded
 "memory-bound" full stop and stopped there.
 
@@ -618,7 +616,7 @@ which at 873 MC/s is **~48 GB/s against the 49 GB/s STREAM ceiling.**
 
 So: the constant in §1 was wrong by ~45%, and the conclusion it was used to
 support is right anyway. The multithreaded AVX2 engine is at the DRAM roofline
-on Host C, not merely near it.
+on the i9-13900K, not merely near it.
 
 ### 4.6 GPU memory footprint — 2.8× more than the model needs
 
@@ -651,7 +649,7 @@ Two details worth keeping:
   pointed at it. Footprint needs its own measurement; speed benchmarks will
   not find this class of bug.
 
-### 4.7 Open candidates (new, from Host C)
+### 4.7 Open candidates (new, from the i9-13900K)
 
 #### C1 — Spatial blocking of the AVX2 sweep  ❌ closed on measurement
 
@@ -1000,13 +998,13 @@ cell index on the GPU (x is the slowest axis), so the shader change is a
 `gidBase`/`gidEnd` push-constant pair and a smaller dispatch, with no change to
 the kernel body. Enabled by `OPENEMS_GPU_TEMPORAL_BLOCK=<k>`.
 
-Measured 2026-09-07 (Host C) and 2026-09-08 (Host A), 224³, flat → blocked (k=16):
+Measured 2026-09-07 (i9-13900K) and 2026-09-08 (i7-6700K), 224³, flat → blocked (k=16):
 
 | device | PEC | PML_8 | |
 |---|---|---|---|
 | RX 6800 (128 MB Infinity Cache) | 5674 → **12319** | 4619 → **10212** | **2.2×** |
 | UHD 770 (share of 36 MB CPU L3) | 520 → 601 | 323 → 347 | 1.08–1.16× |
-| HD 530 (Gen9, Host A) | 478 → 484 | 270 → 269 | 1.00× |
+| HD 530 (Gen9; i7-6700K) | 478 → 484 | 270 → 269 | 1.00× |
 
 The RX 6800 result erases the cache cliff §4.1 documents: a 270 MB grid now
 runs within 6% of what a 94 MB grid reaches *inside* the Infinity Cache. The
@@ -1019,7 +1017,7 @@ Bit-identical to the flat sweep on both drivers
 RLC and GPU probes still have no slab path and make the schedule refuse rather
 than risk; the remaining work is in `plans/GPU_TEMPORAL_BLOCKING_PLAN.md`.
 
-Two things this opened, both recorded in [PERFORMANCE.md](PERFORMANCE.md) §5.2:
+Two things this opened, both recorded in [PERFORMANCE.md](PERFORMANCE.md) §5.5:
 Vulkan exposes no last-level-cache size, so the tile target is a tunable
 (`OPENEMS_GPU_TEMPORAL_BLOCK_MB`, default 64 MB discrete / 16 MB integrated),
 and on a card whose real cache is larger than the default the guard engages on
@@ -1028,8 +1026,9 @@ a startup micro-probe would fix it.
 
 ### 4.8 What five more hosts changed (2026-09-11)
 
-Hosts D–H were added to [PERFORMANCE.md](PERFORMANCE.md) as a portability and
-generality check on §4's conclusions, which were all drawn on Hosts A and C —
+The five servers were added to [PERFORMANCE.md](PERFORMANCE.md)
+as a portability and generality check on §4's conclusions, drawn on the i7-6700K
+and i9-13900K —
 both single-socket parts with one monolithic last-level cache. Two of those
 conclusions do not survive a machine shaped differently, and both are recorded
 here because they are cheap to rediscover the hard way.
@@ -1041,15 +1040,16 @@ justified it. Both are correct on a chip with one shared L3 and wrong on a chip
 with several: `sysconf` reports one instance, while a run spanning *n* of them
 has roughly *n* times that capacity, because the tile is split across cores in
 x and each core's slab lands in its own cache. Measured on 224³ PEC, setting
-the width by hand to the aggregate is worth **1.99×** on compute5 at 16 threads
-(4 CCXs), **2.01×** on loki at 32 (2 sockets) and **1.60×** on tierwater at 12
-(2 sockets) — and is a *loss* on every configuration whose threads fit inside a
+the width by hand to the aggregate is worth **1.99×** on the Ryzen 9 3950X at
+16 threads (4 CCXs), **2.01×** on the 2× Xeon Gold 6130 at 32 (2 sockets) and
+**1.60×** on the 2× Xeon E5-2620 v3 at 12 (2 sockets) — and is a *loss* on every configuration whose threads fit inside a
 single instance, which is why the defect hides at low thread counts. The
 corrected widths also show the right quantity is aggregate capacity across the
-hierarchy, not the L3 line alone: loki's non-inclusive L3 plus 1 MB of L2 per
+hierarchy, not the L3 line alone: the 2× Xeon Gold 6130's non-inclusive L3 plus
+1 MB of L2 per
 core wants a 43.6 MB tile on a 22 MB socket. Full sweep in
 `python/Tests/results/tile_width_sweep_2026-09-11.txt`; consequences in
-PERFORMANCE.md §5.7. This is the same class of mistake as §4.7/C5's GPU tile
+PERFORMANCE.md §5.3. This is the same class of mistake as §4.7/C5's GPU tile
 target above — a cache size treated as a constant rather than as a property of
 the device and of how much of it the run is using.
 
@@ -1058,11 +1058,11 @@ test of the *build* machine's `CMAKE_SYSTEM_PROCESSOR` and compiler, so an
 x86-64 binary built with any modern GCC always has `OPENEMS_ENABLE_AVX2=1` —
 including the copy that then runs on a pre-AVX2 host, where the default engine
 and every `--engine=avx2*` selection die with SIGILL before the first timestep.
-maxwell is that host and all 30 fork rows of its matrix crash. The `#else`
+The 2× Xeon E5-2630 is that host and all 30 fork rows of its matrix crash. The `#else`
 branch carrying the "AVX2+FMA engine is unavailable on this platform; using
 multithreaded engine" fallback is compiled out in exactly the builds that need
 it. A runtime `__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")`
-at engine selection is the fix; it has not been made. PERFORMANCE.md §5.8.
+at engine selection is the fix; it has not been made. PERFORMANCE.md §6.
 
 ---
 
@@ -1135,7 +1135,7 @@ repo.
   anything, and use run lengths long enough that startup is negligible —
   300-timestep runs put the 64³ point 39% off its 4000-timestep value.
 - **`uncore_imc` is unavailable, the core PMU is not.** `perf_event_paranoid`
-  is 2 on Host C and there is no passwordless sudo, so the memory-controller
+  is 2 on the i9-13900K and there is no passwordless sudo, so the memory-controller
   CAS counters that would give DRAM traffic directly cannot be read. The core
   PMU *does* work unprivileged for one's own process:
   `longest_lat_cache.miss` is the usable substitute (§4.5). On this hybrid CPU
@@ -1157,7 +1157,7 @@ repo.
   process exits before they are flushed. That is the right experiment for
   isolating HDF5 serialization and `memcpy` from the stepping thread, and the
   wrong one for claiming anything about storage. Do not run it on tmpfs
-  (`/tmp` is tmpfs on Host C), where even the page-cache pressure disappears,
+  (`/tmp` is tmpfs on the i9-13900K), where even the page-cache pressure disappears,
   and state which filesystem a dump number came from.
 - **Speed benchmarks do not find footprint bugs.** §4.6 was 515 MB of VRAM
   allocated and never touched, invisible to every timing measurement in this

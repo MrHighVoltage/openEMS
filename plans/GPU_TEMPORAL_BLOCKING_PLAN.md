@@ -13,7 +13,7 @@ traffic*, not from tightening arithmetic. That is exactly what this does. It
 does not raise the roofline; it moves the kernel onto a different one.
 
 The prize is bounded by the device's cache-vs-DRAM span, and that span is
-device-specific. Measured on Host C:
+device-specific. Measured on the i9-13900K:
 
 | device | working set 2.7 MB → 270 MB | span |
 |---|---|---|
@@ -59,11 +59,11 @@ The proxy that skipped the wedges reached 2.30×, so the wedges and the
 narrowed slabs cost about 8% of the ideal — the correct schedule keeps most
 of it.
 
-Re-measured 2026-09-07 (Host C) / 2026-09-08 (Host A) in the full
+Re-measured 2026-09-07 (i9-13900K) / 2026-09-08 (i7-6700K) in the full
 fork-vs-upstream matrix (best of 3, no
-probes or dumps), which is the version that reached PERFORMANCE.md §4.3:
+probes or dumps), which is the version that reached PERFORMANCE.md §5.4:
 
-| grid | RX 6800 | UHD 770 | HD 530 (Host A) |
+| grid | RX 6800 | UHD 770 | HD 530 (i7-6700K) |
 |---|---|---|---|
 | 160×128×192 PEC (94 MB) | 13070 → 12950 (**0.99×**) | 524 → 611 (1.17×) | 368 → 381 (1.04×) |
 | 224³ PEC (270 MB) | 5674 → **12319** (2.17×) | 520 → 601 (1.16×) | 478 → 484 (1.01×) |
