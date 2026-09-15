@@ -18,6 +18,7 @@
 #include "engine_avx2_multithread.h"
 #include "extensions/engine_extension.h"
 #include "tools/denormal.h"
+#include "tools/cache_topology.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -103,7 +104,10 @@ void Engine_AVX2_Multithread::Init()
 		m_numThreads = m_max_numThreads;
 
 	this->changeNumThreads(m_numThreads);
-	ConfigureTemporalBlocking();
+	// The tile is sized from the L3 instances the threads occupy, so it waits
+	// for the final thread count; calibration runs on the flat path anyway.
+	if (!m_opt_speed)
+		ConfigureTemporalBlocking();
 }
 
 void Engine_AVX2_Multithread::Reset()
@@ -248,17 +252,19 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	if (!endPtr || k < 2 || (*endPtr != '\0' && *endPtr != ':'))
 		return;
 
-	// One tile of both field arrays should be about one last-level cache. That
-	// is not obvious a priori -- a trapezoid's swept range shrinks from W to
-	// W-2k as it advances, so its live set is smaller than W planes -- but it
-	// is what the measurements land on: the optimum was W=64 on a grid with
-	// 0.56 MB x-planes and W=32 on one with 1.20 MB, i.e. 36 and 38 MB, against
-	// this host's 36 MB L3.
+	// One tile of both field arrays should be about the last-level cache the
+	// run has. That is not obvious a priori -- a trapezoid's swept range shrinks
+	// from W to W-2k as it advances, so its live set is smaller than W planes --
+	// but it is what the measurements land on: the optimum was W=64 on a grid
+	// with 0.56 MB x-planes and W=32 on one with 1.20 MB, i.e. 36 and 38 MB,
+	// against an i9-13900K's 36 MB L3. "The cache the run has" is the sum over
+	// the L3 instances its threads occupy, not one of them: the tile is split
+	// across cores in x, so each core's slab lands in its own instance. Taking
+	// one instance made tiles 2-4x too narrow on multi-socket servers and
+	// multi-CCX Ryzens (PERFORMANCE.md §5.3).
 	const double planeBytes = 2.0 * (double)m_vs_x * sizeof(f8vector);
-	long cacheBytes = 0;
-#ifdef _SC_LEVEL3_CACHE_SIZE
-	cacheBytes = sysconf(_SC_LEVEL3_CACHE_SIZE);
-#endif
+	const LLC_Span llc = QueryLastLevelCaches(m_numThreads);
+	long cacheBytes = (long)llc.totalBytes;
 	if (cacheBytes <= 0)
 		cacheBytes = 32L * 1024 * 1024;
 	long W = (long)((double)cacheBytes / planeBytes);
@@ -315,11 +321,14 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 		return;
 	}
 
-	// Below roughly one L3 the flat sweep is already cache-resident and there is
-	// no traffic to remove; blocking then costs the wedge work for nothing
-	// (measured -32% on a 96^3 grid), so do not engage.
+	// Below roughly the run's L3 the flat sweep is already cache-resident and
+	// there is no traffic to remove; blocking then costs the wedge work for
+	// nothing (measured -32% on a 96^3 grid), so do not engage. 48 MB is the
+	// threshold measured against a 36 MB L3; it scales with the cache the run
+	// has, but is kept as a floor so single-cache hosts behave as before.
 	const double fieldBytes = planeBytes * (double)numLines[0];
-	if (fieldBytes < 48.0 * 1024 * 1024 && !force)
+	const double fitsBytes = std::max(48.0 * 1024 * 1024, cacheBytes * 4.0 / 3.0);
+	if (fieldBytes < fitsBytes && !force)
 	{
 		cout << "AVX2 temporal blocking: disabled, grid fits cache ("
 		     << (fieldBytes / (1024 * 1024)) << " MB of field state)." << endl;
@@ -360,7 +369,8 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	cout << "AVX2 temporal blocking ACTIVE (prototype): k=" << m_blk_k
 	     << ", tile width " << m_blk_W << " x-lines, "
 	     << (planeBytes * m_blk_W / (1024 * 1024)) << " MB per tile, "
-	     << (m_blk_edges.size() - 1) << " tiles" << endl;
+	     << (m_blk_edges.size() - 1) << " tiles; L3 " << llc.instances << " x "
+	     << (llc.instanceBytes / (1024 * 1024)) << " MB (" << llc.source << ")" << endl;
 }
 
 void Engine_AVX2_Multithread::SplitRange(int lo, int hi, unsigned int nThreads,
@@ -676,6 +686,7 @@ void Engine_AVX2_Multithread::FinishCalibration()
 
 	cout << "AVX2 Multithreaded Engine: Best performance found using "
 	     << m_numThreads << " threads." << endl;
+	ConfigureTemporalBlocking();
 }
 
 void Engine_AVX2_Multithread::NextInterval(float curr_speed)
