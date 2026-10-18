@@ -269,6 +269,7 @@ Two structural results worth carrying forward:
 | `08fa968` | Vectorize the UPML passes | See below |
 | `fd555ee` | Calibrate the thread count on real timesteps instead of on 4 s `NextInterval` callbacks | **+50%** on a 400-timestep run (507 → 759 MC/s), **+6.4%** at 20000 timesteps. The i9-13900K only; the i7-6700K was never hurt by the old search |
 | *(prototype, opt-in)* | Trapezoidal temporal blocking of the update sweep, `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` | **3.2×–3.6×** on grids that exceed L3 (873 → 2805, 613 → 2171, 610 → 2194 MC/s). Bit-identical to the flat sweep. Carries every engine extension except steady-state detection: **3.13×** PEC, **2.96×** UPML, **2.60×** Mur at 224³ — see §4.7/C2 |
+| `b39bd36` | Cheaper synchronisation in the blocked schedule (barrier elision, y-row split, optional spinning barrier, sync statistics), and a tile that leaves room for the coefficient tables | **1.6×–2.0×** over the previous blocked default on a 5 M-cell TL model, bit-identical — see §4.9 |
 
 **The multithreaded AVX2 engine is memory-bound and already at the host
 ceiling.** Measured DRAM traffic at its optimal 4-thread point is 27–38 GB/s
@@ -767,6 +768,12 @@ tile sized for the *other* grid (W=64, 77 MB) gives 1267 MC/s where W=32 gives
 > multi-CCX or multi-socket machine a full-machine run has several, and the
 > derived width is short by that factor — worth up to 2× where it bites. §4.8.
 
+> **Refined (2026-10-18).** "One L3" holds for these uniform grids, whose
+> coefficient tables are a few KB. On a graded mesh the tables can be as large
+> as the fields (122 MB on a δ/10 transmission line), and there half the L3 is
+> the optimum. The engine now starts at half and widens back to the full cache
+> to keep k where the tables are small. §4.9.
+
 **It refuses rather than risks.** Blocking engages only when every active
 engine extension reports `SupportsSlabApply()`. An extension that has not
 implemented the slab hooks returns false — the default — and sends the whole run
@@ -1066,6 +1073,108 @@ at engine selection is the fix, and `openEMS::SetupOperator()` now makes it: an
 AVX2 engine, default or explicit, falls back to the multithreaded engine with a
 one-line warning (`OPENEMS_FORCE_NO_AVX2=1` exercises the path on AVX2 hosts).
 Not yet re-run on the E5-2630. PERFORMANCE.md §6.
+
+### 4.9 Synchronisation of the blocked AVX2 schedule (2026-10-18)
+
+C2's barrier note above ("barriers turned out to be the thing worth
+optimising") was right, and it did not go far enough. On a production model, a
+5.03 M-cell δ/10 transmission line with Mur on six faces and two lumped ports,
+the blocked workers were 79–89 % busy, and about 185 times per timestep each
+one went to sleep at a barrier. `OPENEMS_AVX2_SYNC_STATS=1` now measures this
+directly. On the Ryzen 5 5600G at 10:20 tiles the old schedule ran **552
+barriers per timestep**. Its threads spent **21 %** of their time waiting for
+the slowest thread and another **27 %** just getting back onto a CPU after a
+release, because `Barrier` parks every early thread in the kernel.
+
+**Done** in `b39bd36`, all bit-identical to the flat sweep (`python/Tests/tblock_identity.py`):
+
+- **Fewer barriers.** Two new `Engine_Extension` queries:
+  - `SlabTouches(hook, startX, stopX)` — false skips the hook and its barrier
+    for that slab. Implemented for Mur (faces normal to x), LumpedRLC,
+    Excitation and UPML (each region's x-range).
+  - `SlabHookWritesFields(hook)` — false lets consecutive hooks of that kind
+    share a single barrier. True for Mur's pre/post hooks and LumpedRLC's pre
+    hook.
+
+  Both default to the old behaviour, so an extension that does not answer
+  loses nothing. On the TL model this cut 552 → 189 barriers per timestep (Ryzen) and
+  264 → 92 (i9-13900K). It is the largest single step, about +30 %.
+  `OPENEMS_AVX2_TBLOCK_ELIDE=0` turns it off.
+- **Even work split.** Slab updates are divided over threads by y-row (one
+  contiguous range of memory) instead of by x-line, through
+  `Engine_AVX2::UpdateVoltageRows()` / `UpdateCurrentRows()`. Worth +3–7 % at
+  4–8 threads. The schedule model says x-line splitting wastes up to 40 % at 32
+  threads, which is still to be measured. `OPENEMS_AVX2_TBLOCK_SPLIT=lines`
+  turns it off.
+- **Spinning barrier.** `HybridBarrier` (`tools/barrier.h`) arrives with one
+  atomic and can spin before it sleeps. With `OPENEMS_AVX2_BARRIER_SPIN_US=100`
+  the waking-up share falls from 14 % to 1 %, a further +16–19 %. Off by
+  default.
+- **A tile that leaves room for the coefficients.** On the TL model the
+  hand-swept optimum was 40–60 % of the L3 on all three hosts, with a
+  full-cache tile 1.2–1.9× slower. The reason is that its compressed
+  coefficient tables (317 192 unique entries, 122 MB) are as large as its
+  fields, which are all the tile accounting counts. On uniform 224³ grids
+  (12 entries), a half-cache tile only forces k down (to 3–7), and is 17–38 %
+  slower than a full-cache one that keeps k. The rule is now:
+  - start at half the L3 the threads span;
+  - if that is narrower than 2k and the tables are under 25 % of the field
+    bytes, widen up to the full L3 to keep k;
+  - beyond that, lower k to W/2.
+
+  That is within 7 % of the best hand-set tile on all nine model/host pairs
+  measured. The rule is fitted to those nine; D4 is what will show whether it
+  holds.
+
+Together, on the TL model, against each host's previous default: **2.0×** on
+the i9-13900K (944 → 1758 MC/s) and on the Ryzen 5 5600G (552 → 1088), and
+**1.6×** on the i7-6700K (293 → 467). Tables: PERFORMANCE.md §5.7. Raw output:
+`python/Tests/results/tblock_sync_2026-10-18.txt`.
+
+#### Next steps
+
+- **D1 — Fewer barriers still.**
+  - Mur faces with the same normal write disjoint planes, so their field-writing
+    Apply hooks could share a barrier (y-min with y-max, z-min with z-max). That
+    is 4 → 2 per E half-step in interior slabs.
+  - UPML regions are disjoint boxes, so their hooks could share barriers among
+    themselves too. That needs a "commutes with" declaration beside
+    `SlabHookWritesFields()`; a 160×128×192 PML model still has ~120 extension
+    barriers per timestep.
+  - About 12–20 % of thread time is still spent waiting for the slowest thread,
+    and it grows as tiles narrow.
+- **D2 — Balance what is left.** Mur faces normal to z still split a slab over
+  threads by x-line, and LumpedRLC runs on thread 0 alone. Both are small, but
+  each one holds up a barrier.
+- **D3 — Defaults.** Spin 100 µs beat 20 µs in 21 of 23 pairs, by 1–7 %.
+  Before it becomes the default, measure it on a host with more runnable
+  threads than cores (where spinning steals time from the thread being waited
+  for), and judge the power cost of a waiting thread that shows as 100 % CPU.
+- **D4 — The tile campaign.** Check the tile rule across models and hosts,
+  and decide whether its tables-vs-fields switch should become a working-set
+  estimate: field bytes plus the coefficient entries a plane actually
+  references, plus extension state such as UPML's. Models: the five §5 models, the TL model, a thin grid with small
+  planes (e.g. 600×96×96) and one with large planes (e.g. 160×320×320, where
+  W ≥ 2k forces k down). Hosts: i9-13900K, i7-6700K, Ryzen 5 5600G, 2× Xeon
+  Gold 6130 and 2× Xeon E5-2620 v3, at one socket and at both. Only
+  `avx2-multithreaded`. The multi-socket hosts are also where the y-row split
+  and barrier count should matter most, at 16–32 threads.
+  `python/Tests/bench_tblock_sync.py` is the driver.
+- **D5 — Re-run the matrix.** PERFORMANCE.md §5.2/§5.3/§8 predate all of this.
+- **D6 — The GPU engine.** Find out whether these findings hold for
+  `Engine_Vulkan`'s blocked schedule, and where it can win:
+  - per-extension, per-tile synchronisation: pipeline barriers or dispatches
+    per hook per tile;
+  - its tile target, still a constant (PERFORMANCE.md §5.5);
+  - its refusal of Mur boundaries (the TL model above cannot block on the GPU
+    at all);
+  - on this model the RX 7900 XTX ran at ~5700 MC/s, only 1.6× the RX 6800's
+    ~3500 despite ~1.9× the memory bandwidth. The RX 6800 itself drops from
+    ~5450 MC/s on a 2.3 M-cell grid to ~3500 here. Find out whether that is
+    bandwidth, cache or dispatch.
+- **D7 — The flat path.** It still barriers after every extension in all six
+  phases, implemented or not: about 50 barriers per timestep on the TL model,
+  but only ~6 % waiting. `SlabHookMask()`-style skipping would carry over.
 
 ---
 

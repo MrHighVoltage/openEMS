@@ -1,0 +1,461 @@
+Synchronisation of the AVX2 temporally blocked schedule, and its tile width (2026-10-18).
+PERFORMANCE.md §5.7, OPTIMIZATIONS.md §4.9.
+
+Binaries: "ref" = the fork at 4bfcd74 (portable GPU bundle), "new" = the same bundle with this
+change. Drivers: python/Tests/tblock_identity.py (bit-identity) and python/Tests/bench_tblock_sync.py
+(variants BIN/TBLOCK[/lines|rows][/elide|noelide][/spinN]; every new/ run has OPENEMS_AVX2_SYNC_STATS=1).
+TL model: tl_openEMS_m2_m1_w0p20um_skin_delta10_cs0p019081um (sub-1: port 1 driven), 247x153x133 =
+5.03 M cells, Mur on six faces, two lumped ports; Gaussian DC..300 GHz. Other models: python/Tests/models.
+Columns: barr/TS = barriers per timestep per thread; wait % = share of thread time waiting for the
+slowest thread; wake % = share spent getting back onto a CPU after the release; us/barr = both per
+barrier; GB/s and B/cell from the memory controllers (perf, uncore_imc_free_running / amd_df), '-' where
+not readable or where the run ended inside the counter window.
+Hosts: i9-13900K (8 P-cores, CPUs 0,2,..,14; desktop running), ryzen5-5600G (6 cores, CPUs 0-5; idle),
+i7-6700K (4 cores, CPUs 0-3; serves applications).
+
+Unique AVX2 coefficient entries (openEMS --verbose=1): TL model 317192 (x 384 B = 122 MB, fields 120 MB);
+224x224x224_pec 12; 160x128x192_pml 5096.
+
+====================================================================================================
+1. Bit-identity, intermediate build (half-cache tiles, k lowered): 6 models x 8/7 threads x 10 variants
+====================================================================================================
+=== tl_skin_sub1.xml
+   8t  ref flat                                       392.50 MC/s  reference
+   8t  new flat                                       385.85 MC/s  identical
+   8t  ref tblock 16                                  734.72 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             1036.39 MC/s  identical
+   8t  new tblock 16 (rows, no elision)              1050.55 MC/s  identical
+   8t  new tblock 16 (lines, elision)                1269.12 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 1276.79 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               1079.85 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     1271.98 MC/s  identical
+   8t  new tblock 16 + sync stats                    1339.84 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=16 W=37, split by y-row, elision on, spin 0 us
+          barriers per timestep 108.5 (update 26.0, extension 82.5)
+          share of thread time waiting for the slowest thread 17.4 % (update 10.7, extension 6.7), waking up 9.6 %; per barrier 5.7 + 3.1 us
+          per thread (waiting / waking %): 14.9/9.3 18.4/9.8 19.5/9.7 18.7/9.8 17.8/9.5 18.4/9.6 17.6/9.7 14.0/9.3
+   7t  ref flat                                       391.95 MC/s  identical
+   7t  new flat                                       394.06 MC/s  identical
+   7t  ref tblock 16                                  707.44 MC/s  identical
+   7t  new tblock 16 (lines, no elision)             1103.46 MC/s  identical
+   7t  new tblock 16 (rows, no elision)              1126.22 MC/s  identical
+   7t  new tblock 16 (lines, elision)                1280.72 MC/s  identical
+   7t  new tblock 16 (rows, elision)                 1331.81 MC/s  identical
+   7t  new tblock 8:16 (rows, elision)               1021.36 MC/s  identical
+   7t  new tblock 16 (rows, elision, spin 50 us)     1399.49 MC/s  identical
+   7t  new tblock 16 + sync stats                    1309.21 MC/s  identical
+        AVX2 sync stats: 7 threads, 600 timesteps, blocked k=16 W=37, split by y-row, elision on, spin 0 us
+          barriers per timestep 108.5 (update 26.0, extension 82.5)
+          share of thread time waiting for the slowest thread 15.4 % (update 9.7, extension 5.7), waking up 7.7 %; per barrier 5.2 + 2.6 us
+          per thread (waiting / waking %): 12.7/7.5 16.7/7.9 17.9/7.6 16.2/7.6 16.0/7.8 15.9/7.7 12.2/7.6
+=== 224x224x224_mur.xml
+   8t  ref flat                                       529.83 MC/s  reference
+   8t  new flat                                       548.99 MC/s  identical
+   8t  ref tblock 16                                 1728.13 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             1166.90 MC/s  identical
+   8t  new tblock 16 (rows, no elision)              1271.81 MC/s  identical
+   8t  new tblock 16 (lines, elision)                1385.49 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 1577.81 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               1611.45 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     1661.88 MC/s  identical
+   8t  new tblock 16 + sync stats                    1500.17 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=7 W=15, split by y-row, elision on, spin 0 us
+          barriers per timestep 235.0 (update 58.0, extension 177.0)
+          share of thread time waiting for the slowest thread 19.2 % (update 11.7, extension 7.6), waking up 10.5 %; per barrier 5.9 + 3.2 us
+          per thread (waiting / waking %): 16.0/10.3 18.6/10.7 20.3/10.6 20.3/10.5 20.5/10.6 20.5/10.6 20.9/10.3 16.8/10.0
+   7t  ref flat                                       531.96 MC/s  identical
+   7t  new flat                                       534.29 MC/s  identical
+   7t  ref tblock 16                                 1660.73 MC/s  identical
+   7t  new tblock 16 (lines, no elision)             1212.87 MC/s  identical
+   7t  new tblock 16 (rows, no elision)              1240.34 MC/s  identical
+   7t  new tblock 16 (lines, elision)                1413.28 MC/s  identical
+   7t  new tblock 16 (rows, elision)                 1538.57 MC/s  identical
+   7t  new tblock 8:16 (rows, elision)               1629.29 MC/s  identical
+   7t  new tblock 16 (rows, elision, spin 50 us)     1647.57 MC/s  identical
+   7t  new tblock 16 + sync stats                    1518.89 MC/s  identical
+        AVX2 sync stats: 7 threads, 600 timesteps, blocked k=7 W=15, split by y-row, elision on, spin 0 us
+          barriers per timestep 235.0 (update 58.0, extension 177.0)
+          share of thread time waiting for the slowest thread 15.7 % (update 9.8, extension 6.0), waking up 8.0 %; per barrier 4.8 + 2.4 us
+          per thread (waiting / waking %): 12.0/7.8 16.0/8.2 16.8/8.2 17.6/8.2 18.3/8.0 17.6/8.0 11.8/7.8
+=== 224x224x224_pml.xml
+   8t  ref flat                                       233.18 MC/s  reference
+   8t  new flat                                       233.94 MC/s  identical
+   8t  ref tblock 16                                  789.11 MC/s  identical
+   8t  new tblock 16 (lines, no elision)              734.21 MC/s  identical
+   8t  new tblock 16 (rows, no elision)               725.36 MC/s  identical
+   8t  new tblock 16 (lines, elision)                 731.75 MC/s  identical
+   8t  new tblock 16 (rows, elision)                  734.96 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)                785.86 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)      724.34 MC/s  identical
+   8t  new tblock 16 + sync stats                     765.13 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=7 W=15, split by y-row, elision on, spin 0 us
+          barriers per timestep 522.5 (update 58.0, extension 464.5)
+          share of thread time waiting for the slowest thread 30.1 % (update 4.5, extension 25.6), waking up 10.0 %; per barrier 8.3 + 2.7 us
+          per thread (waiting / waking %): 14.7/10.0 21.9/10.5 24.9/10.5 27.4/10.3 31.0/10.1 36.0/9.7 42.0/9.5 42.8/9.3
+   7t  ref flat                                       232.46 MC/s  identical
+   7t  new flat                                       233.07 MC/s  identical
+   7t  ref tblock 16                                  735.60 MC/s  identical
+   7t  new tblock 16 (lines, no elision)              680.27 MC/s  identical
+   7t  new tblock 16 (rows, no elision)               670.46 MC/s  identical
+   7t  new tblock 16 (lines, elision)                 718.07 MC/s  identical
+   7t  new tblock 16 (rows, elision)                  710.76 MC/s  identical
+   7t  new tblock 8:16 (rows, elision)                757.58 MC/s  identical
+   7t  new tblock 16 (rows, elision, spin 50 us)      731.98 MC/s  identical
+   7t  new tblock 16 + sync stats                     716.92 MC/s  identical
+        AVX2 sync stats: 7 threads, 600 timesteps, blocked k=7 W=15, split by y-row, elision on, spin 0 us
+          barriers per timestep 522.5 (update 58.0, extension 464.5)
+          share of thread time waiting for the slowest thread 31.1 % (update 4.1, extension 27.0), waking up 7.6 %; per barrier 9.2 + 2.2 us
+          per thread (waiting / waking %): 16.4/7.3 21.8/7.9 29.8/7.9 31.6/7.8 35.4/7.7 39.4/7.5 43.0/7.2
+=== 160x128x192_pml.xml
+   8t  ref flat                                       260.44 MC/s  reference
+   8t  new flat                                       259.05 MC/s  identical
+   8t  ref tblock 16                                 729.883 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             949.174 MC/s  identical
+   8t  new tblock 16 (rows, no elision)              933.828 MC/s  identical
+   8t  new tblock 16 (lines, elision)                1059.43 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 1058.16 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               739.538 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     1174.37 MC/s  identical
+   8t  new tblock 16 + sync stats                    1036.88 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=16 W=32, split by y-row, elision on, spin 0 us
+          barriers per timestep 171.0 (update 18.0, extension 153.0)
+          share of thread time waiting for the slowest thread 22.3 % (update 3.0, extension 19.3), waking up 11.8 %; per barrier 4.8 + 2.6 us
+          per thread (waiting / waking %): 12.0/11.4 18.8/12.2 19.6/12.3 20.8/12.1 22.2/11.9 24.7/11.7 28.4/11.4 31.7/11.1
+   7t  ref flat                                       257.21 MC/s  identical
+   7t  new flat                                       258.03 MC/s  identical
+   7t  ref tblock 16                                  673.09 MC/s  identical
+   7t  new tblock 16 (lines, no elision)              930.97 MC/s  identical
+   7t  new tblock 16 (rows, no elision)              910.635 MC/s  identical
+   7t  new tblock 16 (lines, elision)                981.039 MC/s  identical
+   7t  new tblock 16 (rows, elision)                 1002.07 MC/s  identical
+   7t  new tblock 8:16 (rows, elision)               706.448 MC/s  identical
+   7t  new tblock 16 (rows, elision, spin 50 us)     1115.67 MC/s  identical
+   7t  new tblock 16 + sync stats                     1015.9 MC/s  identical
+        AVX2 sync stats: 7 threads, 600 timesteps, blocked k=16 W=32, split by y-row, elision on, spin 0 us
+          barriers per timestep 171.0 (update 18.0, extension 153.0)
+          share of thread time waiting for the slowest thread 20.9 % (update 2.6, extension 18.3), waking up 9.8 %; per barrier 4.6 + 2.2 us
+          per thread (waiting / waking %): 11.0/9.1 12.9/9.9 20.3/10.0 22.6/10.0 24.4/9.9 26.1/9.8 28.8/9.4
+=== 160x128x192_pec.xml
+   8t  ref flat                                       848.44 MC/s  reference
+   8t  new flat                                      854.668 MC/s  identical
+   8t  ref tblock 16                                 2821.52 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             2742.02 MC/s  identical
+   8t  new tblock 16 (rows, no elision)               2772.7 MC/s  identical
+   8t  new tblock 16 (lines, elision)                2966.58 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 3135.12 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               2342.09 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     2938.71 MC/s  identical
+   8t  new tblock 16 + sync stats                     3118.7 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=16 W=32, split by y-row, elision on, spin 0 us
+          barriers per timestep 19.0 (update 18.0, extension 1.0)
+          share of thread time waiting for the slowest thread 14.6 % (update 14.4, extension 0.2), waking up 5.3 %; per barrier 9.0 + 3.2 us
+          per thread (waiting / waking %): 14.1/5.8 15.9/5.1 15.9/5.2 15.1/5.0 15.5/4.8 15.7/4.8 15.3/5.1 9.4/6.3
+   7t  ref flat                                      836.578 MC/s  identical
+   7t  new flat                                       849.48 MC/s  identical
+   7t  ref tblock 16                                 2876.84 MC/s  identical
+   7t  new tblock 16 (lines, no elision)             2760.98 MC/s  identical
+   7t  new tblock 16 (rows, no elision)              2938.76 MC/s  identical
+   7t  new tblock 16 (lines, elision)                2926.69 MC/s  identical
+   7t  new tblock 16 (rows, elision)                 3055.35 MC/s  identical
+   7t  new tblock 8:16 (rows, elision)               2402.25 MC/s  identical
+   7t  new tblock 16 (rows, elision, spin 50 us)     3193.58 MC/s  identical
+   7t  new tblock 16 + sync stats                    2970.08 MC/s  identical
+        AVX2 sync stats: 7 threads, 600 timesteps, blocked k=16 W=32, split by y-row, elision on, spin 0 us
+          barriers per timestep 19.0 (update 18.0, extension 1.0)
+          share of thread time waiting for the slowest thread 13.1 % (update 13.0, extension 0.2), waking up 4.1 %; per barrier 8.7 + 2.7 us
+          per thread (waiting / waking %): 12.0/3.7 14.6/4.5 13.3/4.1 14.1/4.0 15.0/3.8 14.0/4.2 8.9/4.3
+=== 224x224x224_pec.xml
+   8t  ref flat                                       614.97 MC/s  reference
+   8t  new flat                                       618.39 MC/s  identical
+   8t  ref tblock 16                                 2518.01 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             1715.78 MC/s  identical
+   8t  new tblock 16 (rows, no elision)              1935.46 MC/s  identical
+   8t  new tblock 16 (lines, elision)                1826.16 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 2070.46 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               2084.98 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     2057.61 MC/s  identical
+   8t  new tblock 16 + sync stats                    2030.45 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=7 W=15, split by y-row, elision on, spin 0 us
+          barriers per timestep 59.0 (update 58.0, extension 1.0)
+          share of thread time waiting for the slowest thread 14.2 % (update 14.2, extension 0.1), waking up 3.8 %; per barrier 12.7 + 3.3 us
+          per thread (waiting / waking %): 10.4/4.4 14.3/3.7 16.9/3.5 16.9/3.4 16.7/3.4 16.5/3.4 14.6/3.8 7.6/4.4
+   7t  ref flat                                       616.26 MC/s  identical
+   7t  new flat                                       616.80 MC/s  identical
+   7t  ref tblock 16                                 2349.49 MC/s  identical
+   7t  new tblock 16 (lines, no elision)             1703.96 MC/s  identical
+   7t  new tblock 16 (rows, no elision)              1893.51 MC/s  identical
+   7t  new tblock 16 (lines, elision)                1803.23 MC/s  identical
+   7t  new tblock 16 (rows, elision)                 2001.28 MC/s  identical
+   7t  new tblock 8:16 (rows, elision)               2103.58 MC/s  identical
+   7t  new tblock 16 (rows, elision, spin 50 us)     2037.02 MC/s  identical
+   7t  new tblock 16 + sync stats                    2024.08 MC/s  identical
+        AVX2 sync stats: 7 threads, 600 timesteps, blocked k=7 W=15, split by y-row, elision on, spin 0 us
+          barriers per timestep 59.0 (update 58.0, extension 1.0)
+          share of thread time waiting for the slowest thread 12.8 % (update 12.8, extension 0.1), waking up 2.5 %; per barrier 11.7 + 2.3 us
+          per thread (waiting / waking %): 8.0/2.4 13.9/2.7 16.4/2.6 16.0/2.6 16.1/2.6 14.2/2.6 5.4/2.4
+
+all identical
+
+====================================================================================================
+1b. Bit-identity, final build (tile rule C), 8 threads
+====================================================================================================
+=== tl_skin_sub1.xml
+   8t  ref flat                                       403.45 MC/s  reference
+   8t  new flat                                       403.82 MC/s  identical
+   8t  ref tblock 16                                 775.281 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             1097.26 MC/s  identical
+   8t  new tblock 16 (rows, no elision)              1139.33 MC/s  identical
+   8t  new tblock 16 (lines, elision)                 1345.2 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 1356.34 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               1112.85 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     1479.73 MC/s  identical
+   8t  new tblock 16 + sync stats                    1378.05 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=16 W=37, split by y-row, elision on, spin 0 us
+          barriers per timestep 108.5 (update 26.0, extension 82.5)
+          share of thread time waiting for the slowest thread 16.7 % (update 10.7, extension 6.0), waking up 8.8 %; per barrier 5.3 + 2.8 us
+          per thread (waiting / waking %): 14.1/8.6 17.6/9.0 18.3/9.2 17.9/8.8 17.0/9.0 17.7/8.9 17.3/8.8 13.5/8.6
+=== 224x224x224_mur.xml
+   8t  ref flat                                       554.50 MC/s  reference
+   8t  new flat                                       555.00 MC/s  identical
+   8t  ref tblock 16                                 1733.39 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             1754.55 MC/s  identical
+   8t  new tblock 16 (rows, no elision)              1832.71 MC/s  identical
+   8t  new tblock 16 (lines, elision)                1947.23 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 2004.88 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               1661.25 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     2035.63 MC/s  identical
+   8t  new tblock 16 + sync stats                    2047.81 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=15 W=31, split by y-row, elision on, spin 0 us
+          barriers per timestep 107.0 (update 26.0, extension 81.0)
+          share of thread time waiting for the slowest thread 12.3 % (update 7.9, extension 4.3), waking up 5.8 %; per barrier 6.0 + 2.8 us
+          per thread (waiting / waking %): 10.1/5.7 12.5/6.0 12.6/6.1 12.8/6.0 12.8/5.9 13.0/5.8 13.9/5.7 10.4/5.7
+=== 224x224x224_pml.xml
+   8t  ref flat                                       233.55 MC/s  reference
+   8t  new flat                                       233.30 MC/s  identical
+   8t  ref tblock 16                                  748.91 MC/s  identical
+   8t  new tblock 16 (lines, no elision)              761.01 MC/s  identical
+   8t  new tblock 16 (rows, no elision)               788.79 MC/s  identical
+   8t  new tblock 16 (lines, elision)                 811.16 MC/s  identical
+   8t  new tblock 16 (rows, elision)                  821.76 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)                819.36 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)      803.90 MC/s  identical
+   8t  new tblock 16 + sync stats                     790.64 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=15 W=31, split by y-row, elision on, spin 0 us
+          barriers per timestep 243.0 (update 26.0, extension 217.0)
+          share of thread time waiting for the slowest thread 17.8 % (update 2.9, extension 14.9), waking up 4.8 %; per barrier 10.2 + 2.7 us
+          per thread (waiting / waking %): 6.4/4.6 15.0/4.9 17.0/5.0 17.6/4.8 19.0/4.9 21.1/4.7 23.4/4.6 22.6/4.6
+=== 160x128x192_pml.xml
+   8t  ref flat                                       258.22 MC/s  reference
+   8t  new flat                                       260.72 MC/s  identical
+   8t  ref tblock 16                                 731.977 MC/s  identical
+   8t  new tblock 16 (lines, no elision)             956.069 MC/s  identical
+   8t  new tblock 16 (rows, no elision)              930.398 MC/s  identical
+   8t  new tblock 16 (lines, elision)                1032.99 MC/s  identical
+   8t  new tblock 16 (rows, elision)                 1001.27 MC/s  identical
+   8t  new tblock 8:16 (rows, elision)               745.647 MC/s  identical
+   8t  new tblock 16 (rows, elision, spin 50 us)     1143.48 MC/s  identical
+   8t  new tblock 16 + sync stats                    1000.76 MC/s  identical
+        AVX2 sync stats: 8 threads, 600 timesteps, blocked k=16 W=32, split by y-row, elision on, spin 0 us
+          barriers per timestep 171.0 (update 18.0, extension 153.0)
+          share of thread time waiting for the slowest thread 24.3 % (update 3.6, extension 20.7), waking up 11.5 %; per barrier 5.5 + 2.6 us
+          per thread (waiting / waking %): 14.2/11.2 20.7/11.9 21.9/12.2 22.3/11.9 24.3/11.8 26.6/11.5 31.0/11.2 33.4/10.8
+
+all identical
+
+====================================================================================================
+2a. One change at a time, TL model, i9-13900K (two rounds)
+====================================================================================================
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 8000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+ref/16:44                      1220.3         -        -        -         -     20.9     17.1  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/lines/noelide        1261.5     264.0     22.0     17.7 3.30+2.70     21.4     16.9  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/rows/noelide         1296.7     264.0     18.5     18.0 2.70+2.60     21.7     16.8  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/lines/elide          1534.2      91.7     19.6      8.0 7.00+2.90     24.9     16.2  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44                      1499.2      91.7     17.6      8.6 6.40+3.10     25.9     17.3  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/spin20               1701.5      91.7     15.3      1.8 4.90+0.60        -        -  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/spin100              1680.3      91.7     15.8      1.4 5.20+0.50        -        -  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16                          920.4      60.3     10.9      4.0 9.90+3.60     36.9     40.1  ACTIVE (prototype): k=16, tile width 75 x-lines, 35.7193 MB 
+new/16:36                      1596.3     108.3     16.6      9.3 4.80+2.70        -        -  ACTIVE (prototype): k=16, tile width 36 x-lines, 17.1453 MB 
+new/12:24                      1434.3     156.7     18.7     11.7 4.20+2.60     24.1     16.8  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB 
+new/flat                        401.4      50.0      5.9      1.7 14.90+4.30     43.1    107.3  not requested
+ref/16:44                      1209.2         -        -        -         -     20.8     17.2  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/lines/noelide        1207.1     264.0     23.8     18.2 3.80+2.90     21.7     18.0  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/rows/noelide         1197.5     264.0     21.1     18.9 3.40+3.00     22.6     18.9  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/lines/elide          1464.3      91.7     21.6      8.8 8.10+3.30     25.0     17.0  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44                      1553.2      91.7     15.7      7.9 5.60+2.80     25.9     16.7  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/spin20               1608.0      91.7     18.0      2.8 6.10+0.90        -        -  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/spin100              1679.3      91.7     16.7      1.5 5.50+0.50        -        -  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16                          928.2      60.3     10.4      4.0 9.40+3.60     36.9     39.8  ACTIVE (prototype): k=16, tile width 75 x-lines, 35.7193 MB 
+new/16:36                      1555.3     108.3     17.9      9.5 5.40+2.80     23.9     15.4  ACTIVE (prototype): k=16, tile width 36 x-lines, 17.1453 MB 
+new/12:24                      1441.9     156.7     18.6     11.6 4.10+2.60     24.0     16.6  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB 
+new/flat                        398.9      50.0      6.4      2.0 16.20+5.00     42.9    107.7  not requested
+
+====================================================================================================
+2b. One change at a time, TL model, ryzen5-5600G (two rounds)
+====================================================================================================
+ryzen5-5600G: 6 threads on CPUs 0-5, 8000 timesteps, tl_skin_sub1.xml; DRAM counters amd_df
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+ref/10:20                       680.5         -        -        -         -     18.8     27.6  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/lines/noelide         670.5     552.0     20.9     27.2 2.80+3.70     18.7     27.8  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/rows/noelide          698.0     552.0     16.2     28.3 2.10+3.70     19.4     27.7  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/lines/elide           883.7     189.0     18.5     13.3 5.60+4.00     24.2     27.4  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20                       929.3     189.0     12.4     14.0 3.50+4.00     25.3     27.2  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/spin20               1069.0     189.0     12.1      2.1 3.00+0.50     28.2     26.3  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/spin100              1103.4     189.0     11.4      0.9 2.70+0.20     28.5     25.8  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/16                          634.1     108.2      8.1      5.7 5.90+4.20     32.6     51.4  ACTIVE (prototype): k=16, tile width 33 x-lines, 15.7165 MB 
+new/12:24                       868.3     156.7     10.3     10.7 3.80+3.90     28.6     32.9  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB 
+new/8:16                        897.7     237.5     13.3     17.0 3.10+4.00     22.3     24.8  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/flat                        310.6      50.0      3.9      1.3 12.80+4.30     36.5    117.5  not requested
+ref/10:20                       680.3         -        -        -         -     18.8     27.7  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/lines/noelide         669.7     552.0     20.7     27.3 2.80+3.70     18.7     28.0  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/rows/noelide          695.0     552.0     16.1     28.5 2.10+3.70     19.3     27.7  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/lines/elide           887.6     189.0     18.5     13.3 5.50+4.00     24.2     27.2  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20                       928.5     189.0     12.2     14.0 3.50+4.00     25.3     27.2  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/spin20               1069.9     189.0     12.1      2.1 3.00+0.50     28.3     26.4  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/10:20/spin100              1098.5     189.0     11.5      0.9 2.80+0.20     28.6     26.0  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB 
+new/16                          630.4     108.2      8.2      5.7 6.00+4.20     32.6     51.7  ACTIVE (prototype): k=16, tile width 33 x-lines, 15.7165 MB 
+new/12:24                       869.9     156.7     10.3     10.8 3.80+4.00     28.6     32.8  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB 
+new/8:16                        897.1     237.5     13.4     17.0 3.20+4.00     22.1     24.6  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/flat                        310.5      50.0      3.9      1.3 12.70+4.30     36.5    117.6  not requested
+
+====================================================================================================
+2c. One change at a time, TL model, i7-6700K (two rounds)
+====================================================================================================
+i7-6700K: 4 threads on CPUs 0-3, 4000 timesteps, tl_skin_sub1.xml; DRAM counters not readable
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+ref/16                          293.1         -        -        -         -        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/lines/noelide            290.7     696.0     16.5     15.2 4.10+3.80        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/rows/noelide             308.7     696.0     10.0     14.8 2.30+3.50        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/lines/elide              343.1     237.5     13.4      6.9 8.30+4.30        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16                          353.5     237.5      7.6      6.6 4.50+4.00        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/spin20                   383.8     237.5      7.0      1.3 3.90+0.70        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/spin100                  385.0     237.5      6.6      0.2 3.60+0.10        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/6:12                        394.1     318.3      9.9      9.4 4.00+3.70        -        -  ACTIVE (prototype): k=6, tile width 12 x-lines, 5.71509 MB p
+new/8:24                        306.6     157.0      5.6      4.3 5.80+4.50        -        -  ACTIVE (prototype): k=8, tile width 24 x-lines, 11.4302 MB p
+new/flat                        256.8      50.0      4.0      1.5 15.70+6.00        -        -  not requested
+ref/16                          280.4         -        -        -         -        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/lines/noelide            291.6     696.0     16.4     15.2 4.10+3.80        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/rows/noelide             297.3     696.0     10.8     14.9 2.60+3.60        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/lines/elide              320.4     237.5     16.2      8.6 10.70+5.70        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16                          354.8     237.5      7.6      6.6 4.50+4.00        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/spin20                   380.8     237.5      6.9      1.1 3.80+0.60        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/16/spin100                  384.1     237.5      6.6      0.3 3.60+0.20        -        -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/6:12                        398.7     318.3      9.7      9.3 3.80+3.70        -        -  ACTIVE (prototype): k=6, tile width 12 x-lines, 5.71509 MB p
+new/8:24                        308.7     157.0      5.9      4.5 6.10+4.60        -        -  ACTIVE (prototype): k=8, tile width 24 x-lines, 11.4302 MB p
+new/flat                        256.0      50.0      4.1      1.5 16.10+6.10        -        -  not requested
+
+====================================================================================================
+3a. Tile sweep, new schedule, TL model, i9-13900K
+====================================================================================================
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 12000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin20                   972.4      60.3     11.6      1.6 9.90+1.30     37.1     38.2  ACTIVE (prototype): k=16, tile width 75 x-lines, 35.7193 MB 
+new/16/spin100                  943.7      60.3     12.9      1.7 11.40+1.50     37.1     39.3  ACTIVE (prototype): k=16, tile width 75 x-lines, 35.7193 MB 
+new/16:64/spin20               1140.5      60.1     12.5      1.9 9.20+1.40     35.4     31.1  ACTIVE (prototype): k=16, tile width 64 x-lines, 30.4805 MB 
+new/16:64/spin100              1202.1      60.1     11.2      0.9 7.80+0.60     35.5     29.5  ACTIVE (prototype): k=16, tile width 64 x-lines, 30.4805 MB 
+new/16:52/spin20               1548.4      75.3     14.1      1.5 6.10+0.60     29.3     18.9  ACTIVE (prototype): k=16, tile width 52 x-lines, 24.7654 MB 
+new/16:52/spin100              1572.7      75.3     14.2      1.1 6.00+0.50     28.7     18.3  ACTIVE (prototype): k=16, tile width 52 x-lines, 24.7654 MB 
+new/16:44/spin20               1687.5      91.7     16.0      1.7 5.20+0.60     25.6     15.2  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:44/spin100              1722.0      91.7     15.2      1.1 4.80+0.30     25.7     14.9  ACTIVE (prototype): k=16, tile width 44 x-lines, 20.9553 MB 
+new/16:36/spin20               1726.0     108.3     17.7      2.0 4.80+0.50     23.2     13.5  ACTIVE (prototype): k=16, tile width 36 x-lines, 17.1453 MB 
+new/16:36/spin100              1751.2     108.3     16.9      1.2 4.50+0.30     23.6     13.5  ACTIVE (prototype): k=16, tile width 36 x-lines, 17.1453 MB 
+new/16:32/spin20               1703.6     124.2     18.9      2.2 4.50+0.50     23.4     13.7  ACTIVE (prototype): k=16, tile width 32 x-lines, 15.2402 MB 
+new/16:32/spin100              1758.2     124.2     17.6      1.2 4.00+0.30     23.9     13.6  ACTIVE (prototype): k=16, tile width 32 x-lines, 15.2402 MB 
+new/12:24/spin20               1502.5     156.7     22.4      3.4 4.80+0.70     26.1     17.3  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB 
+new/12:24/spin100              1613.6     156.7     18.8      1.5 3.70+0.30     26.2     16.2  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB 
+new/8:16/spin20                1317.5     237.5     22.4      2.8 3.60+0.50     29.1     22.1  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+new/8:16/spin100               1373.3     237.5     20.3      1.6 3.10+0.30     29.8     21.7  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB p
+
+====================================================================================================
+3b. Tile sweep, new schedule, TL model, ryzen5-5600G
+====================================================================================================
+ryzen5-5600G: 6 threads on CPUs 0-5, 8000 timesteps, tl_skin_sub1.xml
+variant                  MC/s  barr/TS   wait%   wake%    us/barr    GB/s  B/cell  blocking
+new/16/spin20           674.0    108.2     7.6     1.1    5.2+0.8    34.1    50.7  ACTIVE (prototype): k=16, tile width 33 x-lines, 15.7165 MB per tile, 7 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/16/spin100          689.7    108.2     6.8     0.4    4.6+0.2    34.4    49.9  ACTIVE (prototype): k=16, tile width 33 x-lines, 15.7165 MB per tile, 7 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/12:28/spin20        924.2    140.3     9.2     1.5    3.6+0.6    31.5    34.1  ACTIVE (prototype): k=12, tile width 28 x-lines, 13.3352 MB per tile, 9 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/12:28/spin100       949.8    140.3     8.8     0.5    3.3+0.2    31.8    33.5  ACTIVE (prototype): k=12, tile width 28 x-lines, 13.3352 MB per tile, 9 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/12:24/spin20        959.8    156.7    10.0     1.7    3.4+0.6    31.1    32.4  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB per tile, 10 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/12:24/spin100       985.6    156.7     9.7     0.6    3.1+0.2    31.3    31.8  ACTIVE (prototype): k=12, tile width 24 x-lines, 11.4302 MB per tile, 10 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/10:20/spin20       1071.0    189.0    11.9     2.0    2.9+0.5    28.4    26.5  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB per tile, 12 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/10:20/spin100      1088.0    189.0    11.6     0.9    2.8+0.2    28.6    26.3  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB per tile, 12 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/8:16/spin20        1052.7    237.5    12.9     2.1    2.6+0.4    25.6    24.4  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB per tile, 15 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/8:16/spin100       1073.2    237.5    12.3     1.1    2.4+0.2    25.8    24.0  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB per tile, 15 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/6:12/spin20         931.2    318.3    13.6     2.0    2.3+0.3    26.7    28.7  ACTIVE (prototype): k=6, tile width 12 x-lines, 5.71509 MB per tile, 20 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/6:12/spin100        942.6    318.3    13.0     1.2    2.2+0.2    26.9    28.6  ACTIVE (prototype): k=6, tile width 12 x-lines, 5.71509 MB per tile, 20 tiles; L3 1 x 16 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+
+====================================================================================================
+3c. Tile sweep, new schedule, TL model, i7-6700K (no DRAM counters)
+====================================================================================================
+i7-6700K: 4 threads on CPUs 0-3, 4000 timesteps, tl_skin_sub1.xml
+variant                  MC/s  barr/TS   wait%   wake%    us/barr    GB/s  B/cell  blocking
+new/16/spin20           377.4    237.5     7.2     1.2    4.0+0.7       -       -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB per tile, 15 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/16/spin100          381.7    237.5     6.8     0.3    3.8+0.2       -       -  ACTIVE (prototype): k=8, tile width 16 x-lines, 7.62012 MB per tile, 15 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/10:20/spin20        338.1    189.0     5.5     1.0    4.3+0.8       -       -  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB per tile, 12 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/10:20/spin100       344.5    189.0     5.3     0.3    4.1+0.2       -       -  ACTIVE (prototype): k=10, tile width 20 x-lines, 9.52515 MB per tile, 12 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/6:12/spin20         436.2    318.3     9.3     1.6    3.4+0.6       -       -  ACTIVE (prototype): k=6, tile width 12 x-lines, 5.71509 MB per tile, 20 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/6:12/spin100        450.4    318.3     9.0     0.2    3.2+0.1       -       -  ACTIVE (prototype): k=6, tile width 12 x-lines, 5.71509 MB per tile, 20 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/5:10/spin20         465.4    383.0    10.7     1.5    3.0+0.4       -       -  ACTIVE (prototype): k=5, tile width 10 x-lines, 4.76257 MB per tile, 24 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/5:10/spin100        463.9    383.0    10.3     0.3    2.9+0.1       -       -  ACTIVE (prototype): k=5, tile width 10 x-lines, 4.76257 MB per tile, 24 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+new/4:8/spin20          456.5    496.0    12.7     2.0    2.8+0.4       -       -  ACTIVE (prototype): k=4, tile width 8 x-lines, 3.81006 MB per tile, 31 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 20 us
+new/4:8/spin100         467.2    496.0    12.1     0.4    2.6+0.1       -       -  ACTIVE (prototype): k=4, tile width 8 x-lines, 3.81006 MB per tile, 31 tiles; L3 1 x 8 MB (sysconf); split by y-row, barrier elision on, barrier spin 100 us
+
+====================================================================================================
+4a. Half cache (k lowered; new/16 on the intermediate build) against full cache, i9-13900K
+====================================================================================================
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 8000 timesteps, 224x224x224_pec.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 2322.6      59.0     13.9      0.5 11.40+0.40     33.6     14.5  ACTIVE (prototype): k=7, tile width 15 x-lines, 17.2266 MB p
+new/15:31/spin100              2970.6      27.0     10.5      0.4 14.70+0.60     27.1      9.1  ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB 
+new/12:24/spin100              2823.9      35.0     11.0      0.3 12.50+0.40     28.8     10.2  ACTIVE (prototype): k=12, tile width 24 x-lines, 27.5625 MB 
+new/10:20/spin100              2671.0      43.0     12.7      0.4 12.40+0.40     30.9     11.6  ACTIVE (prototype): k=10, tile width 20 x-lines, 22.9688 MB 
+new/16                         2281.7      59.0     12.4      3.6 10.30+3.00     33.1     14.5  ACTIVE (prototype): k=7, tile width 15 x-lines, 17.2266 MB p
+new/15:31                      2978.9      27.0      8.1      2.3 11.40+3.20     27.4      9.2  ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB 
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 12000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 1761.8     108.3     16.7      1.1 4.40+0.30     23.4     13.3  ACTIVE (prototype): k=16, tile width 37 x-lines, 17.6215 MB 
+new/16                         1661.7     108.3     14.8      8.9 4.10+2.50     22.8     13.7  ACTIVE (prototype): k=16, tile width 37 x-lines, 17.6215 MB 
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 4000 timesteps, 224x224x224_mur.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 1867.8     235.0     16.5      1.0 4.20+0.30        -        -  ACTIVE (prototype): k=7, tile width 15 x-lines, 17.2266 MB p
+new/15:31/spin100              2258.0     107.0     12.5      0.8 5.80+0.40        -        -  ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB 
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 4000 timesteps, 224x224x224_pml.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                  814.6     522.3     35.5      1.0 9.40+0.30     22.0     27.0  ACTIVE (prototype): k=7, tile width 15 x-lines, 17.2266 MB p
+new/15:31/spin100               831.4     243.0     20.0      0.6 11.10+0.30     33.9     40.7  ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB 
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 6000 timesteps, 160x128x192_pml.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 1226.2     171.0     24.4      0.9 4.60+0.20        -        -  ACTIVE (prototype): k=16, tile width 32 x-lines, 18 MB per t
+new/16:64/spin100               868.4      99.0     15.1      0.5 6.90+0.20     34.7     40.0  ACTIVE (prototype): k=16, tile width 64 x-lines, 36 MB per t
+
+====================================================================================================
+4b. The same on 224^3, ryzen5-5600G
+====================================================================================================
+ryzen5-5600G: 6 threads on CPUs 0-5, 4000 timesteps, 224x224x224_pec.xml; DRAM counters amd_df
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/3:6/spin100                1095.9     147.0      8.1      0.3 5.60+0.20     33.4     30.5  ACTIVE (prototype): k=3, tile width 6 x-lines, 6.89062 MB pe
+new/4:8/spin100                1289.7     111.0      7.7      0.3 6.00+0.20     31.0     24.0  ACTIVE (prototype): k=4, tile width 8 x-lines, 9.1875 MB per
+new/6:13/spin100               1644.0      67.0      7.6      0.2 7.70+0.20     26.6     16.2  ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB p
+new/8:16/spin100               1761.9      55.0      7.2      0.2 8.30+0.20     26.3     15.0  ACTIVE (prototype): k=8, tile width 16 x-lines, 18.375 MB pe
+ryzen5-5600G: 6 threads on CPUs 0-5, 4000 timesteps, 224x224x224_mur.xml; DRAM counters amd_df
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/3:6/spin100                 954.5     587.0     11.6      1.0 2.30+0.20     29.9     31.3  ACTIVE (prototype): k=3, tile width 6 x-lines, 6.89062 MB pe
+new/4:8/spin100                1104.2     443.0     10.2      0.9 2.30+0.20     27.3     24.8  ACTIVE (prototype): k=4, tile width 8 x-lines, 9.1875 MB per
+new/6:13/spin100               1401.8     267.0      8.5      0.8 2.50+0.20     23.6     16.9  ACTIVE (prototype): k=6, tile width 13 x-lines, 14.9297 MB p
+new/8:16/spin100               1410.0     219.0      7.9      0.7 2.90+0.20     24.6     17.4  ACTIVE (prototype): k=8, tile width 16 x-lines, 18.375 MB pe
+
+====================================================================================================
+5. Final build, auto tile (rule C), spin 100 us, i9-13900K
+====================================================================================================
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 12000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 1760.4     108.3     16.5      1.1 4.40+0.30     23.7     13.5  ACTIVE (prototype): k=16, tile width 37 x-lines, 17.6215 MB 
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 8000 timesteps, 224x224x224_pec.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 2942.6      27.0     10.6      0.4 14.90+0.60     27.9      9.5  ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB 
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 4000 timesteps, 224x224x224_mur.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 2191.1     107.0     12.7      0.8 6.10+0.40        -        -  ACTIVE (prototype): k=15, tile width 31 x-lines, 35.6016 MB 
+i9-13900K: 8 threads on CPUs 0,2,4,6,8,10,12,14, 6000 timesteps, 160x128x192_pml.xml; DRAM counters uncore_imc_free_running
+variant                          MC/s   barr/TS   wait %   wake %   us/barr     GB/s   B/cell  blocking
+new/16/spin100                 1213.8     171.0     24.7      1.0 4.70+0.20        -        -  ACTIVE (prototype): k=16, tile width 32 x-lines, 18 MB per t

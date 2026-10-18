@@ -42,6 +42,12 @@ This is the one-page answer. §2 onward is the detail and the method.
   worthwhile on a large undivided cache on weaker parts (≈1.4× on the i5-8500),
   and recovers to roughly break-even even on a dual-socket server once its tile
   width is set by hand (§5.2–§5.3).
+- **Cheaper synchronisation in that CPU schedule** (2026-10): fewer barriers, a
+  per-row work split, an optional spinning barrier, and tiles that leave half
+  the cache free where the model's coefficient tables need it. On a 5 M-cell
+  transmission line with Mur and lumped ports that is **1.6×–2.0×** over the
+  blocked schedule's previous default on three machines, bit-identical to it
+  (§5.7). The other figures in this list predate it.
 - **The largest CPU-only result comes from a modest part.** The Ryzen 5 5600G
   reaches **1.96×–3.79×** upstream's best on every model with no discrete GPU
   involved. Along with the i9-13900K it is one of only two hosts whose blocked
@@ -73,7 +79,9 @@ This is the one-page answer. §2 onward is the detail and the method.
 - **CPU temporal blocking needs a large, undivided last-level cache.** On the
   i7-6700K's 8 MB L3 the gains collapse to **1.05×–1.42×** and the Mur model
   **regresses 13%** (0.87×), because the tile shrinks to what the cache allows
-  (§5.3). It is opt-in, so this costs nothing unless asked for.
+  (§5.3). It is opt-in, so this costs nothing unless asked for. These figures
+  predate §5.7, which measured the i7-6700K's blocked schedule 1.6× faster
+  than before on a transmission-line model; the matrix has not been re-run.
 - **The CPU blocking tile width is derived from one cache instance**, not from
   the cache the running threads collectively have. On a partitioned LLC this
   makes the shipped schedule a **30–50% regression** on a dual-socket server
@@ -766,6 +774,12 @@ why the row reads ~1.00× rather than a regression.
 
 ### 5.3 CPU limits: a large, undivided cache — and the tile-width defect
 
+> **Since 2026-10 (§5.7)** the derived tile width starts at half the cache the
+> threads span. It widens back towards all of it when that keeps the block
+> depth on a model with small coefficient tables. The blocked schedule's
+> synchronisation is also much cheaper. The tables in this section were
+> measured before both changes.
+
 On the i7-6700K's 8 MB L3 the schedule's gains collapse and one model regresses:
 
 | Model | tile geometry chosen | flat → blocked (4t) | |
@@ -992,6 +1006,184 @@ in §5.2 and §5.4:
   past Nyquist will not reach these figures.
 - **These models have no probes or dumps at all**, so they see the ceiling of
   what blocking can do. A probe-dense model will land lower.
+
+### 5.7 The CPU schedule was synchronisation-bound, and its tile must leave room for the coefficients (2026-10)
+
+A production run made the problem visible. On the δ/10 skin-depth mesh of an
+on-chip line (247×153×133 = 5.03 M cells, 0.48 MB per x-plane, Mur on all six
+faces, two lumped ports), the GPU engine kept its cards at 100 %, while the
+blocked CPU workers sat at **79–89 % busy**. Each worker went to sleep about
+**30 000 times a second**, roughly 185 times per timestep. Memory stalls count
+as busy time, so the missing time was sleep, at barriers. Three costs added up:
+
+- **Barrier count.** The blocked path barriers after every extension hook, once
+  per timestep for every tile and every wedge. On this model that is 24
+  barriers per sweep step: six Mur faces with three hooks each, a lumped port
+  and the excitation with two each, and two field updates. Per timestep that
+  came to 264 barriers on the i9-13900K at 16:44 tiles, 552 on the Ryzen 5
+  5600G at 10:20 and 696 on the i7-6700K at 8:16.
+- **Waking up.** `Barrier` is a mutex plus a condition variable. A thread that
+  arrives early sleeps in the kernel and takes 3–4 µs to run again after the
+  release. With the old schedule that was **18–28 % of all thread time**.
+- **Splitting by x-line.** Each step's slab was divided over the threads in
+  whole x-lines, but slabs are often only a few lines wide and wedges start at
+  one. Replaying the schedule gives a work balance of 0.81–0.91 at 6–8 threads
+  on this model, and 0.59 at 32.
+
+Four changes address these. All are switchable, so each can be measured on its
+own against the old behaviour in the same binary:
+
+| Change | Switch | Default |
+|---|---|---|
+| Skip a hook and its barrier for a slab the extension cannot reach (`SlabTouches()`: the Mur faces normal to x, lumped elements, excitation, UPML regions). Run consecutive hooks that only read the fields without a barrier between them (`SlabHookWritesFields()`: the Mur pre/post hooks, the lumped-element pre hook) | `OPENEMS_AVX2_TBLOCK_ELIDE=0` restores the old behaviour | on |
+| Split each slab's update by y-row, a contiguous range of memory, instead of by x-line | `OPENEMS_AVX2_TBLOCK_SPLIT=lines` restores | on |
+| `HybridBarrier`: atomic arrival, and an optional spin before sleeping | `OPENEMS_AVX2_BARRIER_SPIN_US=<µs>` | 0 (no spin) |
+| Per-thread barrier counts, time spent waiting for the slowest thread, and time spent waking up, printed at the end of the run | `OPENEMS_AVX2_SYNC_STATS=1` | off |
+
+**Results are bit-identical, not merely close.**
+`python/Tests/tblock_identity.py` dumps E and H over the whole domain for
+every variant and compares them bit for bit with the previous build's flat
+sweep: both builds, flat and blocked, both splits, elision on and off,
+spinning, and sync statistics on. Six models (the TL case; 224³ Mur, PML_8
+and PEC; 160×128×192 PML_8 and PEC), each at 8 and 7 threads, came out
+identical. The previous build's own blocked schedule matches as well.
+
+**Each change on its own**, on the TL model with the tile width fixed (MC/s;
+"waiting" is waiting for the slowest thread, "waking" is waking up after the
+release; both are shares of thread time):
+
+| Ryzen 5 5600G, 6 threads, 10:20 | MC/s | barriers per timestep | waiting | waking |
+|---|---|---|---|---|
+| previous build | 680 | – | – | – |
+| new build, old schedule | 671 | 552 | 20.9 % | 27.2 % |
+| + split by y-row | 698 | 552 | 16.2 % | 28.3 % |
+| elision only (split by x-line) | 884 | 189 | 18.5 % | 13.3 % |
+| y-row split + elision | 929 | 189 | 12.4 % | 14.0 % |
+| + spin 20 µs | 1069 | 189 | 12.1 % | 2.1 % |
+| + spin 100 µs | **1103** | 189 | 11.4 % | 0.9 % |
+
+| i9-13900K, 8 P-cores, 16:44 (two rounds) | MC/s | barriers per timestep | waiting | waking |
+|---|---|---|---|---|
+| previous build | 1220 / 1209 | – | – | – |
+| new build, old schedule | 1262 / 1207 | 264 | 22–24 % | 18 % |
+| y-row split + elision | 1499 / 1553 | 92 | 16–18 % | 8–9 % |
+| + spin 100 µs | **1680 / 1679** | 92 | 16–17 % | 1.5 % |
+
+On the i7-6700K (4 threads, its auto tile of 8:16), the previous build ran at
+293 MC/s, y-row split plus elision at 354 and spin 100 µs at 385. Elision is
+the largest single step: it removes two thirds of the barriers. Spinning
+removes almost all of the waking time. The y-row split is worth 3–7 % at these
+thread counts and should matter more at 16–32 (see the balance model above).
+DRAM traffic per cell update does not change: the gain is synchronisation
+alone.
+
+**The tile-width optimum moved, on this model to about half the cache.** With
+all three changes on, the width was swept by hand (spin 20 µs / 100 µs, k=16 on
+the i9-13900K). "Previous build" is the same sweep done the day before on the
+old schedule. Bytes per cell update are DRAM traffic divided by cell updates,
+from the memory-controller counters at spin 100 µs:
+
+| i9-13900K, 36 MB L3 — tile (share of L3) | previous build | spin 20 | spin 100 | B/cell |
+|---|---|---|---|---|
+| 75 lines, auto at the time (99 %) | 865 | 972 | 944 | 39 |
+| 64 (85 %) | 954 | 1141 | 1202 | 30 |
+| 52 (69 %) | 1186 | 1548 | 1573 | 18 |
+| 44 (58 %) | 1208 | 1688 | 1722 | 15 |
+| 36 (48 %) | 1165 | 1726 | 1751 | 14 |
+| 32 (42 %) | – | 1704 | **1758** | 14 |
+| 12:24 (32 %) | – | 1503 | 1614 | 16 |
+| 8:16 (21 %) | – | 1318 | 1373 | 22 |
+| flat sweep | 387 | 401 (no spin) | | 107 |
+
+| Ryzen 5 5600G, 16 MB L3 — tile (share of L3) | previous build | spin 20 | spin 100 | B/cell |
+|---|---|---|---|---|
+| 16:33, auto at the time (98 %) | 552 | 674 | 690 | 50 |
+| 12:28 (83 %) | – | 924 | 950 | 34 |
+| 12:24 (71 %) | 679 | 960 | 986 | 32 |
+| 10:20 (60 %) | 681 | 1071 | **1088** | 26 |
+| 8:16 (48 %) | 618 | 1053 | 1073 | 24 |
+| 6:12 (36 %) | – | 931 | 943 | 29 |
+
+| i7-6700K, 8 MB L3 — tile (share of L3) | previous build | spin 20 | spin 100 |
+|---|---|---|---|
+| 8:16, auto at the time (95 %) | 293 | 377 | 382 |
+| 10:20 (119 %) | – | 338 | 345 |
+| 6:12 (71 %) | – | 436 | 450 |
+| 5:10 (60 %) | – | 465 | 464 |
+| 4:8 (48 %) | – | 457 | **467** |
+
+For this model, on all three machines, the best tile fills 40–60 % of the L3,
+across a broad plateau, and a full-cache tile is 1.2–1.9× slower. That is a
+property of the model, not of the cache:
+- **The TL model's tables are as large as its fields.** Its strongly graded
+  mesh gives the compressed coefficient tables 317 192 unique entries, 122 MB,
+  as large as the field arrays. The tile accounting counts only the fields, so
+  half the cache by that measure is about all of it in practice.
+- **The uniform 224³ grids are the opposite.** With 12 unique entries, a
+  half-cache tile only forces k down, and a full-cache tile that keeps k wins:
+
+| spin 100 µs | half cache, k lowered | full cache, k kept |
+|---|---|---|
+| i9-13900K, 224³ PEC | 2323 (7:15) | **2971** (15:31) |
+| i9-13900K, 224³ Mur | 1868 (7:15) | **2258** (15:31) |
+| i9-13900K, 224³ PML_8 | 815 (7:15) | **831** (15:31) |
+| Ryzen 5 5600G, 224³ PEC | 1096 (3:6) | 1644 (6:13); **1762** at 8:16 |
+| Ryzen 5 5600G, 224³ Mur | 955 (3:6) | 1402 (6:13); **1410** at 8:16 |
+| i9-13900K, 160×128×192 PML_8 | **1226** (16:32) | 868 (16:64) |
+
+The last row is the TL case again, from another direction. Half the cache
+still allows k=16 there, and the UPML regions' per-cell state takes the other
+half.
+
+So `ConfigureTemporalBlocking()` now works like this:
+1. **Start at half the L3 the threads span.**
+2. **Widen to keep k where tables are small.** If that tile is narrower than
+   2k and the coefficient tables are under a quarter of the field bytes, widen
+   it up to the full L3 to keep k.
+3. **Otherwise lower k.** Beyond that, k drops to W/2. A shallow block that
+   stays resident beats a deep one that does not (4:8 over 8:16 on the
+   i7-6700K).
+
+On the nine model/machine pairs measured, this lands within 7 % of the best
+hand-set tile; the worst is 224³ PEC on the Ryzen, at 6:13 against 8:16.
+Checked on the final build on the i9-13900K (auto tile, spin 100 µs):
+
+| Model | Tile chosen | MC/s |
+|---|---|---|
+| TL model | 16:37 | 1760 |
+| 224³ PEC | 15:31 | 2943 |
+| 224³ Mur | 15:31 | 2191 |
+| 160×128×192 PML_8 | 16:32 | 1214 | The
+rule is fitted to those nine cases, and the tile campaign in OPTIMIZATIONS.md
+§4.9 (D4) is what will show whether it holds beyond them.
+
+On the TL model, against each machine's best tile on the previous build, the
+new schedule is **+46 %** on the i9-13900K and **+60 %** on the Ryzen 5 5600G.
+Against the previous auto tile it is **2.0×** on both and **1.6×** on the
+i7-6700K. A full 60 ps run of this model on the i9-13900K drops from 26 h
+(previous auto tile) to about 12.6 h.
+
+Spin 100 µs beat 20 µs in 21 of 23 pairs, by 1–7 %, and the two exceptions
+are within 1 %. It is not the default yet: a spinning thread shows as 100 %
+CPU and costs power, and on a host with more runnable threads than cores it
+takes time from the thread being waited for. About **12–20 % of thread time
+is still spent waiting for the slowest thread**, more as tiles narrow. What
+remains to try is in OPTIMIZATIONS.md §4.9.
+
+What these numbers are not:
+- **Few models, and short runs.** The full tile sweeps are single runs of
+  8000–12000 timesteps on the TL model. The other models only have the
+  half/full comparison above, and only the i9-13900K ablation has a second
+  round.
+- **Not quiet machines.** The i9-13900K runs a desktop and the i7-6700K serves
+  applications; only the Ryzen 5 5600G was idle.
+- **Not the §5.2 matrix.** The §5.2/§5.3 matrix and §8 predate this and have
+  not been re-run. The new tile rule is also untested on the multi-socket
+  hosts.
+
+Raw output: `python/Tests/results/tblock_sync_2026-10-18.txt`. The driver is
+`python/Tests/bench_tblock_sync.py`; it reads the memory controllers through
+`perf` when `kernel.perf_event_paranoid` ≤ 0.
 
 ---
 
