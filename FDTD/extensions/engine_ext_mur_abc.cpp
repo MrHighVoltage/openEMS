@@ -133,6 +133,16 @@ bool Engine_Ext_Mur_ABC::SlabRange(unsigned int startX, unsigned int stopX, int 
 	// holds both at the same timestep. The schedule guarantees such a slab
 	// exists at either domain edge (see SupportsSlabApply()); this test only
 	// picks out which slab it is, it is not what makes the case safe.
+	return SlabTouches(SLAB_PRE_VOLT, startX, stopX);
+}
+
+bool Engine_Ext_Mur_ABC::SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const
+{
+	(void)hook;
+	// The same test SlabRange() applies to a plane normal to x, so the two
+	// cannot disagree; every other orientation crosses every slab.
+	if (m_ny!=0)
+		return true;
 	return (m_LineNr>=startX) && (m_LineNr<stopX) &&
 	       ((unsigned int)m_LineNr_Shift>=startX) && ((unsigned int)m_LineNr_Shift<stopX);
 }

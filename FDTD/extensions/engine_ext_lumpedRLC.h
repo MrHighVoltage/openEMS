@@ -44,10 +44,17 @@ public:
 	//! no coupling to a neighbouring cell, so an x-range restriction is exact.
 	virtual bool SupportsSlabApply() const {return true;}
 	virtual unsigned int SlabHookMask() const {return SLAB_PRE_VOLT | SLAB_APPLY_VOLT;}
+	virtual bool SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const
+	{(void)hook; return (m_xLo<stopX) && (startX<m_xHi);}
+	//! The pre-update hook only advances the inductor currents from this extension's own history.
+	virtual bool SlabHookWritesFields(SlabHook hook) const {return hook != SLAB_PRE_VOLT;}
 	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 
 protected:
+	//! The elements' x-extent [m_xLo,m_xHi); empty without elements.
+	unsigned int m_xLo, m_xHi;
+
 	void DoPreVoltageUpdatesImpl(int numTS, unsigned int startX, unsigned int stopX);
 
 	template <typename EngType>

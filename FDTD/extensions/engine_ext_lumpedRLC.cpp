@@ -32,6 +32,14 @@ Engine_Ext_LumpedRLC::Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC* op_ext_RLC) :
 	v_Jn		= new FDTD_FLOAT*[3];
 	v_Il		= NULL;
 
+	m_xLo = m_xHi = 0;
+	for (unsigned int posIdx = 0 ; posIdx < m_Op_Ext_RLC->RLC_count ; ++posIdx)
+	{
+		const unsigned int x = m_Op_Ext_RLC->v_RLC_pos[0][posIdx];
+		if (posIdx==0 || x<m_xLo) m_xLo = x;
+		if (posIdx==0 || x+1>m_xHi) m_xHi = x+1;
+	}
+
 	// No additional allocations are required if there are no actual lumped elements.
 	if (!(m_Op_Ext_RLC->RLC_count))
 		return;

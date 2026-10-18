@@ -74,6 +74,16 @@ protected:
 	virtual void UpdateVoltages(unsigned int startX, unsigned int numX);
 	virtual void UpdateCurrents(unsigned int startX, unsigned int numX);
 
+	//! The same updates for the y-rows [yStart,yStop) of the single x-line \a x.
+	/*!
+	  Every cell of a half-step depends only on the other field, so any split of
+	  the cells gives the same result bit for bit; these let a caller split a
+	  range finer than whole x-lines. UpdateCurrents() covers y < numLines[1]-1,
+	  so \a yStop must not exceed that for UpdateCurrentRows().
+	*/
+	void UpdateVoltageRows(unsigned int x, unsigned int yStart, unsigned int yStop);
+	void UpdateCurrentRows(unsigned int x, unsigned int yStart, unsigned int yStop);
+
 	unsigned int numVectors; //!< number of 8-wide AVX vectors along z
 
 public: // public access for efficient extension/interface access

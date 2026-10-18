@@ -136,6 +136,30 @@ public:
 	*/
 	virtual unsigned int SlabHookMask() const {return 0;}
 
+	//! Can \a hook do anything at all for the slab [startX,stopX)?
+	/*!
+	  The engine calls every hook once per timestep per tile and barriers
+	  after it, also for tiles the extension never reaches -- a Mur plane at
+	  x=0 is only ever in the first one. Returning false lets the engine skip
+	  the call and its barrier for that slab. Return false only when the hook
+	  would provably do nothing there on every thread; the answer may depend
+	  on the slab, but not on the timestep or the thread. The default, true,
+	  is always safe.
+	*/
+	virtual bool SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const
+	{(void)hook; (void)startX; (void)stopX; return true;}
+
+	//! Does \a hook write the engine's fields?
+	/*!
+	  A hook that only reads the fields, and writes nothing but this
+	  extension's own state, cannot change what another such hook reads, so
+	  the engine runs consecutive hooks of that kind without a barrier between
+	  them; it still barriers before anything that writes the fields. Return
+	  false only for hooks that honour exactly that. The default, true, is
+	  always safe.
+	*/
+	virtual bool SlabHookWritesFields(SlabHook hook) const {(void)hook; return true;}
+
 	//! \copydoc DoPreVoltageUpdates
 	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
 	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}

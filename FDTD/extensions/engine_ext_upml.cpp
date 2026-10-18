@@ -88,6 +88,15 @@ bool Engine_Ext_UPML::ThreadLocalX(int threadID, unsigned int& locStart, unsigne
 	return locStop > locStart;
 }
 
+bool Engine_Ext_UPML::SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const
+{
+	(void)hook;
+	// Exactly when SlabShare() below finds a non-empty intersection.
+	const unsigned int lo = m_Op_UPML->m_StartPos[0];
+	const unsigned int hi = lo + m_Op_UPML->m_numLines[0];
+	return (lo < stopX) && (startX < hi);
+}
+
 bool Engine_Ext_UPML::SlabLocalX(unsigned int startX, unsigned int stopX, int threadID,
                                  unsigned int& locStart, unsigned int& locStop) const
 {

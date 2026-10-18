@@ -22,6 +22,7 @@
 #include "engine_avx2.h"
 
 #include <chrono>
+#include <cstdint>
 #include <thread>
 #include <vector>
 #include "tools/barrier.h"
@@ -104,6 +105,14 @@ protected:
 	                       unsigned int& start, unsigned int& stop);
 	//! One trapezoid: k timesteps over a narrowing (dir=+1) or widening (dir=-1) x-range.
 	void TrapezoidSweep(int A0, int B0, int k, int dir, int t0, unsigned int threadID);
+	//! This thread's share of the voltage / current update of the x-lines [lo,hi).
+	/*!
+	  Split by y-rows, not whole x-lines (unless OPENEMS_AVX2_TBLOCK_SPLIT=lines):
+	  a slab is often only a few x-lines wide, and a wedge starts at one, so a
+	  split by x-line leaves most threads waiting on whichever got one more.
+	*/
+	void UpdateVoltageShare(int lo, int hi, unsigned int threadID);
+	void UpdateCurrentShare(int lo, int hi, unsigned int threadID);
 
 	//! The blocked counterparts of DoPreVoltageUpdates() and friends.
 	void SlabPreVoltage(unsigned int startX, unsigned int stopX, int numTS, unsigned int threadID);
@@ -115,11 +124,31 @@ protected:
 	//! Worker body for the blocked schedule.
 	void BlockedWorker(unsigned int threadID);
 
+	//! Wait at m_IterateBarrier, counting the wait if OPENEMS_AVX2_SYNC_STATS is set.
+	enum SyncKind { SYNC_UPDATE = 0, SYNC_HOOK = 1 };
+	void SyncWait(unsigned int threadID, SyncKind kind);
+	//! Print and clear the synchronisation statistics gathered so far.
+	void PrintSyncStats();
+
 	const Operator_AVX2_Multithread* m_Op_MT;
 	std::vector<std::thread> m_threads;
 	Barrier* m_startBarrier;
 	Barrier* m_stopBarrier;
-	Barrier* m_IterateBarrier;
+	HybridBarrier* m_IterateBarrier;
+	unsigned int m_barrierSpinUs;  //!< OPENEMS_AVX2_BARRIER_SPIN_US: spin before sleeping at m_IterateBarrier
+
+	// --- synchronisation statistics (OPENEMS_AVX2_SYNC_STATS=1) ---
+	//! Per worker, one cache line each so the counters do not share one.
+	struct alignas(64) SyncStats
+	{
+		uint64_t rounds[2];   //!< barrier rounds, by SyncKind
+		int64_t  waitNs[2];   //!< arrival until the last thread arrived
+		int64_t  wakeNs[2];   //!< release until this thread was running again
+		int64_t  activeNs;    //!< time between the start and stop barriers
+		uint64_t timesteps;   //!< timesteps advanced while active
+	};
+	bool m_syncStats;
+	std::vector<SyncStats> m_sync;
 	volatile unsigned int m_iterTS;
 	unsigned int m_numThreads;
 	unsigned int m_max_numThreads;
@@ -147,6 +176,8 @@ protected:
 	*/
 	std::vector<int> m_blk_edges;
 	bool m_blk_active;       //!< workers take the trapezoidal path this batch
+	bool m_blk_rowSplit;     //!< split slab updates by y-row (OPENEMS_AVX2_TBLOCK_SPLIT)
+	bool m_blk_elide;        //!< skip or merge extension barriers (OPENEMS_AVX2_TBLOCK_ELIDE)
 };
 
 #endif // ENGINE_AVX2_MULTITHREAD_H

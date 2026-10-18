@@ -51,6 +51,8 @@ public:
 	virtual bool SupportsSlabApply() const {return true;}
 	virtual unsigned int SlabHookMask() const
 	{return SLAB_PRE_VOLT | SLAB_POST_VOLT | SLAB_PRE_CURR | SLAB_POST_CURR;}
+	//! A region is a box: a slab that misses its x-range has nothing to do.
+	virtual bool SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const;
 
 	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 	virtual void DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);

@@ -44,6 +44,10 @@ public:
 	virtual bool SupportsSlabApply() const;
 	virtual unsigned int SlabHookMask() const
 	{return SLAB_PRE_VOLT | SLAB_POST_VOLT | SLAB_APPLY_VOLT;}
+	//! A plane normal to x lives in one slab; the other two orientations span x.
+	virtual bool SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const;
+	//! The pre- and post-update hooks only fill this extension's plane buffers.
+	virtual bool SlabHookWritesFields(SlabHook hook) const {return hook == SLAB_APPLY_VOLT;}
 
 	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 	virtual void DoPostVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);

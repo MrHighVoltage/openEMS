@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <string>
 #include <iomanip>
+#include <sstream>
 #include <unistd.h>
 
 using std::cout;
@@ -74,6 +75,21 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	m_blk_k = 0;
 	m_blk_W = 0;
 	m_blk_active = false;
+
+	// Synchronisation knobs of the blocked schedule, kept switchable so each
+	// can be measured against the old behaviour on the same binary.
+	m_barrierSpinUs = 0;
+	if (const char* env = std::getenv("OPENEMS_AVX2_BARRIER_SPIN_US"))
+		m_barrierSpinUs = (unsigned int)std::strtoul(env, nullptr, 10);
+	m_syncStats = false;
+	if (const char* env = std::getenv("OPENEMS_AVX2_SYNC_STATS"))
+		m_syncStats = (env[0] == '1');
+	m_blk_rowSplit = true;
+	if (const char* env = std::getenv("OPENEMS_AVX2_TBLOCK_SPLIT"))
+		m_blk_rowSplit = (std::string(env) != "lines");
+	m_blk_elide = true;
+	if (const char* env = std::getenv("OPENEMS_AVX2_TBLOCK_ELIDE"))
+		m_blk_elide = (env[0] != '0');
 }
 
 Engine_AVX2_Multithread::~Engine_AVX2_Multithread()
@@ -114,6 +130,7 @@ void Engine_AVX2_Multithread::Reset()
 {
 	if (!m_threads.empty())
 	{
+		PrintSyncStats();
 		ClearExtensions();
 
 		m_stopThreads = true;
@@ -135,6 +152,7 @@ void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 {
 	if (!m_threads.empty())
 	{
+		PrintSyncStats();
 		m_stopThreads = true;
 		m_startBarrier->wait();
 		for (auto& t : m_threads) t.join();
@@ -143,6 +161,7 @@ void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 
 	m_numThreads = numThreads;
 	m_stopThreads = false;
+	m_sync.assign(m_numThreads, SyncStats());
 
 	if (g_settings.GetVerboseLevel() > 0)
 		cout << "AVX2 multithreaded engine using " << m_numThreads << " threads. Utilization: (";
@@ -152,7 +171,7 @@ void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 	m_Op_MT->CalcStartStopLines(m_numThreads, m_Start_Lines, m_Stop_Lines);
 
 	delete m_IterateBarrier;
-	m_IterateBarrier = new Barrier(m_numThreads);
+	m_IterateBarrier = new HybridBarrier(m_numThreads, m_barrierSpinUs);
 
 	delete m_startBarrier;
 	m_startBarrier = new Barrier(m_numThreads + 1);
@@ -252,22 +271,37 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	if (!endPtr || k < 2 || (*endPtr != '\0' && *endPtr != ':'))
 		return;
 
-	// One tile of both field arrays should be about the last-level cache the
-	// run has. That is not obvious a priori -- a trapezoid's swept range shrinks
-	// from W to W-2k as it advances, so its live set is smaller than W planes --
-	// but it is what the measurements land on: the optimum was W=64 on a grid
-	// with 0.56 MB x-planes and W=32 on one with 1.20 MB, i.e. 36 and 38 MB,
-	// against an i9-13900K's 36 MB L3. "The cache the run has" is the sum over
-	// the L3 instances its threads occupy, not one of them: the tile is split
-	// across cores in x, so each core's slab lands in its own instance. Taking
-	// one instance made tiles 2-4x too narrow on multi-socket servers and
-	// multi-CCX Ryzens (PERFORMANCE.md §5.3).
+	// One tile of both field arrays should be about half the last-level cache
+	// the run has -- unless that costs block depth on a model with little else
+	// to cache. Measured with the cheaper synchronisation below (PERFORMANCE.md
+	// §5.7): on a graded-mesh transmission line the optimum was 40-60 % of the
+	// L3 on three hosts, and its compressed coefficient tables (317k unique
+	// entries, 122 MB) were as large as its fields. The accounting here counts
+	// only the fields, so there "half" is the whole cache in practice; extension
+	// state (UPML) has the same effect. On uniform grids with a handful of
+	// unique coefficients, a full-cache tile that kept k beat a half-cache one
+	// that forced k down to 3-7 by 17-38 %. Hence: half the cache, and where
+	// that is narrower than 2k and the coefficient tables are small next to the
+	// fields, widen up to the full cache to keep k. Past that, k is lowered to
+	// fit (below): a shallow block that stays resident beat a deep one that did
+	// not (4:8 over 8:16 on an 8 MB L3). "The cache the run has" is the sum
+	// over the L3 instances its threads occupy, not one of them: the tile is
+	// split across cores, so each core's share lands in its own instance.
+	// Taking one instance made tiles 2-4x too narrow on multi-socket servers
+	// and multi-CCX Ryzens (§5.3).
 	const double planeBytes = 2.0 * (double)m_vs_x * sizeof(f8vector);
+	const double fieldBytes = planeBytes * (double)numLines[0];
 	const LLC_Span llc = QueryLastLevelCaches(m_numThreads);
 	long cacheBytes = (long)llc.totalBytes;
 	if (cacheBytes <= 0)
 		cacheBytes = 32L * 1024 * 1024;
-	long W = (long)((double)cacheBytes / planeBytes);
+	long W = (long)(0.5 * (double)cacheBytes / planeBytes);
+	// vv, vi, iv and ii, three polarisations each; uncompressed, they are twice the fields.
+	const double tableBytes = Op->m_Use_Compression
+		? (double)Op->m_numCompressedEntries * 12.0 * sizeof(f8vector)
+		: 2.0 * fieldBytes;
+	if (W < 2 * k && tableBytes < 0.25 * fieldBytes)
+		W = std::min((long)((double)cacheBytes / planeBytes), 2 * k);
 
 	if (*endPtr == ':')
 	{
@@ -326,7 +360,6 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	// nothing (measured -32% on a 96^3 grid), so do not engage. 48 MB is the
 	// threshold measured against a 36 MB L3; it scales with the cache the run
 	// has, but is kept as a floor so single-cache hosts behave as before.
-	const double fieldBytes = planeBytes * (double)numLines[0];
 	const double fitsBytes = std::max(48.0 * 1024 * 1024, cacheBytes * 4.0 / 3.0);
 	if (fieldBytes < fitsBytes && !force)
 	{
@@ -370,7 +403,10 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	     << ", tile width " << m_blk_W << " x-lines, "
 	     << (planeBytes * m_blk_W / (1024 * 1024)) << " MB per tile, "
 	     << (m_blk_edges.size() - 1) << " tiles; L3 " << llc.instances << " x "
-	     << (llc.instanceBytes / (1024 * 1024)) << " MB (" << llc.source << ")" << endl;
+	     << (llc.instanceBytes / (1024 * 1024)) << " MB (" << llc.source << "); coefficient tables "
+	     << (tableBytes / (1024 * 1024)) << " MB; split by "
+	     << (m_blk_rowSplit ? "y-row" : "x-line") << ", barrier elision "
+	     << (m_blk_elide ? "on" : "off") << ", barrier spin " << m_barrierSpinUs << " us" << endl;
 }
 
 void Engine_AVX2_Multithread::SplitRange(int lo, int hi, unsigned int nThreads,
@@ -388,44 +424,57 @@ void Engine_AVX2_Multithread::SplitRange(int lo, int hi, unsigned int nThreads,
 }
 
 // The six slab dispatchers below mirror the flat path's DoPreVoltageUpdates()
-// and friends exactly: same extension order (pre-hooks walk m_Eng_exts
-// backwards, since it is sorted by descending priority), same barrier after
-// every single extension. Getting either wrong is not a performance bug but a
-// correctness one -- two extensions can touch the same cell, and the flat path
-// is what defines who goes first.
-// An extension that does not implement a hook is skipped along with its
-// barrier: a no-op call is free but the barrier after it is not, and the
-// blocked path pays that barrier once per timestep *per tile*. With six or
-// seven extensions -- one per boundary face is ordinary -- that is the
-// difference between 42 barriers per timestep per tile and about 20. Every
-// thread reads the same masks, so they cannot disagree on how many barriers
-// this pass has.
-#define SLAB_DISPATCH_FWD(NAME, HOOK, BIT)                                     \
-void Engine_AVX2_Multithread::NAME(unsigned int startX, unsigned int stopX,    \
-                                   int numTS, unsigned int threadID)           \
-{                                                                              \
-	for (size_t n = 0; n < m_Eng_exts.size(); ++n)                             \
+// and friends: same extension order (pre-hooks walk m_Eng_exts backwards,
+// since it is sorted by descending priority), and a barrier between any two
+// extensions that could conflict. Getting either wrong is not a performance
+// bug but a correctness one -- two extensions can touch the same cell, and the
+// flat path is what defines who goes first.
+// The blocked path pays every barrier once per timestep *per tile*, so three
+// kinds are left out. An extension that does not implement a hook is skipped
+// along with its barrier. With barrier elision on (OPENEMS_AVX2_TBLOCK_ELIDE,
+// default), so is one whose SlabTouches() says it cannot reach this slab -- a
+// Mur plane at x=0 is only ever in the first tile, a port only in its own --
+// and two consecutive hooks that both only read the fields (SlabHookWrites-
+// Fields() false) run without a barrier between them, since neither can
+// change what the other reads. The barrier after the last hook stays: the
+// update or the next pass writes the fields. Every thread evaluates the same
+// masks and the same slab, so they cannot disagree on how many barriers this
+// pass has.
+#define SLAB_DISPATCH_HOOK(HOOK, BIT)                                          \
 	{                                                                          \
 		Engine_Extension* ext = m_Eng_exts.at(n);                              \
 		if (!(ext->SlabHookMask() & Engine_Extension::BIT))                    \
 			continue;                                                          \
+		if (m_blk_elide && !ext->SlabTouches(Engine_Extension::BIT, startX, stopX)) \
+			continue;                                                          \
+		if (prev && (!m_blk_elide ||                                           \
+		             prev->SlabHookWritesFields(Engine_Extension::BIT) ||      \
+		             ext->SlabHookWritesFields(Engine_Extension::BIT)))        \
+			SyncWait(threadID, SYNC_HOOK);                                     \
 		ext->HOOK(startX, stopX, numTS, (int)threadID);                        \
-		m_IterateBarrier->wait();                                              \
-	}                                                                          \
+		prev = ext;                                                            \
+	}
+
+#define SLAB_DISPATCH_FWD(NAME, HOOK, BIT)                                     \
+void Engine_AVX2_Multithread::NAME(unsigned int startX, unsigned int stopX,    \
+                                   int numTS, unsigned int threadID)           \
+{                                                                              \
+	Engine_Extension* prev = nullptr;                                          \
+	for (size_t n = 0; n < m_Eng_exts.size(); ++n)                             \
+		SLAB_DISPATCH_HOOK(HOOK, BIT)                                          \
+	if (prev)                                                                  \
+		SyncWait(threadID, SYNC_HOOK);                                         \
 }
 
 #define SLAB_DISPATCH_REV(NAME, HOOK, BIT)                                     \
 void Engine_AVX2_Multithread::NAME(unsigned int startX, unsigned int stopX,    \
                                    int numTS, unsigned int threadID)           \
 {                                                                              \
+	Engine_Extension* prev = nullptr;                                          \
 	for (int n = (int)m_Eng_exts.size() - 1; n >= 0; --n)                      \
-	{                                                                          \
-		Engine_Extension* ext = m_Eng_exts.at(n);                              \
-		if (!(ext->SlabHookMask() & Engine_Extension::BIT))                    \
-			continue;                                                          \
-		ext->HOOK(startX, stopX, numTS, (int)threadID);                        \
-		m_IterateBarrier->wait();                                              \
-	}                                                                          \
+		SLAB_DISPATCH_HOOK(HOOK, BIT)                                          \
+	if (prev)                                                                  \
+		SyncWait(threadID, SYNC_HOOK);                                         \
 }
 
 SLAB_DISPATCH_REV(SlabPreVoltage,     DoPreVoltageUpdatesSlab,  SLAB_PRE_VOLT)
@@ -435,8 +484,62 @@ SLAB_DISPATCH_REV(SlabPreCurrent,     DoPreCurrentUpdatesSlab,  SLAB_PRE_CURR)
 SLAB_DISPATCH_FWD(SlabPostCurrent,    DoPostCurrentUpdatesSlab, SLAB_POST_CURR)
 SLAB_DISPATCH_FWD(SlabApply2Current,  Apply2CurrentSlab,        SLAB_APPLY_CURR)
 
+#undef SLAB_DISPATCH_HOOK
 #undef SLAB_DISPATCH_FWD
 #undef SLAB_DISPATCH_REV
+
+namespace
+{
+// Visit thread \a id's share of the rows [lo,hi) x [0,ny) as runs (x, y0, y1).
+// Rows are numbered x-major, which is also their order in memory, so a share
+// is one contiguous stretch of the field arrays.
+template <typename F>
+void ForRowShare(int lo, int hi, unsigned int ny, unsigned int nThreads, unsigned int id, F f)
+{
+	if (hi <= lo || ny == 0 || nThreads == 0)
+		return;
+	const uint64_t rows = (uint64_t)(hi - lo) * ny;
+	const uint64_t base = rows / nThreads;
+	const uint64_t rem  = rows % nThreads;
+	uint64_t r = id * base + std::min<uint64_t>(id, rem);
+	const uint64_t stop = r + base + (id < rem ? 1 : 0);
+	while (r < stop)
+	{
+		const unsigned int x  = (unsigned int)lo + (unsigned int)(r / ny);
+		const unsigned int y0 = (unsigned int)(r % ny);
+		const unsigned int y1 = (unsigned int)std::min<uint64_t>(ny, y0 + (stop - r));
+		f(x, y0, y1);
+		r += y1 - y0;
+	}
+}
+}
+
+void Engine_AVX2_Multithread::UpdateVoltageShare(int lo, int hi, unsigned int threadID)
+{
+	if (!m_blk_rowSplit)
+	{
+		unsigned int s, e;
+		SplitRange(lo, hi, m_numThreads, threadID, s, e);
+		if (e > s) UpdateVoltages(s, e - s);
+		return;
+	}
+	ForRowShare(lo, hi, numLines[1], m_numThreads, threadID,
+	            [this](unsigned int x, unsigned int y0, unsigned int y1) { UpdateVoltageRows(x, y0, y1); });
+}
+
+void Engine_AVX2_Multithread::UpdateCurrentShare(int lo, int hi, unsigned int threadID)
+{
+	if (!m_blk_rowSplit)
+	{
+		unsigned int s, e;
+		SplitRange(lo, hi, m_numThreads, threadID, s, e);
+		if (e > s) UpdateCurrents(s, e - s);
+		return;
+	}
+	// UpdateCurrents() stops one row short in y; so does each share.
+	ForRowShare(lo, hi, numLines[1] - 1, m_numThreads, threadID,
+	            [this](unsigned int x, unsigned int y0, unsigned int y1) { UpdateCurrentRows(x, y0, y1); });
+}
 
 void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
                                              int t0, unsigned int threadID)
@@ -474,11 +577,9 @@ void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
 		const int ts = t0 + t;
 		const unsigned int eS = (unsigned int)eLo, eE = (unsigned int)eHi;
 
-		unsigned int s, e;
 		SlabPreVoltage(eS, eE, ts, threadID);
-		SplitRange(eLo, eHi, m_numThreads, threadID, s, e);
-		if (e > s) UpdateVoltages(s, e - s);
-		m_IterateBarrier->wait();
+		UpdateVoltageShare(eLo, eHi, threadID);
+		SyncWait(threadID, SYNC_UPDATE);
 		SlabPostVoltage(eS, eE, ts, threadID);
 		SlabApply2Voltages(eS, eE, ts, threadID);
 
@@ -496,9 +597,8 @@ void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
 		const unsigned int hE = (unsigned int)(hExt < An ? An : hExt);
 
 		SlabPreCurrent(hS, hE, ts, threadID);
-		SplitRange(An, hHi, m_numThreads, threadID, s, e);
-		if (e > s) UpdateCurrents(s, e - s);
-		m_IterateBarrier->wait();
+		UpdateCurrentShare(An, hHi, threadID);
+		SyncWait(threadID, SYNC_UPDATE);
 		SlabPostCurrent(hS, hE, ts, threadID);
 		SlabApply2Current(hS, hE, ts, threadID);
 
@@ -511,6 +611,7 @@ void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 {
 	const unsigned int total = m_iterTS;
 	const int startTS = (int)numTS;
+	const int64_t t0 = m_syncStats ? HybridBarrier::now() : 0;
 
 	unsigned int done = 0;
 	while (done < total)
@@ -526,10 +627,87 @@ void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 		done += (unsigned int)kk;
 	}
 
+	if (m_syncStats)
+	{
+		m_sync[threadID].activeNs += HybridBarrier::now() - t0;
+		m_sync[threadID].timesteps += total;
+	}
+
 	// Every thread read numTS before the block's first barrier and none reads
 	// it again, so the last barrier above orders this write after all of them.
 	if (threadID == 0)
 		numTS += total;
+}
+
+void Engine_AVX2_Multithread::SyncWait(unsigned int threadID, SyncKind kind)
+{
+	if (!m_syncStats)
+	{
+		m_IterateBarrier->wait();
+		return;
+	}
+	const int64_t arrive  = HybridBarrier::now();
+	const int64_t release = m_IterateBarrier->waitTimed();
+	const int64_t back    = HybridBarrier::now();
+	SyncStats& s = m_sync[threadID];
+	++s.rounds[kind];
+	s.waitNs[kind] += std::max<int64_t>(0, release - arrive);
+	s.wakeNs[kind] += std::max<int64_t>(0, back - std::max(release, arrive));
+}
+
+void Engine_AVX2_Multithread::PrintSyncStats()
+{
+	if (!m_syncStats || m_sync.empty())
+		return;
+
+	SyncStats sum = SyncStats();
+	for (const SyncStats& s : m_sync)
+	{
+		for (int k = 0; k < 2; ++k)
+		{
+			sum.rounds[k] += s.rounds[k];
+			sum.waitNs[k] += s.waitNs[k];
+			sum.wakeNs[k] += s.wakeNs[k];
+		}
+		sum.activeNs += s.activeNs;
+		sum.timesteps += s.timesteps;
+	}
+	if (sum.timesteps == 0 || sum.activeNs <= 0)
+		return;
+
+	// Every thread advances every timestep, so per-thread means are sums / threads.
+	const double n = (double)m_sync.size();
+	const double ts = sum.timesteps / n;
+	const double act = (double)sum.activeNs;
+	const uint64_t rounds = sum.rounds[0] + sum.rounds[1];
+	auto pct = [act](int64_t ns) { return 100.0 * (double)ns / act; };
+
+	std::ostringstream os;
+	os << std::fixed << std::setprecision(1);
+	os << "AVX2 sync stats: " << m_sync.size() << " threads, " << (uint64_t)ts << " timesteps, ";
+	if (m_blk_k > 1)
+		os << "blocked k=" << m_blk_k << " W=" << m_blk_W << ", split by " << (m_blk_rowSplit ? "y-row" : "x-line")
+		   << ", elision " << (m_blk_elide ? "on" : "off");
+	else
+		os << "flat";
+	os << ", spin " << m_barrierSpinUs << " us\n";
+	os << "  barriers per timestep " << rounds / n / ts << " (update " << sum.rounds[0] / n / ts
+	   << ", extension " << sum.rounds[1] / n / ts << ")\n";
+	os << "  share of thread time waiting for the slowest thread " << pct(sum.waitNs[0] + sum.waitNs[1])
+	   << " % (update " << pct(sum.waitNs[0]) << ", extension " << pct(sum.waitNs[1]) << "), waking up "
+	   << pct(sum.wakeNs[0] + sum.wakeNs[1]) << " %; per barrier "
+	   << (rounds ? (sum.waitNs[0] + sum.waitNs[1]) / 1e3 / rounds : 0.0) << " + "
+	   << (rounds ? (sum.wakeNs[0] + sum.wakeNs[1]) / 1e3 / rounds : 0.0) << " us\n";
+	os << "  per thread (waiting / waking %):";
+	for (size_t t = 0; t < m_sync.size(); ++t)
+	{
+		const SyncStats& s = m_sync[t];
+		const double a = s.activeNs > 0 ? (double)s.activeNs : 1.0;
+		os << " " << 100.0 * (s.waitNs[0] + s.waitNs[1]) / a << "/" << 100.0 * (s.wakeNs[0] + s.wakeNs[1]) / a;
+	}
+	cout << os.str() << endl;
+
+	m_sync.assign(m_sync.size(), SyncStats());
 }
 
 // ----------------------------------------------------------------------------
@@ -701,7 +879,7 @@ void Engine_AVX2_Multithread::DoPreVoltageUpdates(int threadID)
 	for (int n = m_Eng_exts.size() - 1; n >= 0; --n)
 	{
 		m_Eng_exts.at(n)->DoPreVoltageUpdates(threadID);
-		m_IterateBarrier->wait();
+		SyncWait((unsigned int)threadID, SYNC_HOOK);
 	}
 }
 
@@ -710,7 +888,7 @@ void Engine_AVX2_Multithread::DoPostVoltageUpdates(int threadID)
 	for (size_t n = 0; n < m_Eng_exts.size(); ++n)
 	{
 		m_Eng_exts.at(n)->DoPostVoltageUpdates(threadID);
-		m_IterateBarrier->wait();
+		SyncWait((unsigned int)threadID, SYNC_HOOK);
 	}
 }
 
@@ -719,7 +897,7 @@ void Engine_AVX2_Multithread::Apply2Voltages(int threadID)
 	for (size_t n = 0; n < m_Eng_exts.size(); ++n)
 	{
 		m_Eng_exts.at(n)->Apply2Voltages(threadID);
-		m_IterateBarrier->wait();
+		SyncWait((unsigned int)threadID, SYNC_HOOK);
 	}
 }
 
@@ -728,7 +906,7 @@ void Engine_AVX2_Multithread::DoPreCurrentUpdates(int threadID)
 	for (int n = m_Eng_exts.size() - 1; n >= 0; --n)
 	{
 		m_Eng_exts.at(n)->DoPreCurrentUpdates(threadID);
-		m_IterateBarrier->wait();
+		SyncWait((unsigned int)threadID, SYNC_HOOK);
 	}
 }
 
@@ -737,7 +915,7 @@ void Engine_AVX2_Multithread::DoPostCurrentUpdates(int threadID)
 	for (size_t n = 0; n < m_Eng_exts.size(); ++n)
 	{
 		m_Eng_exts.at(n)->DoPostCurrentUpdates(threadID);
-		m_IterateBarrier->wait();
+		SyncWait((unsigned int)threadID, SYNC_HOOK);
 	}
 }
 
@@ -746,7 +924,7 @@ void Engine_AVX2_Multithread::Apply2Current(int threadID)
 	for (size_t n = 0; n < m_Eng_exts.size(); ++n)
 	{
 		m_Eng_exts.at(n)->Apply2Current(threadID);
-		m_IterateBarrier->wait();
+		SyncWait((unsigned int)threadID, SYNC_HOOK);
 	}
 }
 
@@ -793,6 +971,8 @@ void thread::operator()()
 			continue;
 		}
 
+		const bool stats = m_enginePtr->m_syncStats;
+		const int64_t t0 = stats ? HybridBarrier::now() : 0;
 		for (unsigned int iter = 0; iter < m_enginePtr->m_iterTS; ++iter)
 		{
 			// Pre-voltage extensions
@@ -804,7 +984,7 @@ void thread::operator()()
 			m_enginePtr->UpdateVoltages(m_start, m_stop - m_start + 1);
 
 			// Synchronize
-			m_enginePtr->m_IterateBarrier->wait();
+			m_enginePtr->SyncWait(m_threadID, Engine_AVX2_Multithread::SYNC_UPDATE);
 			if (m_threadID == 0)
 				m_enginePtr->TraceFieldCell("after voltage update");
 
@@ -823,7 +1003,7 @@ void thread::operator()()
 			m_enginePtr->UpdateCurrents(m_start, m_stop_h - m_start + 1);
 
 			// Synchronize
-			m_enginePtr->m_IterateBarrier->wait();
+			m_enginePtr->SyncWait(m_threadID, Engine_AVX2_Multithread::SYNC_UPDATE);
 			if (m_threadID == 0)
 				m_enginePtr->TraceFieldCell("after current update");
 
@@ -835,6 +1015,11 @@ void thread::operator()()
 
 			if (m_threadID == 0)
 				++m_enginePtr->numTS;
+		}
+		if (stats)
+		{
+			m_enginePtr->m_sync[m_threadID].activeNs += HybridBarrier::now() - t0;
+			m_enginePtr->m_sync[m_threadID].timesteps += m_enginePtr->m_iterTS;
 		}
 
 		m_enginePtr->m_stopBarrier->wait();

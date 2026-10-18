@@ -171,6 +171,12 @@ void Engine_AVX2::Reset()
 
 void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 {
+	for (unsigned int x = startX; x < startX + numX; ++x)
+		UpdateVoltageRows(x, 0, numLines[1]);
+}
+
+void Engine_AVX2::UpdateVoltageRows(unsigned int x, unsigned int yStart, unsigned int yStop)
+{
 	f8vector* __restrict volt = m_volt;
 	f8vector* __restrict curr = m_curr;
 
@@ -179,14 +185,13 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 	const int vs_x = (int)m_vs_x;
 
 	unsigned int pos[3];
-	pos[0] = startX;
+	pos[0] = x;
 
-	for (unsigned int posX = 0; posX < numX; ++posX)
 	{
 		// Branchless: 0 when at boundary, full stride otherwise
 		const int i_shift_x = (pos[0] > 0) * vs_x;
 
-		for (pos[1] = 0; pos[1] < numLines[1]; ++pos[1])
+		for (pos[1] = yStart; pos[1] < yStop; ++pos[1])
 		{
 			const int i_shift_y = (pos[1] > 0) * vs_y;
 
@@ -328,7 +333,6 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 				}
 			}
 		}
-		++pos[0];
 	}
 }
 
@@ -343,6 +347,12 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 
 void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 {
+	for (unsigned int x = startX; x < startX + numX; ++x)
+		UpdateCurrentRows(x, 0, numLines[1] - 1);
+}
+
+void Engine_AVX2::UpdateCurrentRows(unsigned int x, unsigned int yStart, unsigned int yStop)
+{
 	f8vector* __restrict volt = m_volt;
 	f8vector* __restrict curr = m_curr;
 
@@ -351,11 +361,10 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 	const int vs_x = (int)m_vs_x;
 
 	unsigned int pos[3];
-	pos[0] = startX;
+	pos[0] = x;
 
-	for (unsigned int posX = 0; posX < numX; ++posX)
 	{
-		for (pos[1] = 0; pos[1] < numLines[1] - 1; ++pos[1])
+		for (pos[1] = yStart; pos[1] < yStop; ++pos[1])
 		{
 			// --- Main loop: z_vec < numVectors - 1 (z+1 within range) ---
 			for (pos[2] = 0; pos[2] < numVectors - 1; ++pos[2])
@@ -495,6 +504,5 @@ void Engine_AVX2::UpdateCurrents(unsigned int startX, unsigned int numX)
 				}
 			}
 		}
-		++pos[0];
 	}
 }

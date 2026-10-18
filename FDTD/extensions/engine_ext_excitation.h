@@ -39,10 +39,14 @@ public:
 	//! exact -- which is what lets a temporally blocked engine carry it.
 	virtual bool SupportsSlabApply() const {return true;}
 	virtual unsigned int SlabHookMask() const {return SLAB_APPLY_VOLT | SLAB_APPLY_CURR;}
+	virtual bool SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const;
 	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 	virtual void Apply2CurrentSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 
 protected:
+	//! x-extent [lo,hi) of the voltage (0) and current (1) excitation lists; empty if a list is.
+	unsigned int m_xLo[2], m_xHi[2];
+
 	//! Slab pattern A over the excitation's cell list, striped by thread.
 	/*!
 	  The list is not sorted by x, so there is no contiguous share to hand a

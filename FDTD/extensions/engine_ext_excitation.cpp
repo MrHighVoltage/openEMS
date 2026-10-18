@@ -24,6 +24,24 @@ Engine_Ext_Excitation::Engine_Ext_Excitation(Operator_Ext_Excitation* op_ext) : 
 {
 	m_Op_Exc = op_ext;
 	m_Priority = ENG_EXT_PRIO_EXCITATION;
+
+	const unsigned int count[2] = {m_Op_Exc->Volt_Count, m_Op_Exc->Curr_Count};
+	const unsigned int* index[2] = {m_Op_Exc->Volt_index[0], m_Op_Exc->Curr_index[0]};
+	for (int l = 0; l < 2; ++l)
+	{
+		m_xLo[l] = m_xHi[l] = 0;
+		for (unsigned int n = 0; n < count[l]; ++n)
+		{
+			if (n == 0 || index[l][n] < m_xLo[l]) m_xLo[l] = index[l][n];
+			if (n == 0 || index[l][n] + 1 > m_xHi[l]) m_xHi[l] = index[l][n] + 1;
+		}
+	}
+}
+
+bool Engine_Ext_Excitation::SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const
+{
+	const int l = (hook == SLAB_APPLY_CURR) ? 1 : 0;
+	return (m_xLo[l] < stopX) && (startX < m_xHi[l]);
 }
 
 Engine_Ext_Excitation::~Engine_Ext_Excitation()
