@@ -1,0 +1,79 @@
+hosts: i7-6700K, i9-13900K, ryzen5-5600G; reference group A holds upstream-sse
+
+tl_openEMS_m2_m1_w0p20um_cs0p013333um: 2359786 timesteps, 2.27 M cells
+  excitation (et/ht): identical in all 30 runs
+
+          probes vs A    S11: |a-b|  d|S| dB  dphase    S21: |a-b|  d|S| dB  dphase  runs
+  A         reference                                                                i9-13900K/fork-multithreaded
+                                                                                     i9-13900K/fork-sse
+                                                                                     i9-13900K/fork-sse-compressed
+                                                                                     i9-13900K/upstream-multithreaded
+                                                                                     i9-13900K/upstream-sse
+                                                                                     i9-13900K/upstream-sse-compressed
+                                                                                     i7-6700K/fork-multithreaded
+                                                                                     i7-6700K/fork-sse
+                                                                                     i7-6700K/fork-sse-compressed
+                                                                                     i7-6700K/upstream-multithreaded
+                                                                                     i7-6700K/upstream-sse
+                                                                                     i7-6700K/upstream-sse-compressed
+                                                                                     ryzen5-5600G/fork-gpu-amd-radeon-graphics-radv-renoir
+                                                                                     ryzen5-5600G/fork-multithreaded
+                                                                                     ryzen5-5600G/fork-sse
+                                                                                     ryzen5-5600G/fork-sse-compressed
+                                                                                     ryzen5-5600G/upstream-multithreaded
+                                                                                     ryzen5-5600G/upstream-sse
+                                                                                     ryzen5-5600G/upstream-sse-compressed
+  B         -116.3 dB     -117.5 dB   1.8e-05 4.4e-04°     -121.6 dB   1.5e-05 8.7e-05°  i9-13900K/fork-avx2
+                                                                                     i9-13900K/fork-avx2-multithreaded
+                                                                                     i7-6700K/fork-avx2
+                                                                                     i7-6700K/fork-avx2-multithreaded
+                                                                                     i7-6700K/fork-avx2-multithreaded-tblock
+                                                                                     ryzen5-5600G/fork-avx2
+                                                                                     ryzen5-5600G/fork-avx2-multithreaded
+                                                                                     ryzen5-5600G/fork-avx2-multithreaded-tblock
+                                                                                     ../results_cpu (earlier run_gpu.py set)
+  C         -116.8 dB     -119.8 dB   2.2e-05 3.0e-04°     -117.6 dB   1.3e-05 1.4e-04°  i9-13900K/fork-gpu-amd-radeon-rx-6800-radv-navi21
+                                                                                     i9-13900K/fork-gpu-intel-r-graphics-rpl-s
+                                                                                     i7-6700K/fork-gpu-intel-r-hd-graphics-530-skl-gt2
+                                                                                     ../results (earlier run_gpu.py set)
+
+  between the groups (worst probe difference relative to the peak):
+                   A           B           C
+  A                -   -116.3 dB   -116.8 dB
+  B        -116.3 dB           -   -125.8 dB
+  C        -116.8 dB   -125.8 dB           -
+
+  host          variant                                    device / threads                    job time    MC/s  group
+  i7-6700K      fork-avx2                                  1 thread                              7.96 h   186.9  B
+  i7-6700K      fork-avx2-multithreaded                    4 threads                             5.83 h   255.2  B
+  i7-6700K      fork-avx2-multithreaded-tblock             4 threads                             4.47 h   333.1  B
+                                                           AVX2 temporal blocking ACTIVE (prototype): k=14, tile width 28 x-lines, 7.82373 MB per tile, 7 tiles; L3 1 x 8 MB (sysconf)
+  i7-6700K      fork-gpu-intel-r-hd-graphics-530-skl-gt2   Intel(R) HD Graphics 530 (SKL GT2)    6.91 h   215.4  C
+  i7-6700K      fork-multithreaded                         4 threads                             6.76 h   220.1  A
+  i7-6700K      fork-sse                                   1 thread                             10.06 h   147.9  A
+  i7-6700K      fork-sse-compressed                        1 thread                             10.89 h   136.6  A
+  i7-6700K      upstream-multithreaded                     3 threads                             6.91 h   215.3  A
+  i7-6700K      upstream-sse                               1 thread                             10.13 h   146.9  A
+  i7-6700K      upstream-sse-compressed                    1 thread                             10.82 h   137.5  A
+  i9-13900K     fork-avx2                                  1 thread                              5.14 h   289.3  B
+  i9-13900K     fork-avx2-multithreaded                    8 threads                             2.84 h   524.0  B
+  i9-13900K     fork-gpu-amd-radeon-rx-6800-radv-navi21    AMD Radeon RX 6800 (RADV NAVI21)      0.27 h  5445.0  C
+  i9-13900K     fork-gpu-intel-r-graphics-rpl-s            Intel(R) Graphics (RPL-S)             4.79 h   310.8  C
+  i9-13900K     fork-multithreaded                         7 threads                             3.04 h   488.9  A
+  i9-13900K     fork-sse                                   1 thread                              6.00 h   247.7  A  (host slept 9.2 h, MC/s from job time)
+  i9-13900K     fork-sse-compressed                        1 thread                              5.55 h   267.9  A
+  i9-13900K     upstream-multithreaded                     7 threads                             3.11 h   478.5  A
+  i9-13900K     upstream-sse                               1 thread                              5.88 h   253.1  A
+  i9-13900K     upstream-sse-compressed                    1 thread                              5.56 h   267.8  A
+  ryzen5-5600G  fork-avx2                                  1 thread                              6.06 h   245.7  B
+  ryzen5-5600G  fork-avx2-multithreaded                    4 threads                             4.93 h   301.9  B
+  ryzen5-5600G  fork-avx2-multithreaded-tblock             3 threads                             2.68 h   555.8  B
+                                                           AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 57 x-lines, 15.9269 MB per tile, 4 tiles; L3 1 x 16 MB (sysconf)
+  ryzen5-5600G  fork-gpu-amd-radeon-graphics-radv-renoir   AMD Radeon Graphics (RADV RENOIR)     4.62 h   322.1  A
+  ryzen5-5600G  fork-multithreaded                         3 threads                             5.02 h   296.3  A
+  ryzen5-5600G  fork-sse                                   1 thread                              7.02 h   211.9  A
+  ryzen5-5600G  fork-sse-compressed                        1 thread                              6.71 h   221.8  A
+  ryzen5-5600G  upstream-multithreaded                     3 threads                             5.02 h   296.2  A
+  ryzen5-5600G  upstream-sse                               1 thread                              7.25 h   205.4  A
+  ryzen5-5600G  upstream-sse-compressed                    1 thread                              6.69 h   222.4  A
+

@@ -15,6 +15,10 @@ time-stepping loop alone, with no probes, no field dumps and no post-processing
 rejected, is in [OPTIMIZATIONS.md](OPTIMIZATIONS.md). This document is the
 summary; that one is the evidence.
 
+§11 is the one exception to that method: a real model with probes, run to
+completion with every engine on three machines, to check that the engines all
+compute the same result.
+
 ---
 
 ## 1. Where the fork helps, and where it does not
@@ -152,6 +156,19 @@ should change what anyone does:
   integrated GPU is the best thing on its machine *and* the machine has a
   competent CPU. It is a narrow win: on the same host the blocked CPU engine is
   ahead on the other four models (§4.2).
+
+### 1.4 And it computes the same answer
+
+A speed-up is only worth reporting if the results do not move. On a
+production-size model — a 2.27 M-cell on-chip transmission line, run for
+2.36 M timesteps with every engine on three of the machines (§11) — the fork's
+`sse`, `sse-compressed` and `multithreaded` engines are **bit-identical to
+upstream's**, on every machine and at every thread count. The fork's AVX2
+engines and its GPU engine form two more bit-identical groups. They differ from
+upstream by **float32 rounding and nothing else**: at most 1.5e-6 of a probe's
+peak, and ≤ 3e-5 dB and ≤ 5e-4° in S11 and S21. That is about 50 dB below the
+change from one step of mesh refinement. CPU temporal blocking is bit-identical
+to the flat sweep it replaces.
 
 ---
 
@@ -631,6 +648,11 @@ nothing:
   function, so cross-engine comparison is structurally blind to this class of
   bug — all engines agree, and all are wrong together. Only absolute-value tests
   on inhomogeneous models catch it.
+
+§11 is the end-to-end check that followed, and it is not blind in that way,
+because it compares the fork against upstream rather than only against itself.
+On a real model, every fork engine matches upstream to float32 rounding, and
+the engines the two builds share match bit for bit.
 
 ---
 
@@ -1481,3 +1503,196 @@ first — that is, on every GPU run on a large grid. The effect was that `setup_
 came back `None` on precisely the rows with the most setup to report. Fixed in
 this revision; §7's GPU column is the first that did not have to be measured by
 hand.
+
+---
+
+## 11. A long run on a real model: the same answer from every engine
+
+§1–§10 time the bare stepping loop on synthetic models. This section asks what
+they cannot: whether the engines compute the same *result*. One real model was
+run to completion with every engine on three of the machines, and the outputs
+were compared fork against upstream and engine against engine.
+
+### 11.1 Model and method
+
+The model is the most finely meshed of a set of on-chip transmission-line test
+cases: a 200 µm line, 0.20 µm wide, in the M2/M1 layers of an IHP back-end
+stack. It is meshed at 0.0133 µm, which gives **2.27 M cells**. The setup is:
+
+- a Gaussian excitation covering DC–300 GHz;
+- Mur absorbing boundaries on all six faces;
+- two lumped ports, each with a voltage and a current probe.
+
+The field energy settles onto a static plateau, so the −50 dB end criterion
+never fires. Each run therefore stops at its 60 ps cap on simulated time, which
+is **2,359,786 timesteps**. All 30 runs ended at that cap, so every run computed
+exactly the same number of steps.
+
+Every run used the GPU portable bundle (§2.2, §9.1): fork `4bfcd74` and upstream
+`d3d2a49`, built once with GCC 10.2.1. All three hosts ran the same binaries,
+with the fork's GPU engine using each host's own Mesa (26.2.4 on the i9-13900K,
+26.2.2 on the i7-6700K and the Ryzen 5 5600G). Each machine ran:
+
+- `sse`, `sse-compressed` and `multithreaded`, from both upstream and the fork;
+- the fork's `avx2` and `avx2-multithreaded`;
+- `avx2-multithreaded` once more with temporal blocking
+  (`OPENEMS_AVX2_TEMPORAL_BLOCK=16`), wherever it engages. On the i9-13900K it
+  does not: the grid has only 191 x-lines, and the schedule needs at least two
+  of that machine's 128-line tiles;
+- the fork's GPU engine on every Vulkan device: the RX 6800 and UHD 770, the
+  HD 530 and the Vega 7.
+
+Each machine ran one simulation at a time, never a CPU and a GPU run together.
+The multithreaded engines chose their own thread counts. `basic` was dropped:
+at ~36 MC/s on the i9-13900K, a single run would take about 42 hours. Before the
+full runs, a 2000-timestep smoke test on the coarsest case of the set ran every
+engine. In it, fork and upstream `basic` gave bit-identical probes.
+
+Results are compared on the probe values, which the files hold to 12
+significant digits. The files themselves cannot be compared, because their
+headers contain a version and a start time. S11 and S21 come from a DFT of the
+port probes over 1–300 GHz, the same way openEMS' lumped port computes them.
+Each run also hashed its excitation signal, and the hash is identical in all 30.
+
+### 11.2 Three answers, bit for bit, differing only by rounding
+
+The 30 runs produce exactly three distinct sets of probe values:
+
+| Group | Runs, on all three machines unless noted | Probes vs A:<br>worst difference,<br>relative to the peak | S11 vs A | S21 vs A |
+|---|---|---|---|---|
+| **A** | upstream `sse`, `sse-compressed`, `multithreaded`; the same three fork engines; fork GPU on the **Vega 7** | — | — | — |
+| **B** | fork `avx2` and `avx2-multithreaded`; `avx2-multithreaded` + temporal blocking (i7-6700K, Ryzen 5 5600G) | −116.3 dB | −117.5 dB<br>1.8e-5 dB, 4.4e-4° | −121.6 dB<br>1.5e-5 dB, 8.7e-5° |
+| **C** | fork GPU on the **RX 6800**, **UHD 770** and **HD 530** | −116.8 dB | −119.8 dB<br>2.2e-5 dB, 3.0e-4° | −117.6 dB<br>1.3e-5 dB, 1.4e-4° |
+
+Each S cell gives the worst complex difference |S − S<sub>A</sub>| over the band,
+then the worst magnitude and phase differences. Groups B and C differ from each
+other by −125.8 dB. For scale, this line's |S21| runs from −5.6 to −6.5 dB and
+its |S11| from −6.4 to −15.3 dB.
+
+The groups show three things:
+
+- **The fork leaves upstream's engines unchanged, bit for bit.** For `sse`,
+  `sse-compressed` and `multithreaded`, fork and upstream agree to the last bit
+  on Raptor Lake, Skylake and Zen 3. That covers the code the fork changed
+  underneath those engines: operator construction is parallelized (§7), and the
+  Mur, excitation and probe paths are shared. This check is stronger than the
+  cross-engine comparison in §4.3. Upstream's operator is independent code, so
+  a fork defect common to all of the fork's engines would show up here.
+- **Nothing that varies within a group changes a bit.** That includes:
+  - thread count (3, 4, 7 and 8 threads);
+  - compressed against plain operator storage;
+  - temporal blocking against the flat sweep, at k=16 on 57-line tiles on the
+    Ryzen 5 5600G and k=14 on 28-line tiles on the i7-6700K. The blocked
+    schedule reorders the work; it does not approximate it.
+- **Neither does the compiler nor the GPU vendor.** Groups B and C each also
+  contain an earlier run of the same fork commit, built natively with GCC 16.2.1
+  instead of the bundle's GCC 10.2.1, and those runs are bit-identical too.
+  Group C spans three GPUs from two vendors and three generations, on two
+  drivers (RADV and ANV).
+
+The only thing that separates the groups is how a multiply-add is rounded. The
+fields are float32 (`FDTD_FLOAT` in `tools/constants.h`):
+
+- The SSE kernels round the product and the following sum separately.
+- The AVX2 kernels use fused multiply-add, which rounds once.
+- The GPU engine runs the same shader source on every device, so its split
+  between A and C must come from the driver's shader compiler. Presumably that
+  is whether the compiler fuses multiply-adds on that architecture. The Vega 7
+  matches the CPU's unfused arithmetic bit for bit; the RX 6800, on the same
+  RADV driver, does not.
+
+The differences are also the size rounding would produce:
+
+- **In the time domain**, the largest difference anywhere is 1.5e-6 of a probe's
+  peak, **13 times float32's machine epsilon** (1.19e-7). It occurs at the pulse
+  maximum, around 10 ps, and falls afterwards instead of accumulating: by 59 ps,
+  2.3 M timesteps later, it is below half an epsilon of the peak on every probe.
+  A real defect, such as a wrong coefficient, a missing boundary cell or an
+  off-by-one at a tile edge, would leave a difference that persists or grows. A
+  rounding difference follows the signal down.
+- **In S11 and S21**, the quantities this model exists to produce, the groups
+  agree to **≤ 3e-5 dB in magnitude and ≤ 5e-4° in phase** across 1–300 GHz.
+  Refining the same line's mesh by one step, from 0.02 µm to 0.0133 µm, moves
+  S21 by −63.6 dB (0.012 dB, 0.024°) and S11 by −68.9 dB (0.005 dB, 0.052°). The
+  spread between engines is therefore about 50 dB below the discretization
+  error of the finest mesh in the set.
+- **Across all 15 cases**, an earlier comparison of the fork's GPU engine with
+  its AVX2 engine (groups C and B) agrees to between −122.7 and −134.5 dB of the
+  probe peak.
+
+**So the fork's engines produce the same answer as upstream's.** Where the
+arithmetic is the same, they match bit for bit. Where it is not, they agree to
+within float32 rounding.
+
+### 11.3 Throughput on this model
+
+MC/s from each run's `Speed:` line; auto-tuned thread counts in parentheses.
+
+| Engine | i9-13900K | i7-6700K | Ryzen 5 5600G |
+|---|---|---|---|
+| upstream `sse` | 253 | 147 | 205 |
+| upstream `sse-compressed` | 268 | 138 | 222 |
+| upstream `multithreaded` | 479 (7t) | 215 (3t) | 296 (3t) |
+| fork `sse` | 248¹ | 148 | 212 |
+| fork `sse-compressed` | 268 | 137 | 222 |
+| fork `multithreaded` | 489 (7t) | 220 (4t) | 296 (3t) |
+| fork `avx2` | 289 | 187 | 246 |
+| fork `avx2-multithreaded` | 524 (8t) | 255 (4t) | 302 (4t) |
+| fork `avx2-multithreaded` + tblock | does not engage | 333 (4t) | 556 (3t) |
+| fork GPU | **5445** RX 6800<br>311 UHD 770 | 215 HD 530 | 322 Vega 7 |
+| **best fork vs upstream `multithreaded`** | **11.4×** GPU<br>1.10× CPU | **1.55×** | **1.88×** |
+| run time, best fork vs upstream `multithreaded` | 16 min vs 3.1 h | 4.5 h vs 6.9 h | 2.7 h vs 5.0 h |
+
+These are single runs, not best-of-N. Fork and upstream run the same SSE
+kernels, and those pairs agree to within about 3% (`sse-compressed` to within
+0.7%). That is the noise floor of this table.
+
+¹ The i9-13900K went to sleep for 9.2 h during this run. openEMS times its loop
+by the wall clock, so its own `Speed:` line reads 97.6 MC/s. The 248 is computed
+from the job's monotonic time, which does not advance during suspend. Expect the
+same on any machine that can sleep during a multi-hour run.
+
+The picture matches the synthetic matrix:
+
+- **The RX 6800 is the only device that changes the order of magnitude.** At
+  5445 MC/s it is in line with its 224³ Mur row (5125, §8.1), and it turns a
+  3-hour job into a 16-minute one.
+- **Temporal blocking is again the CPU result.** It is worth 1.84× over the flat
+  AVX2 engine on the Ryzen 5 5600G's undivided 16 MB L3, and 1.31× on the
+  i7-6700K's 8 MB. That 1.31× is on a Mur model, where the matrix's 224³ Mur row
+  regresses on the same machine (0.87×, §1.2). Without blocking, as on the
+  i9-13900K, AVX2 multithreaded reaches only 1.10× upstream, the
+  bandwidth-limited margin described in §3.2.
+- **The integrated GPUs do what §4.2 predicts for a model without PML.** The UHD
+  770 reaches 0.65× upstream's best, the HD 530 ties it (1.00×) and the Vega 7
+  reaches 1.09×. On both machines where the blocked CPU schedule engages, it
+  beats the integrated GPU: by 1.55× on the i7-6700K and 1.73× on the Ryzen 5
+  5600G.
+
+**A GPU monitor is not a stall detector.** During the HD 530 run, a GPU monitor
+on the i7-6700K showed the load flipping between 100% and 0%, with almost no CPU
+load. This was not a stall:
+
+- the kernel's per-process engine counter showed the GPU 99% busy over three
+  minutes, with no idle second;
+- the GPU held its 1150 MHz maximum clock, with no RC6 (idle) residency;
+- the run finished at 215 MC/s, against 213 in a 20,000-timestep smoke test.
+
+The near-zero CPU load is normal for the GPU engine, whose host thread spends
+the run waiting on a fence. Neither Radeon showed the flicker.
+
+### 11.4 Reproducing
+
+The harness is in `tests/openems-verify/`:
+
+- `run_verify.py` is standard-library Python, with the bundle's binaries beside
+  it. It runs every engine on every device of the machine it starts on, one
+  simulation at a time under a host-wide lock, and it can resume after an
+  interruption. `--smoke` estimates the run time, and `--only 'cs0p013333um$'`
+  restricts the run to this case.
+- `compare_verify.py` builds the tables above from the collected
+  `results/<host>/` directories.
+
+Its full output, including every run's group, thread count, job time and
+temporal-blocking announcement, is
+`python/Tests/results/verify_preflight_tl_2026-10-15.txt`.
