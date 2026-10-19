@@ -20,6 +20,7 @@ layout(push_constant) uniform PC {
     uint lineNrShift;   // unused but keeps PC consistent
     uint numLinesP;
     uint numLinesPP;
+    uint edgeSkip;           // edges an earlier face owns
 };
 
 uint gridIdx(uint ny_dir, uint lineVal, uint i, uint j)
@@ -50,6 +51,16 @@ void main()
 
     uint gPos = gridIdx(ny, lineNr, i, j);
 
-    volt[nP  * N + gPos] = mur_nyP[gid];
-    volt[nPP * N + gPos] = mur_nyPP[gid];
+    // Where two faces meet, both write the field component along their common
+    // edge.  The CPU applies equal-priority extensions in reverse order of
+    // creation, so the earlier face wins there; the host sets a bit for every
+    // edge of this face that an earlier face owns.  Bits 1/2: the edge at
+    // i = 0 / numLinesP-1 (component nyPP); bits 4/8: j = 0 / numLinesPP-1
+    // (component nyP).
+    bool skipPP = ((edgeSkip & 1u) != 0u && i == 0u) || ((edgeSkip & 2u) != 0u && i == numLinesP - 1u);
+    bool skipP  = ((edgeSkip & 4u) != 0u && j == 0u) || ((edgeSkip & 8u) != 0u && j == numLinesPP - 1u);
+    if (!skipP)
+        volt[nP  * N + gPos] = mur_nyP[gid];
+    if (!skipPP)
+        volt[nPP * N + gPos] = mur_nyPP[gid];
 }

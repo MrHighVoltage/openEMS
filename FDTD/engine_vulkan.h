@@ -488,8 +488,11 @@ private:
 	                  uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
 	//! Push constant struct for TF/SF shaders (same as ExcPC).
 	struct TfsfPC   { uint32_t count; int32_t numTS; uint32_t sigLen; int32_t sigPeriod; };
-	//! Push constant struct for Mur ABC shaders.
-	struct MurPC    { uint32_t Nx, Ny, Nz, ny, lineNr, lineNrShift, numLinesP, numLinesPP; };
+	//! Push constant struct for Mur ABC shaders.  edgeSkip marks the edges of
+	//! the face that an earlier face also writes (see SetupGPU_Mur); the apply
+	//! shader leaves those cells to that face.
+	struct MurPC    { uint32_t Nx, Ny, Nz, ny, lineNr, lineNrShift, numLinesP, numLinesPP;
+	                  uint32_t edgeSkip = 0; };
 	//! Push constant struct for LumpedRLC shaders.
 	struct RlcPC    { uint32_t count; };
 	//! Push constant struct for probe gather shader.

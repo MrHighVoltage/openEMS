@@ -3105,6 +3105,26 @@ void Engine_Vulkan::SetupGPU_Mur()
 		m_gpuMur.push_back(std::move(data));
 	}
 
+	// Two faces with different normals share an edge, and both write the
+	// field component along it.  Without a barrier between their apply
+	// dispatches the GPU leaves the order undefined.  Engine::SortExtensionByPriority()
+	// sorts stably and then reverses, so the CPU applies equal-priority faces
+	// in reverse order of creation and the earlier face's value is the one that
+	// stays.  Each face therefore skips the edges an earlier face owns.
+	for (size_t a = 0; a < m_gpuMur.size(); ++a)
+	{
+		MurPC& pa = m_gpuMur[a].pc;
+		const uint32_t nyP = (pa.ny + 1) % 3, nyPP = (pa.ny + 2) % 3;
+		for (size_t b = 0; b < a; ++b)
+		{
+			const MurPC& pb = m_gpuMur[b].pc;
+			if (pb.ny == nyP)
+				pa.edgeSkip |= (pb.lineNr == 0) ? 1u : 2u;
+			else if (pb.ny == nyPP)
+				pa.edgeSkip |= (pb.lineNr == 0) ? 4u : 8u;
+		}
+	}
+
 	m_hasGPU_Mur = !m_gpuMur.empty();
 }
 
@@ -3446,10 +3466,21 @@ void Engine_Vulkan::RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) con
 {
 	if (!m_localAbcPipeline || m_gpuLocalABC.empty()) return;
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_localAbcPipeline);
+	VkMemoryBarrier between{};
+	between.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 	bool dispatched = false;
-	for (const GpuLocalABCData& data : m_gpuLocalABC)
+	// Sheets that cross write the same field cells in their apply phases
+	// (2, 5).  The CPU applies equal-priority extensions in reverse order of
+	// creation, so those phases go in that order, one sheet at a time.
+	const bool writesField = (phase == 2 || phase == 5);
+	for (size_t n = 0; n < m_gpuLocalABC.size(); ++n)
 	{
+		const GpuLocalABCData& data = m_gpuLocalABC[writesField ? m_gpuLocalABC.size() - 1 - n : n];
 		if (phase >= 3 && !data.superAbsorption) continue;
+		if (writesField && dispatched)
+			CmdComputeBarrier(cmd, between);
 		LocalAbcPC pc = data.pc;
 		pc.phase = phase;
 		const uint32_t count = phase >= 3 ? pc.countCurr : pc.countVolt;
@@ -3730,6 +3761,15 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreVolt = true;
 	}
+	// UPML pre-voltage swaps the field for its flux in the PML cells, and the
+	// CPU runs it before every other extension (ENG_EXT_PRIO_UPML).  A Mur
+	// face or a dispersive material reaching into a PML region reads those
+	// cells, so it has to wait -- without the barrier it reads either.
+	if (dispatchedPreVolt && (m_hasGPU_Mur || m_hasGPU_RLC || !m_gpuDisp.empty() || !m_gpuLocalABC.empty()))
+	{
+		CmdComputeBarrier(cmd, barrier);
+		dispatchedPreVolt = false;
+	}
 
 	// Mur pre-voltage (saves boundary values before Yee update)
 	if (!m_gpuMur.empty())
@@ -3800,6 +3840,12 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		vkCmdPushConstants(cmd, m_upmlPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreCurr = true;
+	}
+	// As for the voltage: UPML first, then whatever reads the same cells.
+	if (dispatchedPreCurr && (!m_gpuDisp.empty() || !m_gpuLocalABC.empty()))
+	{
+		CmdComputeBarrier(cmd, barrier);
+		dispatchedPreCurr = false;
 	}
 
 	// Dispersive pre-current
@@ -4530,9 +4576,17 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 
 		const uint32_t ts = t0 + (uint32_t)t;
 
-		// --- Dispersive pre-voltage (ADE update before the Yee sweep) ---
+		// --- Pre-voltage: UPML (unfused), then dispersive ADE ---
 		// Ordered exactly as the flat path has it: the pre passes run before
 		// the update, the apply passes after it and before the excitation.
+		// UPML goes first and alone, because it swaps field and flux in cells
+		// the dispersive pass may read.
+		const bool unfusedUPML = !m_hasFusedUPML && !m_gpuUPML.empty();
+		if (unfusedUPML && eHi > eLo)
+		{
+			RecordUPMLSlabPhase(cmd, 0, eLo, eHi);
+			CmdComputeBarrier(cmd, barrier);
+		}
 		if (RecordDispersiveSlabPhase(cmd, 0, eLo, eHi))
 		{
 				CmdComputeBarrier(cmd, barrier);
@@ -4560,11 +4614,6 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		}
 		else
 		{
-			if (!m_gpuUPML.empty() && eHi > eLo)
-			{
-				RecordUPMLSlabPhase(cmd, 0, eLo, eHi);
-				CmdComputeBarrier(cmd, barrier);
-			}
 			if (eHi > eLo)
 			{
 				GridPC pv = gridV;
@@ -4624,6 +4673,11 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		const int hHi  = (Bn < NXH) ? Bn : NXH;
 		const int hExc = (Bn >= NX) ? NX : hHi;
 
+		if (unfusedUPML && hExc > An)
+		{
+			RecordUPMLSlabPhase(cmd, 2, An, hExc);
+			CmdComputeBarrier(cmd, barrier);
+		}
 		if (RecordDispersiveSlabPhase(cmd, 2, An, hExc))
 		{
 				CmdComputeBarrier(cmd, barrier);
@@ -4647,11 +4701,6 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		}
 		else
 		{
-			if (!m_gpuUPML.empty() && hExc > An)
-			{
-				RecordUPMLSlabPhase(cmd, 2, An, hExc);
-				CmdComputeBarrier(cmd, barrier);
-			}
 			if (hHi > An)
 			{
 				GridPC pc = gridC;
@@ -5049,6 +5098,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdPushConstants(cmd, m_murApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 					vkCmdDispatch(cmd, groups, 1, 1);
 				}
+				// Mur and RLC can share cells; the CPU applies them in this order.
+				if (m_hasGPU_Mur && m_hasGPU_RLC)
+					CmdComputeBarrier(cmd, barrier);
 				if (m_hasGPU_RLC)
 				{
 					RlcPC pc = {m_gpuRLC.count};
@@ -5059,6 +5111,11 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
 					vkCmdDispatch(cmd, groups, 1, 1);
 				}
+				// A lumped port puts its resistor and its excitation on the same
+				// edges.  Without this barrier the excitation's += and the RLC's
+				// write are unordered.
+				if ((m_hasGPU_Mur || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
+					CmdComputeBarrier(cmd, barrier);
 				RecordLocalABCPhase(cmd, 2);
 
 				// --- Voltage excitation ---
@@ -5207,6 +5264,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
+			// UPML post-voltage turns the flux back into the field; Mur and
+			// TF/SF come after it on the CPU and may read the same cells.
+			if (!m_gpuUPML.empty() && (m_hasGPU_Mur || m_hasGPU_TFSF))
+				CmdComputeBarrier(cmd, barrier);
 
 			// Mur post-voltage (accumulates shifted field)
 			if (!m_gpuMur.empty())
@@ -5271,6 +5332,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPushConstants(cmd, m_murApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
+			// Mur and RLC can share cells; the CPU applies them in this order.
+			if (m_hasGPU_Mur && m_hasGPU_RLC)
+				CmdComputeBarrier(cmd, barrier);
 
 			// RLC apply
 			if (m_hasGPU_RLC)
@@ -5283,6 +5347,11 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
+			// A lumped port puts its resistor and its excitation on the same
+			// edges.  Without this barrier the excitation's += and the RLC's
+			// write are unordered.
+			if ((m_hasGPU_Mur || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
+				CmdComputeBarrier(cmd, barrier);
 			RecordLocalABCPhase(cmd, 2);
 
 			// --- Voltage excitation ---
@@ -5338,6 +5407,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
+			if (!m_gpuUPML.empty() && m_hasGPU_TFSF && m_gpuTFSF.currCount > 0)
+				CmdComputeBarrier(cmd, barrier);
 
 			// TF/SF current injection
 			if (m_hasGPU_TFSF && m_gpuTFSF.currCount > 0 && tfsfExc)
