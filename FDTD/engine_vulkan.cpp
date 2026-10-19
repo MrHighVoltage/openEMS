@@ -52,6 +52,8 @@ using std::endl;
 
 bool Engine_Vulkan::s_preferReBARFieldBuffers = true;
 bool Engine_Vulkan::s_enableProfiling = false;
+const char* const Engine_Vulkan::s_profileStageNames[Engine_Vulkan::PROFILE_STAGES] = {
+	"pre-V ext", "Yee V", "post-V ext", "V apply+exc", "pre-I ext", "Yee I", "post-I+exc"};
 
 // ---------------------------------------------------------------------------
 // Vulkan error checking
@@ -715,7 +717,10 @@ void Engine_Vulkan::Init()
 	else
 		cout << "  Pure GPU mode — double-buffered fire-and-forget submission" << endl;
 	if (m_profileEnabled)
-		cout << "  GPU profiling enabled (timestamp queries + fence wait accounting)" << endl;
+		cout << "  GPU profiling enabled (timestamp queries + fence wait accounting"
+		     << (m_profileStages ? ", stage timestamps" : "") << ")" << endl;
+	if (m_profileNoBarriers)
+		cout << "  WARNING: OPENEMS_GPU_PROFILE_NO_BARRIERS -- timestep barriers skipped, results are invalid (timing only)" << endl;
 	if (m_hasGPU_UPML)
 		cout << "  GPU UPML active (" << m_gpuUPML.size() << " region(s))" << endl;
 	if (m_hasFusedUPML)
@@ -1118,6 +1123,10 @@ void Engine_Vulkan::SetupProfiling()
 		m_profilePhaseEnabled = (enabled != 0);
 	}
 	m_profileQueriesPerSlot = m_profilePhaseEnabled ? 4u : 2u;
+	if (const char* env = std::getenv("OPENEMS_GPU_PROFILE_STAGES"))
+		m_profileStages = (std::atoi(env) != 0);
+	if (const char* env = std::getenv("OPENEMS_GPU_PROFILE_NO_BARRIERS"))
+		m_profileNoBarriers = (std::atoi(env) != 0);
 
 	uint32_t qfCount = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, nullptr);
@@ -1141,6 +1150,15 @@ void Engine_Vulkan::SetupProfiling()
 	qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
 	qpi.queryCount = m_profileQueriesPerSlot * CMD_RING_SIZE;
 	VK_CHECK(vkCreateQueryPool(m_device, &qpi, nullptr, &m_tsQueryPool));
+
+	// A pure-GPU batch holds at most m_maxTSPerSubmit timesteps (IterateTS
+	// splits longer calls), so that bounds a slot's stage marks.
+	if (m_profileStages)
+	{
+		m_stageQueriesPerSlot = 1 + PROFILE_STAGES * m_maxTSPerSubmit;
+		qpi.queryCount = m_stageQueriesPerSlot * CMD_RING_SIZE;
+		VK_CHECK(vkCreateQueryPool(m_device, &qpi, nullptr, &m_stageQueryPool));
+	}
 
 	m_profileEnabled = true;
 }
@@ -1167,6 +1185,8 @@ void Engine_Vulkan::CollectProfileForSlot(int slot) const
 		m_profileGpuMs += gpuNs * 1e-6;
 		m_profileBatchCount++;
 		m_profileTSCount += m_profileSubmittedTS[slot];
+		m_profileFirstTick = std::min(m_profileFirstTick, ts[0]);
+		m_profileLastTick = std::max(m_profileLastTick, ts[m_profileQueriesPerSlot - 1]);
 
 		if (m_profilePhaseEnabled && m_profileQueriesPerSlot == 4 &&
 		    ts[1] >= ts[0] && ts[2] >= ts[1] && ts[3] >= ts[2])
@@ -1180,8 +1200,25 @@ void Engine_Vulkan::CollectProfileForSlot(int slot) const
 		}
 	}
 
+	const unsigned int nStage = m_stageSlotTS[slot];
+	if (m_stageQueryPool && nStage > 0)
+	{
+		std::vector<uint64_t> marks(1 + PROFILE_STAGES * nStage);
+		r = vkGetQueryPoolResults(m_device, m_stageQueryPool, (uint32_t)(slot * m_stageQueriesPerSlot),
+		                          (uint32_t)marks.size(), marks.size() * sizeof(uint64_t), marks.data(),
+		                          sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+		if (r == VK_SUCCESS)
+		{
+			for (size_t i = 1; i < marks.size(); ++i)
+				if (marks[i] >= marks[i - 1])
+					m_stageMs[(i - 1) % PROFILE_STAGES] += (double)(marks[i] - marks[i - 1]) * (double)m_timestampPeriodNs * 1e-6;
+			m_stageTSCount += nStage;
+		}
+	}
+
 	const_cast<Engine_Vulkan*>(this)->m_profilePending[slot] = false;
 	const_cast<Engine_Vulkan*>(this)->m_profileSubmittedTS[slot] = 0;
+	const_cast<Engine_Vulkan*>(this)->m_stageSlotTS[slot] = 0;
 }
 
 void Engine_Vulkan::PrintProfileSummary() const
@@ -1212,6 +1249,39 @@ void Engine_Vulkan::PrintProfileSummary() const
 		     << "probe=" << m_profileProbeMs << " ms (" << probePct << "%), "
 		     << "tail=" << m_profileTailMs << " ms (" << tailPct << "%)" << endl;
 	}
+	if (m_profileLastTick > m_profileFirstTick)
+	{
+		// Batches run one after another on one queue, so the span from the
+		// first batch's start to the last one's end, minus their busy time, is
+		// time the GPU sat waiting for the host.
+		const double spanMs = (double)(m_profileLastTick - m_profileFirstTick) * (double)m_timestampPeriodNs * 1e-6;
+		cout << "  GPU span: " << spanMs << " ms, idle between batches " << spanMs - m_profileGpuMs
+		     << " ms (" << 100.0 * (spanMs - m_profileGpuMs) / spanMs << "%)" << endl;
+	}
+	if (m_profileRecordedTS > 0)
+		cout << "  Compute barriers per timestep: " << (double)m_profileBarriers / (double)m_profileRecordedTS
+		     << (m_profileNoBarriers ? " (all skipped: OPENEMS_GPU_PROFILE_NO_BARRIERS, results invalid)" : "") << endl;
+	if (m_stageTSCount > 0)
+	{
+		double sumMs = 0.0;
+		for (int s = 0; s < PROFILE_STAGES; ++s)
+			sumMs += m_stageMs[s];
+		cout << "  Stage split (GPU, " << m_stageTSCount << " timesteps, us/TS):";
+		for (int s = 0; s < PROFILE_STAGES; ++s)
+			cout << (s ? ", " : " ") << s_profileStageNames[s] << "=" << 1000.0 * m_stageMs[s] / (double)m_stageTSCount
+			     << " (" << 100.0 * m_stageMs[s] / sumMs << "%)";
+		cout << ", sum=" << 1000.0 * sumMs / (double)m_stageTSCount << endl;
+	}
+}
+
+void Engine_Vulkan::CmdComputeBarrier(VkCommandBuffer cmd, const VkMemoryBarrier& barrier) const
+{
+	if (m_profileEnabled)
+		++m_profileBarriers;
+	if (m_profileNoBarriers)
+		return;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 // ===========================================================================
@@ -3397,9 +3467,7 @@ void Engine_Vulkan::RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) con
 		barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 		barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-		                     1, &barrier, 0, nullptr, 0, nullptr);
+		CmdComputeBarrier(cmd, barrier);
 	}
 }
 
@@ -3418,9 +3486,7 @@ void Engine_Vulkan::RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts) co
 	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-	                     1, &barrier, 0, nullptr, 0, nullptr);
+	CmdComputeBarrier(cmd, barrier);
 }
 
 void Engine_Vulkan::UpdateSteadyStateResult()
@@ -3710,9 +3776,7 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	// Barrier: all pre-voltage writes must complete before Yee update
 	if (dispatchedPreVolt)
 	{
-		vkCmdPipelineBarrier(cmd,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			0, 1, &barrier, 0, nullptr, 0, nullptr);
+		CmdComputeBarrier(cmd, barrier);
 	}
 }
 
@@ -3755,9 +3819,7 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 
 	if (dispatchedPreCurr)
 	{
-		vkCmdPipelineBarrier(cmd,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			0, 1, &barrier, 0, nullptr, 0, nullptr);
+		CmdComputeBarrier(cmd, barrier);
 	}
 }
 
@@ -4473,9 +4535,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		// the update, the apply passes after it and before the excitation.
 		if (RecordDispersiveSlabPhase(cmd, 0, eLo, eHi))
 		{
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 		}
 
 		// --- Voltage update on [eLo, eHi) ---
@@ -4495,9 +4555,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 				                   0, sizeof(FusedPC), &pf);
 				vkCmdDispatch(cmd, (pf.gidEnd - pf.gidBase + 255) / 256, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 		}
 		else
@@ -4505,9 +4563,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			if (!m_gpuUPML.empty() && eHi > eLo)
 			{
 				RecordUPMLSlabPhase(cmd, 0, eLo, eHi);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			if (eHi > eLo)
 			{
@@ -4520,25 +4576,19 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 				                   0, sizeof(GridPC), &pv);
 				vkCmdDispatch(cmd, (pv.gidEnd - pv.gidBase + 255) / 256, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			if (!m_gpuUPML.empty() && eHi > eLo)
 			{
 				RecordUPMLSlabPhase(cmd, 1, eLo, eHi);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 		}
 
 		// --- Dispersive apply-voltage ---
 		if (RecordDispersiveSlabPhase(cmd, 1, eLo, eHi))
 		{
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 		}
 
 		// --- Voltage excitation, restricted to the same x-range ---
@@ -4554,9 +4604,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 				                   0, sizeof(ExcPC), &epc);
 				vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 		}
 
@@ -4578,9 +4626,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 
 		if (RecordDispersiveSlabPhase(cmd, 2, An, hExc))
 		{
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 		}
 
 		if (m_hasFusedUPML)
@@ -4596,9 +4642,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 				                   0, sizeof(FusedPC), &pf);
 				vkCmdDispatch(cmd, (pf.gidEnd - pf.gidBase + 255) / 256, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 		}
 		else
@@ -4606,9 +4650,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			if (!m_gpuUPML.empty() && hExc > An)
 			{
 				RecordUPMLSlabPhase(cmd, 2, An, hExc);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			if (hHi > An)
 			{
@@ -4621,25 +4663,19 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 				                   0, sizeof(GridPC), &pc);
 				vkCmdDispatch(cmd, (pc.gidEnd - pc.gidBase + 255) / 256, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			if (!m_gpuUPML.empty() && hExc > An)
 			{
 				RecordUPMLSlabPhase(cmd, 3, An, hExc);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 		}
 
 		// --- Dispersive apply-current ---
 		if (RecordDispersiveSlabPhase(cmd, 3, An, hExc))
 		{
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 		}
 
 		// --- Current excitation ---
@@ -4660,9 +4696,7 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 				                   0, sizeof(ExcPC), &epc);
 				vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 		}
 
@@ -4845,6 +4879,22 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile);
 		}
 
+		// OPENEMS_GPU_PROFILE_STAGES: a timestamp after each stage of every
+		// flat-schedule timestep (s_profileStageNames).  A bottom-of-pipe
+		// timestamp is written once all earlier work has finished, so two
+		// consecutive marks bracket one stage, its barrier included.
+		uint32_t qStage = (uint32_t)(m_cmdIdx * m_stageQueriesPerSlot);
+		const auto stageMark = [&]()
+		{
+			if (m_stageQueryPool)
+				vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_stageQueryPool, qStage++);
+		};
+		if (m_stageQueryPool)
+		{
+			vkCmdResetQueryPool(cmd, m_stageQueryPool, qStage, m_stageQueriesPerSlot);
+			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_stageQueryPool, qStage++);
+		}
+
 		// Append all FDTD timesteps
 		// ================= Trapezoidal temporal blocking ==================
 		// See ConfigureTemporalBlocking() for the schedule and its guards.  A
@@ -4921,11 +4971,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.voltPC);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
-					vkCmdPipelineBarrier(cmd,
-						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-						0, 1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				RecordLocalABCPhase(cmd, 0);
+				stageMark();
 
 				// --- Fused voltage update (Yee + UPML pre + UPML post in one dispatch) ---
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedVoltPipeline);
@@ -4935,9 +4984,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				                   0, sizeof(FusedPC), &fusedPC);
 				vkCmdDispatch(cmd, voltGroups, 1, 1);
 
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
+				stageMark();
 				if (m_validateStages)
 					RecordGPUFieldValidation(cmd, 16);
 
@@ -4968,11 +5016,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 						vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
-					vkCmdPipelineBarrier(cmd,
-						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-						0, 1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				RecordLocalABCPhase(cmd, 1);
+				stageMark();
 
 				// --- Apply2Voltages (dispersive, Mur, RLC — same as non-fused path) ---
 				if (!m_gpuDisp.empty())
@@ -4988,9 +5035,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
 									   &dpc);
 					vkCmdDispatch(cmd, groups, 1, 1);
-					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-					                     1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				if (!m_gpuMur.empty())
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
@@ -5034,12 +5079,12 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				// and to the fused Yee current update.
 				if (hasVoltLateWritesFused)
 				{
-					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				if (m_validateStages)
 					RecordGPUFieldValidation(cmd, 32);
 				RecordSteadyStateSample(cmd, ts);
+				stageMark();
 
 				// --- Fused current update (Yee + UPML pre + UPML post) ---
 				// Pre-current non-UPML extensions (dispersive)
@@ -5058,10 +5103,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 										   &d.currPC);
 						vkCmdDispatch(cmd, groups, 1, 1);
 					}
-					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				RecordLocalABCPhase(cmd, 3);
+				stageMark();
 
 				// Fused current dispatch (Yee + UPML pre/post)
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedCurrPipeline);
@@ -5070,8 +5115,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FusedPC), &fusedPC);
 				vkCmdDispatch(cmd, voltGroups, 1, 1); // dispatch N threads (same as voltage)
 
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-									 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
+				stageMark();
 				if (m_validateStages)
 					RecordGPUFieldValidation(cmd, 64);
 
@@ -5088,8 +5133,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				}
 				if (m_hasGPU_TFSF && hasDispCurrADE)
 				{
-					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				RecordLocalABCPhase(cmd, 4);
 				// Dispersive apply current
@@ -5106,9 +5150,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
 									   &dpc);
 					vkCmdDispatch(cmd, groups, 1, 1);
-					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-					                     1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				RecordLocalABCPhase(cmd, 5);
 
@@ -5126,8 +5168,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				}
 				if (hasCurrLateWritesFused)
 				{
-					vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-										 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+					CmdComputeBarrier(cmd, barrier);
 				}
 				if (m_validateStages)
 					RecordGPUFieldValidation(cmd, 80);
@@ -5139,6 +5180,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			RecordVoltageExtensions(cmd, ts);
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 0);
+			stageMark();
 
 			// --- Voltage update ---
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
@@ -5148,9 +5190,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			                   0, sizeof(GridPC), &gridPC);
 			vkCmdDispatch(cmd, voltGroups, 1, 1);
 
-			vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0, 1, &barrier, 0, nullptr, 0, nullptr);
+			CmdComputeBarrier(cmd, barrier);
+			stageMark();
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 16);
 
@@ -5195,11 +5236,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			// Barrier for post-voltage writes
 			if (m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF)
 			{
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					0, 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			RecordLocalABCPhase(cmd, 1);
+			stageMark();
 
 			// === Apply2Voltages extensions (GPU) ===
 			// Dispersive apply
@@ -5215,9 +5255,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 										&d.applyVoltDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-				                     1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 
 			// Mur apply (overwrites boundary voltages)
@@ -5263,17 +5301,18 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 
 			if (hasVoltLateWrites)
 			{
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-									 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 32);
 			RecordSteadyStateSample(cmd, ts);
+			stageMark();
 
 			// === Pre-current extensions (GPU) ===
 			RecordCurrentExtensions(cmd, ts);
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 48);
+			stageMark();
 
 			// --- Current update ---
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
@@ -5282,8 +5321,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC), &gridPCc);
 			vkCmdDispatch(cmd, currGroups, 1, 1);
 
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-								 &barrier, 0, nullptr, 0, nullptr);
+			CmdComputeBarrier(cmd, barrier);
+			stageMark();
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 64);
 
@@ -5314,8 +5353,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 
 			if ((m_hasGPU_UPML || m_hasGPU_TFSF) && hasDispCurrADE)
 			{
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-									 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			RecordLocalABCPhase(cmd, 4);
 
@@ -5332,9 +5370,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 										&d.applyCurrDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-				                     1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			RecordLocalABCPhase(cmd, 5);
 
@@ -5353,12 +5389,12 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 
 			if (hasCurrLateWrites)
 			{
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-									 1, &barrier, 0, nullptr, 0, nullptr);
+				CmdComputeBarrier(cmd, barrier);
 			}
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 80);
 			} // end else (original separate-dispatch path)
+			stageMark();
 		}
 
 		if (m_validateStages)
@@ -5541,6 +5577,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		{
 			m_profilePending[m_cmdIdx] = true;
 			m_profileSubmittedTS[m_cmdIdx] = iterTS;
+			m_profileRecordedTS += iterTS;
+			m_stageSlotTS[m_cmdIdx] = (m_stageQueryPool && !m_tbActive) ? iterTS : 0;
 		}
 		m_gpuDrained = false;  // new submission in flight
 		m_cmdIdx = (m_cmdIdx + 1) % CMD_RING_SIZE;
@@ -5731,6 +5769,11 @@ void Engine_Vulkan::CleanupVulkan()
 	{
 		vkDestroyQueryPool(m_device, m_tsQueryPool, nullptr);
 		m_tsQueryPool = VK_NULL_HANDLE;
+	}
+	if (m_stageQueryPool)
+	{
+		vkDestroyQueryPool(m_device, m_stageQueryPool, nullptr);
+		m_stageQueryPool = VK_NULL_HANDLE;
 	}
 
 	// Pipeline cache

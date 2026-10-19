@@ -368,6 +368,26 @@ private:
 	mutable double m_profileComputeMs = 0.0;
 	mutable double m_profileProbeMs = 0.0;
 	mutable double m_profileTailMs = 0.0;
+	mutable uint64_t m_profileFirstTick = UINT64_MAX; //!< earliest batch start (GPU ticks)
+	mutable uint64_t m_profileLastTick = 0;           //!< latest batch end
+	mutable uint64_t m_profileBarriers = 0;           //!< compute barriers recorded in timesteps
+	mutable uint64_t m_profileRecordedTS = 0;         //!< timesteps recorded while profiling
+
+	//! OPENEMS_GPU_PROFILE_STAGES: timestamps between the stages of every
+	//! flat-schedule timestep.  A timestep has PROFILE_STAGES stages; the slot's
+	//! queries are one batch-start mark plus one mark per stage end.
+	static constexpr int PROFILE_STAGES = 7;
+	static const char* const s_profileStageNames[PROFILE_STAGES];
+	bool m_profileStages = false;
+	VkQueryPool m_stageQueryPool = VK_NULL_HANDLE;
+	uint32_t m_stageQueriesPerSlot = 0;
+	unsigned int m_stageSlotTS[CMD_RING_SIZE] = {}; //!< marked timesteps in each slot's batch
+	mutable uint64_t m_stageTSCount = 0;
+	mutable double m_stageMs[PROFILE_STAGES] = {};
+
+	//! OPENEMS_GPU_PROFILE_NO_BARRIERS: skip the compute barriers inside the
+	//! timestep loop.  Timing only -- the fields are wrong.
+	bool m_profileNoBarriers = false;
 
 	// ---- Internal helpers ---------------------------------------------
 	void InitVulkan();
@@ -398,6 +418,10 @@ private:
 	void SetupProfiling();
 	void CollectProfileForSlot(int slot) const;
 	void PrintProfileSummary() const;
+
+	//! The compute -> compute dependency between two stages of a timestep;
+	//! counted, or skipped, by the profiling switches above.
+	void CmdComputeBarrier(VkCommandBuffer cmd, const VkMemoryBarrier& barrier) const;
 
 	//! Submit any pending batched GPU command buffer and wait for completion.
 	//! Used only by hybrid path and non-ReBAR fallback.
