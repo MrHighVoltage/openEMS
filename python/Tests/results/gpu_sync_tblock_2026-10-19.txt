@@ -1,0 +1,555 @@
+# Vulkan engine on the TL model (247x153x133, 5.03 M cells): synchronisation and temporal blocking
+# 2026-10-19. Build: portable GPU bundle of cc549df (stage profiler, CmdComputeBarrier) for sections 1-2;
+#             later sections name theirs.
+# Hosts: cytex = i9-13900K + RX 6800 (128 MB Infinity Cache, 512 GB/s), pinned via DRI_PRIME=pci-0000_03_00_0.
+#        computeQ1 = RX 7900 XTX (96 MB Infinity Cache, 960 GB/s) at 0000:03:00.0, shared server, card idle.
+# Driver: python/Tests/bench_gpu_sync.py. MC/s from the Speed: line; us/TS from --gpu-profile timestamps.
+
+## 1. Synchronisation and stage split (tests/gpuprof/sweep.sh)
+#    tl_skin_sub1: the TL model with Mur on six faces, two lumped ports, port probes; 20000 TS.
+#    224 mur/pml: 224^3 uniform grid, 3000 TS. 64 pec: 64^3, 200000 TS.
+#    stages: OPENEMS_GPU_PROFILE_STAGES=1. nobarrier: OPENEMS_GPU_PROFILE_NO_BARRIERS=1 (timing only, fields wrong).
+
+### RX 6800
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                3501.3        -       -       -        -  
+batch                3494.3   1437.8    0.03     5.0      314  
+stages               3497.9   1435.8    0.07     5.0      314  pre-Vext 33.3 YeeV 675.2 post-Vext 32.4 Vapply+exc 18.6 pre-Iext 0.1 YeeI 676.1 post-I+exc 0.1
+nobarrier            3544.8   1417.2    0.04     5.0      314  
+plain                3500.6        -       -       -        -  
+batch                3500.5   1435.2    0.04     5.0      314  
+stages               3498.3   1435.6    0.07     5.0      314  pre-Vext 33.3 YeeV 675.1 post-Vext 32.4 Vapply+exc 18.6 pre-Iext 0.1 YeeI 676.0 post-I+exc 0.1
+nobarrier            3544.7   1417.3    0.04     5.0      314  
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+batch/sub16          3499.7   1435.6    0.04     5.0     1251  
+batch/sub256         3500.2   1435.1    0.05     5.0       80  
+cytex: 0000:03:00.0, 3000 timesteps, 224x224x224_mur.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                5094.9        -       -       -        -  
+stages               5096.2   2198.5    0.31     5.0       52  pre-Vext 109.5 YeeV 967.8 post-Vext 84.7 Vapply+exc 55.4 pre-Iext 0.1 YeeI 981.0 post-I+exc 0.1
+nobarrier            5173.8   2167.2    0.23     5.0       52  
+plain                5100.7        -       -       -        -  
+stages               5092.2   2199.6    0.33     5.0       52  pre-Vext 109.7 YeeV 967.6 post-Vext 85.2 Vapply+exc 57.1 pre-Iext 0.1 YeeI 979.9 post-I+exc 0.1
+nobarrier            5169.2   2169.7    0.21     5.0       52  
+cytex: 0000:03:00.0, 3000 timesteps, 224x224x224_pml.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                4591.1        -       -       -        -  
+stages               4577.3   2453.7    0.07     3.0       52  pre-Vext 0.1 YeeV 1228.0 post-Vext 0.1 Vapply+exc 10.6 pre-Iext 0.1 YeeI 1214.7 post-I+exc 0.1
+nobarrier            4597.4   2443.0    0.07     3.0       52  
+plain                4591.0        -       -       -        -  
+stages               4582.1   2451.0    0.07     3.0       52  pre-Vext 0.1 YeeV 1226.7 post-Vext 0.1 Vapply+exc 10.6 pre-Iext 0.1 YeeI 1213.5 post-I+exc 0.1
+nobarrier            4595.1   2444.2    0.06     3.0       52  
+cytex: 0000:03:00.0, 200000 timesteps, 64x64x64_pec.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain               10902.3        -       -       -        -  
+stages              10910.2     23.9    0.54     3.0     3469  pre-Vext 0.1 YeeV 10.5 post-Vext 0.1 Vapply+exc 1.7 pre-Iext 0.1 YeeI 11.4 post-I+exc 0.1
+nobarrier           11246.5     23.1    0.96     3.0     3469  
+plain               10864.3        -       -       -        -  
+stages              11162.1     23.4    0.56     3.0     3469  pre-Vext 0.1 YeeV 10.2 post-Vext 0.1 Vapply+exc 1.7 pre-Iext 0.1 YeeI 11.1 post-I+exc 0.1
+nobarrier           11496.2     22.6    1.00     3.0     3469  
+=== done
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain/cmax65536      3485.4        -       -       -        -  
+stages/cmax65536     3480.5   1443.1    0.06     5.0      314  pre-Vext 33.3 YeeV 671.5 post-Vext 31.8 Vapply+exc 18.9 pre-Iext 0.1 YeeI 687.4 post-I+exc 0.1
+plain/cmax65536      3480.0        -       -       -        -  
+stages/cmax65536     3477.5   1444.3    0.06     5.0      314  pre-Vext 31.6 YeeV 679.8 post-Vext 33.2 Vapply+exc 18.6 pre-Iext 0.1 YeeI 680.8 post-I+exc 0.1
+
+### RX 7900 XTX
+computeq1: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                5684.3        -       -       -        -  
+batch                5694.4    882.4    0.02     5.0      314  
+stages               5678.3    884.5    0.04     5.0      314  pre-Vext 19.9 YeeV 415.8 post-Vext 19.9 Vapply+exc 9.9 pre-Iext 0.1 YeeI 418.8 post-I+exc 0.1
+nobarrier            5734.0    876.2    0.02     5.0      314  
+plain                5696.2        -       -       -        -  
+batch                5696.2    881.9    0.03     5.0      314  
+stages               5678.6    884.5    0.03     5.0      314  pre-Vext 19.9 YeeV 415.8 post-Vext 19.9 Vapply+exc 9.9 pre-Iext 0.1 YeeI 418.7 post-I+exc 0.1
+nobarrier            5733.4    876.2    0.03     5.0      314  
+computeq1: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+batch/sub16          5690.5    882.7    0.05     5.0     1251  
+batch/sub256         5698.6    881.7    0.02     5.0       80  
+computeq1: 0000:03:00.0, 3000 timesteps, 224x224x224_mur.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                9307.3        -       -       -        -  
+stages               9294.1   1207.7    0.10     5.0       52  pre-Vext 49.3 YeeV 548.1 post-Vext 43.8 Vapply+exc 18.7 pre-Iext 0.1 YeeI 547.7 post-I+exc 0.1
+nobarrier            9415.2   1192.4    0.08     5.0       52  
+plain                9306.7        -       -       -        -  
+stages               9297.1   1207.3    0.11     5.0       52  pre-Vext 49.3 YeeV 548.0 post-Vext 43.8 Vapply+exc 18.6 pre-Iext 0.1 YeeI 547.6 post-I+exc 0.1
+nobarrier            9415.0   1192.5    0.08     5.0       52  
+computeq1: 0000:03:00.0, 3000 timesteps, 224x224x224_pml.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                8279.8        -       -       -        -  
+stages               8147.3   1378.2    0.06     3.0       52  pre-Vext 0.1 YeeV 682.0 post-Vext 0.1 Vapply+exc 16.6 pre-Iext 0.1 YeeI 679.4 post-I+exc 0.1
+nobarrier            8270.0   1358.0    0.05     3.0       52  
+plain                8280.3        -       -       -        -  
+stages               8144.4   1378.4    0.08     3.0       52  pre-Vext 0.1 YeeV 682.0 post-Vext 0.1 Vapply+exc 16.6 pre-Iext 0.1 YeeI 679.6 post-I+exc 0.1
+nobarrier            8271.1   1357.7    0.05     3.0       52  
+computeq1: 0000:03:00.0, 200000 timesteps, 64x64x64_pec.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain               20737.1        -       -       -        -  
+stages              19509.1     13.3    1.06     3.0     3469  pre-Vext 0.1 YeeV 5.7 post-Vext 0.1 Vapply+exc 1.6 pre-Iext 0.1 YeeI 5.7 post-I+exc 0.1
+nobarrier           39856.6      6.3    3.64     3.0     3469  
+plain               20631.5        -       -       -        -  
+stages              19449.0     13.3    1.06     3.0     3469  pre-Vext 0.1 YeeV 5.7 post-Vext 0.1 Vapply+exc 1.6 pre-Iext 0.1 YeeI 5.8 post-I+exc 0.1
+nobarrier           39597.6      6.4    3.75     3.0     3469  
+=== done
+
+## 2. Temporal blocking on the TL grid (tests/gpuprof/sweep_tb.sh)
+#    tl_skin_pec_noports: tests/gpuprof/make_tl_pec.py -- the TL model with PEC instead of Mur, no lumped
+#    resistors, no probes, the port's soft excitation kept. Same uncompressed operator (48 B/cell).
+#    'MB field state/tile' is the engine's figure (24 B/cell). The real tile with coefficients is 3x that.
+
+### Bit-identity: full-volume E/H dumps (HDF5) at TS 0, 999, 1998, flat vs blocked
+#### RX 6800 (h5py, compare_dumps.py)
+Et.h5: 3 dumps at steps 00000000,00000999,00001998; last: 14.1 % non-zero, max |f| 2.951e-01
+  r0-plain-tb16w45                         bit-identical
+  r0-plain-tb16                            bit-identical
+  r0-plain-tb8w16                          bit-identical
+  r0-plain-tb32w64                         bit-identical
+Ht.h5: 3 dumps at steps 00000000,00000999,00001998; last: 13.8 % non-zero, max |f| 2.365e-04
+  r0-plain-tb16w45                         bit-identical
+  r0-plain-tb16                            bit-identical
+  r0-plain-tb8w16                          bit-identical
+  r0-plain-tb32w64                         bit-identical
+non-zero E at step 1998 on x-lines 16..113
+#### RX 7900 XTX (no h5py there: byte count from cmp -l; 6 = the HDF5 header timestamps, see the RX 6800 files)
+computeq1: 0000:03:00.0, 2000 timesteps, tl_skin_pec_dump.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                 936.2        -       -       -        -  
+plain/tb16w45        1028.3        -       -       -        -  k=16 W=45, 6 tiles, 20 MB field state/tile
+plain/tb16            959.9        -       -       -        -  k=16 W=137, 2 tiles, 63 MB field state/tile
+plain/tb8w16          999.2        -       -       -        -  k=8 W=16, 15 tiles, 7 MB field state/tile
+plain/tb32w64        1032.3        -       -       -        -  k=32 W=64, 4 tiles, 29 MB field state/tile
+no h5py: bytes differing from the flat run's files (HDF5 header timestamps alone give ~6)
+  r0-plain-tb16: Et 6, Ht 6 of 180960652
+  r0-plain-tb16w45: Et 6, Ht 6 of 180960652
+  r0-plain-tb32w64: Et 6, Ht 6 of 180960652
+  r0-plain-tb8w16: Et 6, Ht 6 of 180960652
+
+### Timing, 20000 TS, two rounds
+#### RX 6800
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_pec_noports.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                3628.0        -       -       -        -  
+plain/tb16           6016.5        -       -       -        -  k=16 W=137, 2 tiles, 63 MB field state/tile
+plain/tb8w16         6827.2        -       -       -        -  k=8 W=16, 15 tiles, 7 MB field state/tile
+plain/tb8w24         6959.4        -       -       -        -  k=8 W=24, 10 tiles, 11 MB field state/tile
+plain/tb16w32        7511.3        -       -       -        -  k=16 W=32, 8 tiles, 14 MB field state/tile
+plain/tb16w45        7578.4        -       -       -        -  k=16 W=45, 6 tiles, 20 MB field state/tile
+plain/tb16w60        7671.2        -       -       -        -  k=16 W=60, 4 tiles, 27 MB field state/tile
+plain/tb16w80        7081.0        -       -       -        -  k=16 W=80, 3 tiles, 37 MB field state/tile
+plain/tb16w100       6640.1        -       -       -        -  k=16 W=100, 3 tiles, 46 MB field state/tile
+plain/tb24w48        7383.1        -       -       -        -  k=24 W=48, 5 tiles, 22 MB field state/tile
+plain/tb24w64        7588.7        -       -       -        -  k=24 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w64        7703.4        -       -       -        -  k=32 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w80        7410.5        -       -       -        -  k=32 W=80, 3 tiles, 37 MB field state/tile
+plain                3652.2        -       -       -        -  
+plain/tb16           6166.5        -       -       -        -  k=16 W=137, 2 tiles, 63 MB field state/tile
+plain/tb8w16         6757.7        -       -       -        -  k=8 W=16, 15 tiles, 7 MB field state/tile
+plain/tb8w24         6808.8        -       -       -        -  k=8 W=24, 10 tiles, 11 MB field state/tile
+plain/tb16w32        7563.5        -       -       -        -  k=16 W=32, 8 tiles, 14 MB field state/tile
+plain/tb16w45        7446.4        -       -       -        -  k=16 W=45, 6 tiles, 20 MB field state/tile
+plain/tb16w60        7674.6        -       -       -        -  k=16 W=60, 4 tiles, 27 MB field state/tile
+plain/tb16w80        6958.1        -       -       -        -  k=16 W=80, 3 tiles, 37 MB field state/tile
+plain/tb16w100       7013.7        -       -       -        -  k=16 W=100, 3 tiles, 46 MB field state/tile
+plain/tb24w48        7339.2        -       -       -        -  k=24 W=48, 5 tiles, 22 MB field state/tile
+plain/tb24w64        7283.8        -       -       -        -  k=24 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w64        7375.9        -       -       -        -  k=32 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w80        7292.0        -       -       -        -  k=32 W=80, 3 tiles, 37 MB field state/tile
+=== done
+#### RX 7900 XTX
+computeq1: 0000:03:00.0, 20000 timesteps, tl_skin_pec_noports.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                5998.7        -       -       -        -  
+plain/tb16           7312.6        -       -       -        -  k=16 W=137, 2 tiles, 63 MB field state/tile
+plain/tb8w16        12692.8        -       -       -        -  k=8 W=16, 15 tiles, 7 MB field state/tile
+plain/tb8w24        14068.5        -       -       -        -  k=8 W=24, 10 tiles, 11 MB field state/tile
+plain/tb16w32       16601.1        -       -       -        -  k=16 W=32, 8 tiles, 14 MB field state/tile
+plain/tb16w45       17516.3        -       -       -        -  k=16 W=45, 6 tiles, 20 MB field state/tile
+plain/tb16w60       17482.4        -       -       -        -  k=16 W=60, 4 tiles, 27 MB field state/tile
+plain/tb16w80       12892.6        -       -       -        -  k=16 W=80, 3 tiles, 37 MB field state/tile
+plain/tb16w100      10951.8        -       -       -        -  k=16 W=100, 3 tiles, 46 MB field state/tile
+plain/tb24w48       18609.0        -       -       -        -  k=24 W=48, 5 tiles, 22 MB field state/tile
+plain/tb24w64       18607.0        -       -       -        -  k=24 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w64       19147.3        -       -       -        -  k=32 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w80       15678.1        -       -       -        -  k=32 W=80, 3 tiles, 37 MB field state/tile
+plain                5998.3        -       -       -        -  
+plain/tb16           7310.1        -       -       -        -  k=16 W=137, 2 tiles, 63 MB field state/tile
+plain/tb8w16        12675.6        -       -       -        -  k=8 W=16, 15 tiles, 7 MB field state/tile
+plain/tb8w24        14066.6        -       -       -        -  k=8 W=24, 10 tiles, 11 MB field state/tile
+plain/tb16w32       16641.9        -       -       -        -  k=16 W=32, 8 tiles, 14 MB field state/tile
+plain/tb16w45       17562.2        -       -       -        -  k=16 W=45, 6 tiles, 20 MB field state/tile
+plain/tb16w60       17492.0        -       -       -        -  k=16 W=60, 4 tiles, 27 MB field state/tile
+plain/tb16w80       12901.3        -       -       -        -  k=16 W=80, 3 tiles, 37 MB field state/tile
+plain/tb16w100      10952.6        -       -       -        -  k=16 W=100, 3 tiles, 46 MB field state/tile
+plain/tb24w48       18601.6        -       -       -        -  k=24 W=48, 5 tiles, 22 MB field state/tile
+plain/tb24w64       18657.4        -       -       -        -  k=24 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w64       19189.8        -       -       -        -  k=32 W=64, 4 tiles, 29 MB field state/tile
+plain/tb32w80       15669.5        -       -       -        -  k=32 W=80, 3 tiles, 37 MB field state/tile
+=== done
+
+## 3. Full GPU temporal blocking (Mur, lumped RLC, TF/SF and probe slab paths; G1-G5): f5dbf3c, with 5686c5e's race fixes
+#    Identity: python/Tests/gpu_tblock_identity.py, RX 6800, full-volume E/H dumps every 96 TS + probe files,
+#    custom-sine excitation (no steady-state detection). Built-in cases, 600 TS:
+=== mur_rlc
+  flat              100.208 MC/s  reference  [7 dumps, last 97.9 % non-zero, max |E| 1.08, 3 probe files]
+  flat again        100.456 MC/s  identical
+  tblock 4:12        92.083 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       94.2409 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      96.6611 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      97.3799 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           99.2304 MC/s  identical  [not blocked: grid already fits the 128 MB default threshold (3 MB of fields and coefficients)]
+=== tfsf
+  flat              98.3324 MC/s  reference  [7 dumps, last 97.9 % non-zero, max |E| 1.45, 0 probe files]
+  flat again         98.993 MC/s  identical
+  tblock 4:12       89.7588 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       89.8452 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      92.8396 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      95.4936 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           96.5527 MC/s  identical  [not blocked: grid already fits the 128 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur
+  flat              95.3701 MC/s  reference  [7 dumps, last 91.1 % non-zero, max |E| 31.8, 0 probe files]
+  flat again        96.3836 MC/s  identical
+  tblock 4:12       88.2593 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       91.5805 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      95.3871 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      96.8036 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           98.9353 MC/s  identical  [not blocked: grid already fits the 128 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur_unfused
+  flat              97.0735 MC/s  reference  [7 dumps, last 91.1 % non-zero, max |E| 31.8, 0 probe files]
+  flat again        96.7719 MC/s  identical
+  tblock 4:12       87.2175 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       88.5026 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40       92.104 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      94.2426 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           97.6856 MC/s  identical  [not blocked: grid already fits the 128 MB default threshold (3 MB of fields and coefficients)]
+=== local_abc
+  flat              99.7673 MC/s  reference  [7 dumps, last 89.9 % non-zero, max |E| 30.7, 0 probe files]
+  flat again        100.817 MC/s  identical
+  tblock 4:12       100.013 MC/s  identical  [refused, as expected]
+  tblock 8:20       100.188 MC/s  identical  [refused, as expected]
+  tblock 16:40      98.0853 MC/s  identical  [refused, as expected]
+  tblock 24:48      96.7928 MC/s  identical  [refused, as expected]
+  default           99.6234 MC/s  identical  [not blocked: local absorbing sheets have no slab path yet]
+
+all identical
+# Previous build (13429c6 + profiler) flat vs this build's flat: identical on mur_rlc, tfsf, pml_mur, local_abc;
+# pml_mur_unfused differed (the old unfused flat path was not even identical to itself: UPML pre/post and
+# Mur pre/post raced; E grew to 4.45e19).
+# The TL model (tl_skin_sub1: Mur on six faces, two lumped ports, four port probes), 400 TS, dumps every 96 TS
+# (non-zero E on x-lines 29..113 at the last dump):
+=== tl_skin_sub1
+  flat                63.35 MC/s  reference  [5 dumps, last 4.8 % non-zero, max |E| 279, 4 probe files]
+  flat again          63.21 MC/s  identical
+  tblock 8:20         62.45 MC/s  identical  [k=8 W=20, 12 tiles]
+  tblock 16:40        62.22 MC/s  identical  [k=16 W=40, 6 tiles]
+  tblock 32:70        62.53 MC/s  identical  [k=32 W=70, 4 tiles]
+  default             63.72 MC/s  identical  [k=22 W=45, 5 tiles]
+
+all identical
+
+### Timing, the TL model itself (tl_skin_sub1), before merging Mur/RLC pre-voltage into the previous current update
+#### RX 6800
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                3484.2        -       -       -        -  
+plain/tb16           6729.0        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain/tb24           7094.0        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb32           6984.3        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb16w32        6663.0        -       -       -        -  k=16 W=32, 8 tiles, 44 MB field state/tile
+plain/tb24w48        7181.6        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64        7008.5        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch/tb16           6939.1    717.9    0.86    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb16            -    653.8    0.89    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb32w64         -    672.9    0.16    36.6      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+plain                3479.3        -       -       -        -  
+plain/tb16           6753.4        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain/tb24           7033.1        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb32           7001.0        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb16w32        6919.4        -       -       -        -  k=16 W=32, 8 tiles, 44 MB field state/tile
+plain/tb24w48        7097.0        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64        6896.2        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch/tb16           7029.9    708.5    0.88    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb16            -    680.8    0.88    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb32w64         -    676.6    0.16    36.6      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+#### RX 7900 XTX
+computeq1: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                5698.2        -       -       -        -  
+plain/tb16          14480.2        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain/tb24          15088.5        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb32          15074.7        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb16w32       13221.7        -       -       -        -  k=16 W=32, 8 tiles, 44 MB field state/tile
+plain/tb24w48       15553.9        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64       16359.0        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch/tb16          14415.2    347.2    0.38    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb16            -    247.7    0.53    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb32w64         -    243.8    0.11    36.6      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+plain                5697.6        -       -       -        -  
+plain/tb16          14404.5        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain/tb24          14998.7        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb32          15023.1        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb16w32       13214.3        -       -       -        -  k=16 W=32, 8 tiles, 44 MB field state/tile
+plain/tb24w48       15548.0        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64       16377.5        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch/tb16          14459.4    346.2    0.36    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb16            -    247.1    0.52    56.6      314  k=16 W=45, 6 tiles, 62 MB field state/tile
+nobarrier/tb32w64         -    243.8    0.11    36.6      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+computeq1: 0000:03:00.0, 20000 timesteps, tl_skin_pec_noports.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                5998.2        -       -       -        -  
+plain/tb16          17499.6        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain/tb32w64       19196.1        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+=== done
+#### RX 6800, PEC variant with the new tile sizing
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_pec_noports.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                3622.8        -       -       -        -  
+plain/tb16           7200.1        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain/tb32w64        7337.1        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+=== done
+
+### Timing after the pre-voltage merge, blocking on by default (plain = default, tb0 = flat)
+#### RX 6800
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain/tb0            3484.2        -       -       -        -  
+plain                6789.8        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb24w48        6851.0        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64        7002.0        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch                6806.6    731.5    0.92    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    661.1    0.17    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+batch/tb32w64        7182.4    698.6    0.15    29.8      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+plain/tb0            3483.6        -       -       -        -  
+plain                7209.5        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb24w48        7255.2        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64        6856.1        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch                7169.9    694.0    0.98    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    652.4    0.17    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+batch/tb32w64        7244.7    692.6    0.15    29.8      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+=== done
+#### RX 7900 XTX
+computeq1: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain/tb0            5697.2        -       -       -        -  
+plain               15522.3        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb24w48       16043.4        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64       16721.7        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch               15463.7    323.5    0.41    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    251.1    0.15    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+batch/tb32w64       16681.7    300.9    0.09    29.8      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+plain/tb0            5697.8        -       -       -        -  
+plain               15374.5        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb24w48       15921.4        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64       16666.0        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch               15468.4    323.6    0.38    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    251.4    0.12    38.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+batch/tb32w64       16683.1    300.8    0.09    29.8      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+=== done
+
+## 4. Full 60 ps TL run (sub-1) on the RX 7900 XTX, blocking on by default (a build of the f5dbf3c work before its absorbing-sheet slab path; no Mur fusion)
+#    tests/computeq1/results-tblock-default/sub-1 (job.json, log, port files); flat reference: tests/computeq1/results (4bfcd74, 2026-10-17).
+Engine_Vulkan: trapezoidal temporal blocking active (default) — k=22 W=45 (5 tiles, 62 MB/tile, 345 MB of fields and coefficients)
+Time for 15801989 iterations with 5026203.00 cells : 5385.80 sec
+Speed: 14746.94 MCells/s 
+# port_ut_1, port_it_1, port_ut_2, port_it_2 (145 samples each) and the et/ht dumps: bit-identical to the flat run.
+# Wall 5386 s vs 14116 s flat (2.62x).
+
+## 5. Mur post/apply folded into the voltage update (update_voltages_mur.comp, a32c439); murfuse0 = separate phases
+### Identity, RX 6800 (h5py): built-in cases and TL model, flat vs 'flat Mur unfused' vs blocked: all identical
+=== tl_skin_sub1
+  flat                62.43 MC/s  reference  [5 dumps, last 4.8 % non-zero, max |E| 279, 4 probe files]
+  flat again          62.24 MC/s  identical
+  ref flat            61.63 MC/s  identical
+  flat Mur unfused    62.19 MC/s  identical
+  tblock 8:20         62.97 MC/s  identical  [k=8 W=20, 12 tiles]
+  tblock 16:40        63.07 MC/s  identical  [k=16 W=40, 6 tiles]
+  tblock 32:70        63.10 MC/s  identical  [k=32 W=70, 4 tiles]
+  default             62.19 MC/s  identical  [k=22 W=45, 5 tiles]
+
+all identical
+#### RX 6800, first fused kernel (local arrays), sweep_tb4.sh
+cytex: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain/tb0            3463.0        -       -       -        -  
+plain                7002.6        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb24w48        6948.9        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64        6960.8        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch                7097.4    707.1    0.13    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    652.6    0.13    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+stages/tb0           3451.6   1455.6    0.04     4.0      314  pre-Vext 38.4 YeeV 711.7 post-Vext 0.1 Vapply+exc 6.3 pre-Iext 0.1 YeeI 698.9 post-I+exc 0.1
+plain/tb0            3463.0        -       -       -        -  
+plain                7130.1        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb24w48        7343.8        -       -       -        -  k=24 W=48, 5 tiles, 67 MB field state/tile
+plain/tb32w64        7185.1        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch                7156.5    701.3    0.13    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    655.1    0.16    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+stages/tb0           3451.0   1455.7    0.04     4.0      314  pre-Vext 38.4 YeeV 711.8 post-Vext 0.1 Vapply+exc 6.3 pre-Iext 0.1 YeeI 698.9 post-I+exc 0.1
+=== done
+#### RX 6800, fused kernel without local arrays
+  stages/tb0               3449.9 MC/s pre-V ext=38.4 Yee V=712.3 post-V ext=0.1 V apply+exc=6.3 pre-I ext=0.1 Yee I=698.9 post-I+exc=0.1
+  stages/tb0/murfuse0      3461.1 MC/s pre-V ext=36.4 Yee V=693.2 post-V ext=33.5 V apply+exc=19.2 pre-I ext=0.1 Yee I=668.6 post-I+exc=0.1
+  plain                    7238.3 MC/s 
+  plain/murfuse0           6882.1 MC/s 
+  stages/tb0               3450.6 MC/s pre-V ext=38.4 Yee V=712.2 post-V ext=0.1 V apply+exc=6.3 pre-I ext=0.1 Yee I=698.8 post-I+exc=0.1
+  stages/tb0/murfuse0      3461.0 MC/s pre-V ext=36.4 Yee V=693.2 post-V ext=33.5 V apply+exc=19.2 pre-I ext=0.1 Yee I=668.6 post-I+exc=0.1
+  plain                    7165.1 MC/s 
+  plain/murfuse0           7215.6 MC/s 
+#### RX 7900 XTX (sweep_tb5.sh)
+computeq1: 0000:03:00.0, 20000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+stages/tb0           5740.9    875.0    0.03     4.0      314  pre-Vext 19.7 YeeV 431.7 post-Vext 0.1 Vapply+exc 6.2 pre-Iext 0.1 YeeI 417.1 post-I+exc 0.1
+stages/tb0/murfuse0   5668.6    886.3    0.03     6.0      314  pre-Vext 22.2 YeeV 416.9 post-Vext 19.0 Vapply+exc 9.8 pre-Iext 0.1 YeeI 418.3 post-I+exc 0.1
+plain               16166.2        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/murfuse0      15348.3        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb32w64       17264.0        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+plain/tb32w64/murfuse0  16604.5        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch               16213.7    309.6    0.10    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    258.5    0.10    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+batch/tb32w64       17268.1    290.7    0.09    15.8      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+stages/tb0           5741.6    875.1    0.02     4.0      314  pre-Vext 19.7 YeeV 431.7 post-Vext 0.1 Vapply+exc 6.2 pre-Iext 0.1 YeeI 417.1 post-I+exc 0.1
+stages/tb0/murfuse0   5670.7    885.9    0.03     6.0      314  pre-Vext 22.2 YeeV 416.9 post-Vext 19.1 Vapply+exc 9.3 pre-Iext 0.1 YeeI 418.2 post-I+exc 0.1
+plain               16150.7        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/murfuse0      15387.6        -       -       -        -  k=22 W=45, 5 tiles, 62 MB field state/tile
+plain/tb32w64       17263.7        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+plain/tb32w64/murfuse0  16620.5        -       -       -        -  k=32 W=64, 4 tiles, 89 MB field state/tile
+batch               16206.6    309.7    0.11    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+nobarrier                 -    258.0    0.11    20.2      314  k=22 W=45, 5 tiles, 62 MB field state/tile
+batch/tb32w64       17272.3    290.4    0.16    15.8      314  k=32 W=64, 4 tiles, 89 MB field state/tile
+=== done
+
+
+### Identity on the RX 7900 XTX (final build with Mur fusion; dumps copied back, compared with h5py; ref-flat = build before the local-ABC change)
+=== local_abc
+  flat             reference  [7 dumps, last 89.9 % non-zero, max |E| 30.7, 0 probe files]
+  default          identical
+  flat-again       identical
+  flat-mur-unfused identical
+  ref-flat         identical
+  tblock-16-40     identical  [k=16 W=40, 3 tiles]
+  tblock-24-48     identical  [k=24 W=48, 2 tiles]
+  tblock-4-12      identical  [k=4 W=12, 8 tiles]
+  tblock-8-20      identical  [k=8 W=20, 5 tiles]
+=== local_abc_sa
+  flat             reference  [7 dumps, last 89.9 % non-zero, max |E| 31.7, 0 probe files]
+  default          identical
+  flat-again       identical
+  flat-mur-unfused identical
+  ref-flat         DIFFERS (Et.h5/FieldData/TD/00000096 differs in 312134 values, max |diff| 0.0128 at (1, 41, 21, 30))
+  tblock-16-40     identical  [k=16 W=40, 2 tiles]
+  tblock-24-48     identical  [k=24 W=48, 2 tiles]
+  tblock-4-12      identical  [k=4 W=12, 8 tiles]
+  tblock-8-20      identical  [k=8 W=20, 4 tiles]
+=== mur_rlc
+  flat             reference  [7 dumps, last 97.9 % non-zero, max |E| 1.08, 3 probe files]
+  default          identical
+  flat-again       identical
+  flat-mur-unfused identical
+  ref-flat         identical
+  tblock-16-40     identical  [k=16 W=40, 3 tiles]
+  tblock-24-48     identical  [k=24 W=48, 2 tiles]
+  tblock-4-12      identical  [k=4 W=12, 8 tiles]
+  tblock-8-20      identical  [k=8 W=20, 5 tiles]
+=== pml_mur
+  flat             reference  [7 dumps, last 91.1 % non-zero, max |E| 31.8, 0 probe files]
+  default          identical
+  flat-again       identical
+  flat-mur-unfused identical
+  ref-flat         identical
+  tblock-16-40     identical  [k=16 W=40, 3 tiles]
+  tblock-24-48     identical  [k=24 W=48, 2 tiles]
+  tblock-4-12      identical  [k=4 W=12, 8 tiles]
+  tblock-8-20      identical  [k=8 W=20, 5 tiles]
+=== pml_mur_unfused
+  flat             reference  [7 dumps, last 91.1 % non-zero, max |E| 31.8, 0 probe files]
+  default          identical
+  flat-again       identical
+  flat-mur-unfused identical
+  ref-flat         identical
+  tblock-16-40     identical  [k=16 W=40, 3 tiles]
+  tblock-24-48     identical  [k=24 W=48, 2 tiles]
+  tblock-4-12      identical  [k=4 W=12, 8 tiles]
+  tblock-8-20      identical  [k=8 W=20, 5 tiles]
+=== tfsf
+  flat             reference  [7 dumps, last 97.9 % non-zero, max |E| 1.45, 0 probe files]
+  default          identical
+  flat-again       identical
+  flat-mur-unfused identical
+  ref-flat         identical
+  tblock-16-40     identical  [k=16 W=40, 3 tiles]
+  tblock-24-48     identical  [k=24 W=48, 2 tiles]
+  tblock-4-12      identical  [k=4 W=12, 8 tiles]
+  tblock-8-20      identical  [k=8 W=20, 5 tiles]
+=== tl_skin_sub1
+  flat             reference  [5 dumps, last 4.8 % non-zero, max |E| 279, 4 probe files]
+  default          identical  [k=22 W=45, 5 tiles]
+  flat-again       identical
+  flat-mur-unfused identical
+  tblock-16-40     identical  [k=16 W=40, 6 tiles]
+  tblock-32-70     identical  [k=32 W=70, 4 tiles]
+  tblock-8-20      identical  [k=8 W=20, 12 tiles]
+
+all identical
+
+
+## 6. Integrated GPUs on the TL model, build of a32c439, forced schedules (tests/gpuprof/sweep_igpu.sh)
+#    5000 TS, two rounds. Without OPENEMS_GPU_TEMPORAL_BLOCK an integrated GPU runs flat ('plain').
+#    'MB field state/tile' is fields + coefficients (72 B/cell on this uncompressed operator).
+#    UHD 770 = cytex 0000:00:02.0 (i9-13900K, 36 MB L3 shared); HD 530 = srv002 (i7-6700K, 8 MB L3);
+#    Vega 7 = srv003 0000:08:00.0 (Ryzen 5 5600G, no GPU-side LLC).
+### UHD 770
+cytex: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                 315.3        -       -       -        -  
+plain/tb2/tbmb8       351.9        -       -       -        -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             402.6        -       -       -        -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      429.2        -       -       -        -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     412.2        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain                 314.5        -       -       -        -  
+plain/tb2/tbmb8       354.2        -       -       -        -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             401.6        -       -       -        -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      429.7        -       -       -        -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     414.3        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+=== done
+#### follow-up, one round
+cytex: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain/tb6/tbmb24      421.8        -       -       -        -  k=6 W=17, 15 tiles, 23 MB field state/tile
+plain/tb11w22         434.8        -       -       -        -  k=11 W=22, 11 tiles, 30 MB field state/tile
+plain/tb8w16          427.7        -       -       -        -  k=8 W=16, 15 tiles, 22 MB field state/tile
+plain/tb12/tbmb48     418.7        -       -       -        -  k=12 W=34, 7 tiles, 47 MB field state/tile
+plain/tb16w34         422.7        -       -       -        -  k=16 W=34, 7 tiles, 47 MB field state/tile
+### HD 530
+# r0 plain: VK_ERROR_DEVICE_LOST at TS 2048 (kernel: 'i915 0000:00:02.0: [drm] Resetting rcs0 for preemption time out',
+# 'GPU HANG: ecode 9:1:8ed9fff2, in openEMS'); the r1 plain run is clean.
+srv002: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                     -        -       -       -        -  
+plain/tb2/tbmb8       253.2        -       -       -        -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             255.4        -       -       -        -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      250.8        -       -       -        -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     251.0        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain                 251.2        -       -       -        -  
+plain/tb2/tbmb8       253.3        -       -       -        -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             255.2        -       -       -        -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      250.9        -       -       -        -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     251.0        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+=== done
+### Vega 7
+srv003: 0000:08:00.0, 5000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches  stages (us/TS)
+plain                 298.2        -       -       -        -  
+plain/tb2/tbmb8       291.7        -       -       -        -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             295.8        -       -       -        -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      297.4        -       -       -        -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     298.1        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain                 298.2        -       -       -        -  
+plain/tb2/tbmb8       291.3        -       -       -        -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             295.8        -       -       -        -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      297.4        -       -       -        -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     298.1        -       -       -        -  k=16 W=45, 6 tiles, 62 MB field state/tile
+=== done

@@ -1021,8 +1021,8 @@ here where the roofline C4 established was never the binding constraint.
 
 Bit-identical to the flat sweep on both drivers
 (`python/Tests/test_gpu_temporal_blocking.py`, 11 tests). Mur, TF/SF, lumped
-RLC and GPU probes still have no slab path and make the schedule refuse rather
-than risk; the remaining work is in `plans/GPU_TEMPORAL_BLOCKING_PLAN.md`.
+RLC and GPU probes had no slab path then and made the schedule refuse; they
+have one since 2026-10-19 (§4.10), and the schedule is on by default.
 
 Two things this opened, both recorded in [PERFORMANCE.md](PERFORMANCE.md) §5.5:
 Vulkan exposes no last-level-cache size, so the tile target is a tunable
@@ -1172,9 +1172,101 @@ the i9-13900K (944 → 1758 MC/s) and on the Ryzen 5 5600G (552 → 1088), and
     ~3500 despite ~1.9× the memory bandwidth. The RX 6800 itself drops from
     ~5450 MC/s on a 2.3 M-cell grid to ~3500 here. Find out whether that is
     bandwidth, cache or dispatch.
+
+  Answered in §4.10: synchronisation is not the GPU's problem, the cache is,
+  and blocking is worth 2.1–3.2× on this grid once the GPU can block it.
 - **D7 — The flat path.** It still barriers after every extension in all six
   phases, implemented or not: about 50 barriers per timestep on the TL model,
   but only ~6 % waiting. `SlabHookMask()`-style skipping would carry over.
+
+### 4.10 The GPU engine on the TL model (2026-10-19)
+
+D6 asked whether the CPU's synchronisation findings hold for `Engine_Vulkan`.
+They do not. Tables are in PERFORMANCE.md §5.8 and raw output in
+`python/Tests/results/gpu_sync_tblock_2026-10-19.txt`.
+
+**Tools.**
+- `OPENEMS_GPU_PROFILE_STAGES=1` and `OPENEMS_GPU_PROFILE_NO_BARRIERS=1`, both
+  with `--gpu-profile`, time each stage of a flat timestep and the timestep
+  without its barriers.
+- Every compute barrier inside the timestep loop goes through
+  `Engine_Vulkan::CmdComputeBarrier()`, which counts the barriers and can drop
+  them.
+- `python/Tests/bench_gpu_sync.py` drives both switches. It also sets the batch
+  size, the compression budget and the blocking schedule per run, and pins the
+  card through `DRI_PRIME`.
+
+**Findings.**
+- **Synchronisation costs ≤ 1.4 % on large grids.** Idle time between
+  batches is ≤ 0.1 %, and the batch size does not matter. Small grids are the
+  exception on the RX 7900 XTX: about 2 µs per barrier, so 64³ PEC runs 1.92×
+  faster without its barriers.
+- **The six Mur faces take 5.6–5.9 % of the TL model's timestep**, and 9–11 %
+  on 224³. That is kernel work, not waiting.
+- **The Yee kernels are bandwidth-bound**: 87 % of the RX 6800's peak and 76 %
+  of the XTX's. The TL model's coefficients are per cell and almost all
+  unique, so compressing the operator cannot help here.
+- **Temporal blocking on this grid** (PEC variant, no ports or probes) is
+  **2.1×** on the RX 6800 and **3.2×** on the XTX. It is bit-identical to the
+  flat sweep on both cards.
+- **The default tile throws most of that away.** The tile target counts only
+  field bytes, while an uncompressed operator triples a cell's footprint, so
+  the default reaches 1.67× and 1.22×.
+
+#### Full temporal blocking on the GPU — G1–G5 done the same day
+
+Everything is bit-identical to the flat sweep:
+`python/Tests/gpu_tblock_identity.py`, with full-volume dumps and probe files,
+covering seven synthetic cases and the TL model; tables in PERFORMANCE.md §5.8.
+
+- **G1 — A tile that counts the coefficients.** ✅ The tile is sized from
+  24 B of fields plus the operator's bytes per cell, and a compressed
+  operator's shared tables come off the target once.
+- **G2 — Mur.** ✅ A face normal to x runs whole, in the slab that holds both
+  of its lines; the y- and z-normal faces are clipped through `xLo/xHi` push
+  constants.
+- **G3 — Lumped RLC and TF/SF.** ✅ Both entry lists are sorted by x, with
+  prefix tables. TF/SF sorts by x and then by field index, so the runs of
+  points sharing an edge cell stay whole. Local absorbing sheets as well: an x-normal sheet
+  keeps its footprint whole because the tile edges are moved at least k lines
+  away from it. The CPU schedule still refuses interior x-normal sheets, which
+  this placement would also fix there.
+- **G4 — GPU probes.** ✅ No work needed: the gather is recorded at the end of
+  each batch.
+- **G5 — On by default.** ✅ On a discrete GPU, when fields and coefficients
+  exceed twice the tile target, with k = min(32, W/2).
+  `OPENEMS_GPU_TEMPORAL_BLOCK=0` turns it off.
+- **G6 — Per-slab cost.** ✅ for Mur.
+  - Running the next step's Mur and RLC pre-voltage with the current update cut
+    46 → 38 barriers per timestep.
+  - Folding Mur's post and apply into the voltage update
+    (`update_voltages_mur.comp`, `SetupMurFusion()`) cut 38 → 20. It is
+    bit-identical to the three-phase path, and on the RX 7900 XTX it is worth
+    +5 % blocked (2.84× flat by default, 3.03× at k=32 with 64 lines).
+  - The rest is the two barriers every slab step needs, between the E and H
+    updates. Only fewer, wider trapezoids reduce them.
+  - The fused kernel is off whenever UPML, a dispersive material, TF/SF or an
+    absorbing sheet could put work between Mur's post and apply. Those models
+    keep the separate phases.
+- **G7 — The flat path's Mur.** ✅ The same kernel: +1.3 % on the XTX, a wash on
+  the RX 6800.
+- **Device cache table.** Open. The XTX prefers a tile just under its 96 MB
+  cache (+8 % over the 64 MB default), while the RX 6800 is flat from 45 to
+  89 MB. A per-device target would need a table of cache sizes, because
+  Vulkan exposes none.
+- **Integrated GPUs.** Open. Blocking stays opt-in there. On the TL model it
+  gives the UHD 770 1.38× (k=11 on 30 MB tiles, just under the 36 MB L3 it
+  shares with the CPU), the HD 530 at most +2 %, and the Vega 7 up to −2 %
+  (PERFORMANCE.md §5.8). The same table could turn it on for Intel parts that
+  share a large L3, with a target near that L3 rather than the 16 MB default.
+
+Four races in the flat path were found and fixed on the way (PERFORMANCE.md
+§5.8):
+
+- a lumped port's RLC apply and excitation;
+- the shared edges of Mur faces;
+- unfused UPML against the Mur and dispersive passes that read the same cells;
+- crossing absorbing sheets.
 
 ---
 

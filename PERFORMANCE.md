@@ -59,6 +59,13 @@ This is the one-page answer. §2 onward is the detail and the method.
   case from 17.7× to **39.0×** over upstream (§5.4). It erases the throughput
   cliff at the cache boundary: a grid that does not fit runs within 6% of one
   that does.
+  On the 5.03 M-cell transmission-line model of §5.7, with Mur on six faces
+  and two lumped ports, it is worth **2.0×** on the RX 6800 and **2.8–3.0×**
+  on an RX 7900 XTX, bit-identical to the flat sweep. A full 60 ps run of it on
+  the XTX drops from 3.9 h to **1.5 h**, with port files identical to the flat
+  run's. It is on by default for discrete GPUs on grids well beyond their cache
+  (§5.8). On the integrated GPUs it stays opt-in: 1.38× on the UHD 770, which
+  shares the i9-13900K's 36 MB L3, nothing on the HD 530 and the Vega 7.
 - **Thread auto-tune on many-core machines.** Upstream's search leaves
   **15–53%** on the table on the 32-thread host; the fork's default lands within
   3–5% of its own pinned optimum there, and 99–100% on the four-core host (§3.3).
@@ -926,16 +933,15 @@ and one checks the fused and unfused PML paths against *each other*, because
 each of the first two compares a path against itself and both would pass if the
 slab range were wrong in a way they shared.
 
-The Mur row is the refusal mechanism working:
+The Mur row was the refusal mechanism working, at the time:
 
 ```
 Engine_Vulkan: temporal blocking disabled — Mur ABC has no slab path yet
 ```
 
-Mur, TF/SF, lumped RLC and GPU probes have no slab path on the GPU yet, so any
-model using them falls back to the flat sweep and reports the flat number. What
-remains to be done, in the order that pays, is in
-`plans/GPU_TEMPORAL_BLOCKING_PLAN.md`.
+Since 2026-10-19 Mur, TF/SF, lumped RLC, GPU probes and local absorbing sheets
+all have slab paths (§5.8), so that row would now block. It has not been
+re-measured.
 
 ### 5.5 GPU limits: a guessed tile target, and compute-bound devices
 
@@ -958,7 +964,10 @@ about 5% in the direct single-run A/B above. Either way it is a loss, and it is
 avoidable per host with one environment variable.
 
 This is a defaulting problem, not a schedule problem, and the fix is known: a
-device-ID table or a startup micro-probe instead of a constant. Until then, on a
+device-ID table or a startup micro-probe instead of a constant. §5.8 found a
+second defect in the same guess: the target counts only field bytes, so with an
+uncompressed operator a tile is three times larger than the target, and the
+default reaches 1.22× where 3.2× was available. Until then, on a
 card with an unusually large last-level cache, set
 `OPENEMS_GPU_TEMPORAL_BLOCK_MB` to it.
 
@@ -992,10 +1001,12 @@ the cache", and it is the one an integrated GPU fails by construction.
 
 ### 5.6 Limits common to both: opt-in, and capped by probe cadence
 
-Both schedules are prototypes behind environment variables —
+Both schedules were prototypes behind environment variables —
 `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` and `OPENEMS_GPU_TEMPORAL_BLOCK=<k>` (here,
-k=16 on the CPU and on the RX 6800, k=6 on the integrated devices) — and do
-nothing unless set. Two limits are worth knowing before relying on the numbers
+k=16 on the CPU and on the RX 6800, k=6 on the integrated devices) — and did
+nothing unless set. The CPU schedule still is. Since 2026-10-19 the GPU one is
+on by default on a discrete card for grids beyond twice its tile target
+(§5.8). Two limits are worth knowing before relying on the numbers
 in §5.2 and §5.4:
 
 - **Block depth is capped by the probe interval.** `openems.cpp` calls
@@ -1184,6 +1195,277 @@ What these numbers are not:
 Raw output: `python/Tests/results/tblock_sync_2026-10-18.txt`. The driver is
 `python/Tests/bench_tblock_sync.py`; it reads the memory controllers through
 `perf` when `kernel.perf_event_paranoid` ≤ 0.
+
+### 5.8 The GPU on the same model: limited by cache, not synchronisation (2026-10-19)
+
+This is the question §5.7 answered for the CPU, asked of `Engine_Vulkan` on the
+same TL model. Two cards:
+
+- the RX 6800 in the i9-13900K host: 128 MB Infinity Cache, 512 GB/s;
+- an RX 7900 XTX in a shared compute server: 96 MB Infinity Cache, 960 GB/s,
+  run on an idle card.
+
+Two profiling switches came with the work. Both need `--gpu-profile`:
+
+- `OPENEMS_GPU_PROFILE_STAGES=1` writes seven timestamps into every flat
+  timestep, so each stage gets its own GPU time. A stage is an extension phase
+  or a Yee half-step, with its trailing barrier.
+- `OPENEMS_GPU_PROFILE_NO_BARRIERS=1` drops the compute barriers inside the
+  timestep loop. This is for timing only, because the fields come out wrong.
+  The plain run's time minus this run's time bounds what the barriers cost.
+
+The profile summary now also reports the idle time between batches and the
+number of barriers per timestep.
+
+**Synchronisation costs at most 1.4 % on large grids.**
+
+| TL model, flat, 20000 TS | RX 6800 | RX 7900 XTX |
+|---|---|---|
+| MC/s | 3501 | 5690 |
+| GPU time per timestep | 1436 µs | 882 µs |
+| Yee V + Yee I | 94.1 % | 94.4 % |
+| Mur, lumped ports, excitation | 5.9 % | 5.6 % |
+| idle between batches | ≤ 0.07 % | ≤ 0.04 % |
+| gain without the 5 barriers per timestep | +1.3 % | +0.8 % |
+| 16, 64 or 256 timesteps per batch | within 0.2 % | within 0.2 % |
+
+The 224³ Mur and PML grids behave the same way: removing the barriers gains at
+most 1.4 % on either card. On the 224³ Mur grid the six Mur faces take 9–11 %
+of the timestep, even though the face cells are a few percent of the grid.
+
+The exception is a small grid on the XTX. 64³ PEC runs 1.92× faster without
+its three barriers per timestep (13.3 → 6.4 µs), which is about 2 µs per
+barrier. The RX 6800 gains only 4.5 % on the same grid.
+
+**The Yee kernels run at the memory bandwidth.** Each half-step moves 60 B per
+cell: the fields read and written, plus 24 B of coefficients. The coefficients
+cannot be shared between cells. The TL model's per-cell coefficient sets are
+nearly all unique, so its 235 MB operator stays uncompressed even with a 64 MB
+table budget. At 60 B per cell the RX 6800 sustains 447 GB/s (87 % of 512) and
+the XTX 725 GB/s (76 % of 960). That answers the question OPTIMIZATIONS.md
+§4.9 (D6) left open: the XTX is only 1.6× the RX 6800 on this model because it
+delivers 1.62× the bandwidth, a smaller share of its peak.
+
+The model's state is 362 MB (121 MB of fields, 241 MB of coefficients), against
+a 96 or 128 MB cache, so the only remaining lever is less memory traffic, which
+means temporal blocking.
+
+**Temporal blocking is worth 2.1× on the RX 6800 and 3.2× on the RX 7900 XTX on
+this grid.** At first the TL model itself could not block, because Mur, lumped
+RLC and GPU probes had no slab path. To measure the ceiling, a variant of it uses PEC
+instead of Mur and drops the lumped resistors and the probes. It keeps the
+port's soft excitation, the grid and the uncompressed operator. Run flat, it is
+4–5 % faster than the real model.
+
+Each run is 20000 timesteps, two rounds per row, values in MC/s. The real tile
+counts 72 B per cell (fields plus coefficients). The engine's own log line
+reports one third of that, because it counts only the fields.
+
+| Schedule | Real tile | RX 6800 | RX 7900 XTX |
+|---|---|---|---|
+| flat | – | 3640 | 5998 |
+| k=16, default tile (137 lines) | 191 MB | 6092 (1.67×) | 7311 (1.22×) |
+| k=8, 16 lines | 22 MB | 6792 (1.87×) | 12684 (2.11×) |
+| k=16, 32 lines | 45 MB | 7537 (2.07×) | 16622 (2.77×) |
+| k=16, 45 lines | 63 MB | 7512 (2.06×) | 17539 (2.92×) |
+| k=16, 60 lines | 84 MB | **7673 (2.11×)** | 17487 (2.92×) |
+| k=24, 64 lines | 89 MB | 7436 (2.04×) | 18632 (3.11×) |
+| k=32, 64 lines | 89 MB | 7540 (2.07×) | **19169 (3.20×)** |
+| k=16, 80 lines | 112 MB | 7020 (1.93×) | 12897 (2.15×) |
+| k=16, 100 lines | 140 MB | 6827 (1.88×) | 10952 (1.83×) |
+
+- **The default tile repeats the mistake §5.7 found on the CPU.** The tile
+  target counts field bytes only, 24 B per cell. With an uncompressed operator a
+  cell carries 72 B. The 64 MB default therefore picks two 137-line tiles of
+  191 MB each and reaches 1.67× and 1.22×. Counting the coefficients, the same
+  64 MB target gives about 45 lines and 2.06× and 2.92×.
+- **The XTX falls off at its cache size.** An 89 MB tile reaches 3.20×, a
+  112 MB tile 2.15–2.61×. Depth matters there too: k=32 is 10 % faster than
+  k=16 at the same tile size.
+- **Once blocked, the RX 6800 is not limited by DRAM.** It stays at about
+  7500 MC/s for any tile from 45 to 89 MB and any k, and falls off only gradually
+  above its cache size. The likely limit is the Infinity Cache's own bandwidth,
+  but that has not been measured. Blocked, the XTX is 2.5× the RX 6800,
+  against 1.65× flat.
+- **Bit-identical.** Full-volume E/H dumps at timesteps 0, 999 and 1998 are
+  identical to the flat run for four schedules: k=16 with 45 lines, the default
+  k=16 with 137 lines, k=8 with 16 lines and k=32 with 64 lines. That holds on
+  both cards. The field at timestep 1998 spans x-lines 16–113, so it crosses
+  every tile edge except the 137-line one.
+
+**Implemented the same day: the real model now blocks.** What it took:
+
+- **A tile that counts the coefficients.** The engine sizes the tile from the
+  fields plus the operator's bytes per cell: 72 B uncompressed, or 24 B plus
+  the index when compressed, whose shared tables come off the target once.
+  The 64 MB default now picks 45 lines on this model, not 137.
+- **Slab paths for every GPU extension the model uses**, in the flat path's
+  order:
+  - Mur: a face normal to x runs whole, in the one slab that holds both its
+    boundary line and the line it reads; faces normal to y or z are clipped to
+    the slab.
+  - Lumped RLC and TF/SF: their entry lists are sorted by x, so a slab is a
+    contiguous range, as the excitation's already was.
+  - Local absorbing sheets: clipped like Mur faces. A sheet normal to x reads
+    the line next to the one it writes. During a block of k steps a slab
+    boundary only ever sweeps the k lines on either side of a tile edge, so
+    the engine moves any tile edge that would come within k lines of such a
+    sheet. The sheet then stays inside one core tile.
+  - GPU probes needed nothing: the gather is recorded once at the end of a
+    batch, when the whole grid is at one timestep.
+- **On by default.** Unless `OPENEMS_GPU_TEMPORAL_BLOCK` is set, a discrete
+  GPU blocks when the grid's fields and coefficients exceed twice the tile
+  target, with the deepest block the tile allows (k = W/2, up to 32).
+  `OPENEMS_GPU_TEMPORAL_BLOCK=0` turns it off. Only steady-state detection and
+  extensions that run on the CPU still refuse.
+
+Four races in the *flat* path turned up on the way, and are fixed:
+
+- A lumped port's resistor and excitation sit on the same edges, and their
+  dispatches had no barrier between them.
+- Mur faces with different normals both write the field component along their
+  shared edge. The earlier face now wins, as on the CPU.
+- With the unfused UPML kernel, UPML's swap between field and flux was
+  unordered against Mur and dispersive passes that read the same cells. On a
+  test model with Mur faces reaching into PML regions the old flat path was
+  not even identical to itself, and E grew to 4e19.
+- Crossing absorbing sheets both wrote their common line.
+
+Each fix only changes a result where the old code raced. On the TL model and
+on four of the five synthetic cases, the old and new flat paths are
+bit-identical.
+
+**Bit-identical to the flat sweep.** `python/Tests/gpu_tblock_identity.py`
+runs every case flat (twice), with explicit schedules, and with the default.
+Every full-volume E and H dump and every probe file must match the first flat
+run bit for bit. The cases:
+
+- Mur with lumped ports and RLC elements;
+- a TF/SF box;
+- PML with Mur and a Lorentz material, fused and unfused;
+- absorbing sheets: first-order normal to y, and super-absorbing, one of them
+  normal to x on the tile edges;
+- the TL model itself, with Mur on six faces, two lumped ports and four probes.
+
+All pass on the RX 6800 and on the RX 7900 XTX. The XTX host has no h5py, so
+its dumps were copied back and compared here (`--compare`). A sine excitation
+keeps the fields non-zero from the first step, and a custom function avoids the
+steady-state detection that a periodic signal switches on.
+
+**Speed on the TL model itself**, 20000 timesteps, two rounds per row, values
+in MC/s:
+
+| Schedule | RX 6800 | RX 7900 XTX |
+|---|---|---|
+| flat | 3484 | 5697 |
+| default (k=22, 45 lines, 62 MB) | 6790–7210 (≈2.0×) | 15448 (**2.71×**) |
+| k=24, 48 lines | 6851–7255 | 15982 (2.81×) |
+| k=32, 64 lines | 6856–7002 | 16694 (**2.93×**) |
+
+The RX 6800 rows are ranges because its two rounds differ by up to 6 % on
+this busy desktop. Every Mur phase is a dispatch and a barrier in every slab
+step, and on the XTX a barrier costs about 1.8 µs:
+
+- Running the next step's Mur and RLC pre-voltage alongside the current update
+  cut the barriers from about 46 to 38 per timestep, worth 2–3 % on the XTX.
+- The rest still costs the XTX 72 of its 323 µs per timestep (22 %). Without
+  barriers it would run 251 µs, about 20 000 MC/s, which is 3.5× flat.
+- The RX 6800 loses only 6 % to barriers.
+
+A larger tile means fewer trapezoids and so fewer barriers, which is why the
+XTX prefers 64 lines at 89 MB, just under its 96 MB cache.
+
+**Then Mur's post and apply phases went into the voltage update.** The thread
+that updates a shift cell holds the new V(shift), so it writes the face's
+boundary value itself (`update_voltages_mur.comp`). The boundary cell's own
+thread skips the components Mur overwrites, so every element has one writer.
+The value is computed from V(shift) as the pre phase saved it, because a cell
+can be one face's boundary and another's shift cell. The result is
+bit-identical to the three-phase path. The kernel is used only when nothing
+runs between Mur's post and apply in the flat order: no UPML, dispersive
+material, TF/SF box or absorbing sheet. `OPENEMS_GPU_MUR_FUSION=0` turns it
+off.
+
+| TL model, 20000 TS, MC/s | Mur separate | Mur fused | |
+|---|---|---|---|
+| XTX flat | 5670 | 5741 | +1.3 % |
+| XTX default (k=22, 45 lines) | 15368 | **16158** | +5.1 % |
+| XTX k=32, 64 lines | 16612 | **17264** | +3.9 % |
+| RX 6800 flat | 3461 | 3450 | −0.3 % |
+| RX 6800 default | 6882–7216 | 7165–7238 | within noise |
+
+On the XTX the blocked default is now **2.84×** flat and k=32 with 64-line tiles
+**3.03×**. The barriers drop from 38 to 20 per timestep and cost 51 of 310 µs.
+The fused kernel itself is about 3.5 % slower than the plain voltage update,
+which the RX 6800, losing little to barriers, does not win back.
+
+**The whole production run, blocked by default, gives the same answer
+2.6× faster.** The 60 ps run with port 1 driven (sub-1: 15.8 M timesteps, Mur, both
+ports, the port probes and the initial field dumps) ran on the RX 7900 XTX with
+nothing set. The engine chose k=22 on 45-line tiles.
+
+| | flat (2026-10-17, 4bfcd74) | blocked (2026-10-19) |
+|---|---|---|
+| wall time | 14116 s (3.92 h) | **5386 s (1.50 h)** |
+| MC/s | 5627 | **14747** (2.62×) |
+
+All four port files (145 samples each) and both field dumps are bit-identical
+to the flat run of two days earlier. That holds with the probe cadence (every
+~109k timesteps), the speculative single-timestep submissions of the pipelined
+probe loop, and the 64-timestep batch limit all in play.
+
+**On the integrated GPUs the default stays flat, and should for two of the
+three.** The same TL model, 5000 timesteps, forced schedules
+(`OPENEMS_GPU_TEMPORAL_BLOCK=k`, tile from `OPENEMS_GPU_TEMPORAL_BLOCK_MB`;
+the integrated default target is 16 MB), MC/s. Rows with all three devices
+are two rounds; the UHD 770-only rows are one:
+
+| Schedule (tile incl. coefficients) | UHD 770 (i9-13900K) | HD 530 (i7-6700K) | Vega 7 (Ryzen 5 5600G) |
+|---|---|---|---|
+| flat (the default) | 315 | 251 | 298 |
+| k=2, 5 lines, 6 MB | 352–354 | 253 | 291 |
+| k=4, 11 lines, 15 MB | 402 | 255 | 296 |
+| k=6, 17 lines, 23 MB | 422 | | |
+| k=8, 16 lines, 22 MB | 428 | | |
+| k=8, 22 lines, 30 MB | 429–430 | 251 | 297 |
+| k=11, 22 lines, 30 MB | **435 (1.38×)** | | |
+| k=16, 34 lines, 47 MB | 423 | | |
+| k=16, 45 lines, 62 MB | 412–414 | 251 | 298 |
+
+The three devices repeat §5.4 and §5.5 more sharply:
+
+- **UHD 770**: up to 1.38× with a 30 MB tile, just under the 36 MB L3 it
+  shares with the CPU, and 1.28× at the 16 MB default target. That is more
+  than the 1.08–1.17× of §5.4's uniform grids, probably because this operator
+  is uncompressed: each cell streams 72 B instead of about 25, so more of the
+  time is DRAM traffic that a tile can save.
+- **HD 530**: within 2 % of flat at every depth. It is limited by its 24
+  execution units, not by memory.
+- **Vega 7**: up to 2 % slower than flat. It has no last-level cache to hold a
+  tile.
+
+Enabling it by default on integrated GPUs would need to tell a UHD 770 from
+the other two, which Vulkan's device type does not.
+
+One HD 530 flat run failed after 2048 timesteps with `VK_ERROR_DEVICE_LOST`. The
+kernel log shows `Resetting rcs0 for preemption time out`: a 64-timestep batch
+takes 1.3 s on that card, and i915 resets a context that holds the engine
+longer than its preemption timeout when something else wants it. The repeat
+ran clean. A smaller `OPENEMS_GPU_MAX_TS_PER_SUBMIT` shortens the batches.
+
+What these numbers are not:
+
+- **Short runs.** Each is 20000 timesteps.
+- **One quiet machine.** The i9-13900K runs a desktop. The XTX's server is
+  shared, but the card was idle, and its rounds agree within 1 %.
+- **One mesh.** The tile target and depth defaults are fitted to this model
+  and the PEC variant on two cards.
+
+Raw output: `python/Tests/results/gpu_sync_tblock_2026-10-19.txt`. The drivers
+are `python/Tests/bench_gpu_sync.py`, whose `tbK[wW]` and `tbmbN` options set
+the schedule (`tb0` is flat), and `python/Tests/gpu_tblock_identity.py`. The
+variant model, the sweep scripts and the dump comparison are in the
+`tests/gpuprof` kit.
 
 ---
 

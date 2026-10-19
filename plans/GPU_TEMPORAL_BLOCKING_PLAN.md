@@ -86,7 +86,29 @@ Three things that table says which the earlier one could not:
   negative control — the one device here whose limit was never the roofline
   this work removes.
 
+## Measured on a production grid (2026-10-19)
+
+The 5.03 M-cell TL model of PERFORMANCE.md §5.7/§5.8 has an uncompressed
+operator, 72 B per cell with its coefficients. With Mur, the lumped resistors
+and the probes removed, it blocks at **2.1×** on the RX 6800 and **3.2×** on an
+RX 7900 XTX, bit-identical to the flat sweep. The default tile reaches only
+1.67× and 1.22×, because the tile target counts 24 B per cell. Hence item 0.
+
+## Status 2026-10-19: done
+
+Items 0 and 2–4 below are implemented, and so are local absorbing sheets. The
+schedule is on by default for discrete GPUs (OPTIMIZATIONS.md §4.10,
+PERFORMANCE.md §5.8). What remains is per-slab cost: barriers, which are 22 %
+of the timestep on an RX 7900 XTX. The items are kept below as the record of
+the plan.
+
 ## Remaining work, in the order that pays
+
+### 0. Tile sizing that counts the coefficients
+
+`ConfigureTemporalBlocking()` sizes `planeBytes` from volt+curr alone. Add the
+operator's bytes per cell, and the per-cell state of any extension heavy enough
+to matter. Measured optimum: real tiles of 45–89 MB on both cards, k=16–32.
 
 ### 1. ~~UPML~~ — done
 
