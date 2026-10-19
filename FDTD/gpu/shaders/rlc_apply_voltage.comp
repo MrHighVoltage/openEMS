@@ -35,12 +35,16 @@ layout(set=0, binding=15) buffer B2Buf   { float v_b2[];   };  // [count]
 
 layout(push_constant) uniform PC {
     uint count;
+    // Temporal blocking: this dispatch owns elements [entryBase, entryEnd).
+    // The list is sorted by x on the host, so an x-slab is a contiguous run.
+    // The flat sweep passes (0, 0xFFFFFFFF).
+    uint entryBase, entryEnd;
 };
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= count) return;
+    uint gid = gl_GlobalInvocationID.x + entryBase;
+    if (gid >= count || gid >= entryEnd) return;
 
     // Rotate Jn history
     float oldJn0 = v_Jn0[gid];

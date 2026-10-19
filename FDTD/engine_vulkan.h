@@ -323,17 +323,16 @@ private:
 	mutable bool m_gpuDrained;       //!< true after DrainGPU(), cleared on submit
 	unsigned int m_maxTSPerSubmit;   //!< Max timesteps per pure-GPU vkQueueSubmit
 
-	// ---- Temporal-blocking traffic proxy (OPENEMS_GPU_TEMPORAL_BLOCK) --
-	// EXPERIMENT ONLY, and knowingly not the physics.  It runs the Yee sweep
-	// on one x-slab for k consecutive timesteps before moving to the next
-	// slab, without the trapezoidal narrowing that would make the schedule
-	// equivalent to the flat one.  Field values are therefore wrong at slab
-	// boundaries; the point is the *access pattern*, which is what sets
-	// cache behaviour -- the same proxy trick python/Tests/bench_temporal_blocking.c
-	// uses on the CPU side.  Never enable this for a real simulation.
-	unsigned int m_tbK;      //!< timesteps per block; 0 = disabled
+	// ---- Trapezoidal temporal blocking (OPENEMS_GPU_TEMPORAL_BLOCK) ----
+	// Advances one x-slab through k timesteps before moving on, so that the
+	// working set the last-level cache has to hold is a slab rather than the
+	// whole grid; bit-identical to the flat sweep.  See
+	// ConfigureTemporalBlocking() for the schedule, the guards and the
+	// default (on for discrete GPUs when the grid is well beyond the cache).
+	unsigned int m_tbK;      //!< timesteps per block; 0 = not requested
+	bool         m_tbAuto;   //!< OPENEMS_GPU_TEMPORAL_BLOCK unset: decide from device and grid
 	unsigned int m_tbW;      //!< tile width in x-lines; 0 = derive from m_tbTargetMB
-	unsigned int m_tbTargetMB; //!< bytes of field state one tile should occupy
+	unsigned int m_tbTargetMB; //!< MB of fields and coefficients one tile should occupy
 	bool         m_tbActive;   //!< blocking passed its guards for this run
 	bool         m_tbAnnounced;
 	std::vector<int> m_tbEdges; //!< tile boundaries, [0, e1, .., NX]
@@ -342,6 +341,9 @@ private:
 	//! that x; it has numLines[0]+1 elements so [xStart[a], xStart[b]) is the
 	//! entry range of x in [a,b).
 	std::vector<uint32_t> m_excVoltXStart, m_excCurrXStart;
+	//! The same prefix tables for the lumped RLC elements and the TF/SF
+	//! injection points, whose lists are sorted by x at setup for this.
+	std::vector<uint32_t> m_rlcXStart, m_tfsfVoltXStart, m_tfsfCurrXStart;
 	double       m_chunkProgressIntervalSec; //!< Minimum interval between chunk-progress prints
 	mutable bool m_chunkProgressHasLastPrint;
 	mutable std::chrono::steady_clock::time_point m_chunkProgressLastPrint;
@@ -473,6 +475,29 @@ private:
 	//! `phase` is 0=pre-volt, 1=post-volt, 2=pre-curr, 3=post-curr.
 	void RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const;
 
+	//! Record the Mur dispatches of one phase over the E range [x0,x1) at
+	//! timestep ts.  `phase` is 0=pre-volt, 1=post-volt, 2=apply.  A face normal
+	//! to x runs whole or not at all: only the slab that holds both its boundary
+	//! line and the line it reads one cell inward.  Faces normal to y or z are
+	//! clipped to [x0,x1).  Returns true if anything was dispatched.
+	bool RecordMurSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1, uint32_t ts) const;
+
+	//! Record the lumped RLC dispatch of one phase (0=pre-volt, 1=apply) for
+	//! the elements with x in [x0,x1).  Returns true if anything was dispatched.
+	bool RecordRLCSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const;
+
+	//! Record one local absorbing sheet phase (see RecordLocalABCPhase()) for
+	//! the x-range [x0,x1): the E range for phases 0-2, the H range for 3-5.
+	//! A sheet normal to x runs whole, in the one slab that holds its whole
+	//! footprint (ConfigureTemporalBlocking() places the tile edges so that
+	//! one always does); the others are clipped.  Returns true if anything
+	//! was dispatched.  Records no barrier.
+	bool RecordLocalABCSlabPhase(VkCommandBuffer cmd, uint32_t phase, int x0, int x1) const;
+
+	//! Record the TF/SF injection (volt or curr) for the points with x in
+	//! [x0,x1) at timestep ts.  Returns true if anything was dispatched.
+	bool RecordTFSFSlabPhase(VkCommandBuffer cmd, bool volt, int x0, int x1, uint32_t ts) const;
+
 	//! Record the dispersive dispatches of one phase over [x0,x1).
 	//! `phase` is 0=pre-volt, 1=apply-volt, 2=pre-curr, 3=apply-curr.
 	//! Returns true if anything was dispatched, so the caller can skip a
@@ -486,15 +511,19 @@ private:
 	//! Push constant struct for dispersive material shaders.
 	struct DispPC   { uint32_t count, Nx, Ny, Nz, hasLorADE;
 	                  uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
-	//! Push constant struct for TF/SF shaders (same as ExcPC).
-	struct TfsfPC   { uint32_t count; int32_t numTS; uint32_t sigLen; int32_t sigPeriod; };
-	//! Push constant struct for Mur ABC shaders.  edgeSkip marks the edges of
-	//! the face that an earlier face also writes (see SetupGPU_Mur); the apply
-	//! shader leaves those cells to that face.
+	//! Push constant struct for TF/SF shaders (same as ExcPC).  The points are
+	//! sorted by x, so a slab is the entry range [entryBase, entryEnd).
+	struct TfsfPC   { uint32_t count; int32_t numTS; uint32_t sigLen; int32_t sigPeriod;
+	                  uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
+	//! Push constant struct for Mur ABC shaders.  [xLo, xHi) clips a face
+	//! normal to y or z to an x-slab; the default covers the whole face.
+	//! edgeSkip marks the edges of the face that an earlier face also writes
+	//! (see SetupGPU_Mur); the apply shader leaves those cells to that face.
 	struct MurPC    { uint32_t Nx, Ny, Nz, ny, lineNr, lineNrShift, numLinesP, numLinesPP;
-	                  uint32_t edgeSkip = 0; };
-	//! Push constant struct for LumpedRLC shaders.
-	struct RlcPC    { uint32_t count; };
+	                  uint32_t xLo = 0; uint32_t xHi = 0xFFFFFFFFu; uint32_t edgeSkip = 0; };
+	//! Push constant struct for LumpedRLC shaders.  The elements are sorted by
+	//! x, so a slab is the entry range [entryBase, entryEnd).
+	struct RlcPC    { uint32_t count; uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
 	//! Push constant struct for probe gather shader.
 	struct ProbePC  { uint32_t count; };
 	struct SteadyPC { uint32_t count, ringSize, timestep; };
@@ -503,7 +532,10 @@ private:
 		uint32_t startX, startY, startZ;
 		uint32_t voltBoundary, voltShift, currBoundary, currShift;
 		uint32_t sizeP, sizePP, countVolt, countCurr, phase;
+		uint32_t xLo = 0, xHi = 0xFFFFFFFFu;  //!< x-slab clip for sheets normal to y or z
 	};
+	//! The x-lines a sheet normal to x reads or writes in any phase.
+	static void LocalABCFootprintX(const LocalAbcPC& pc, bool superAbsorption, int& lo, int& hi);
 
 	//! Helper pairing a VkBuffer with its VkDeviceMemory.
 	struct GpuBuf {

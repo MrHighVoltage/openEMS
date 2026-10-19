@@ -497,6 +497,7 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 	m_utilFence = VK_NULL_HANDLE;
 	m_cmdIdx = 0;
 	m_tbK = 0;
+	m_tbAuto = true;
 	m_tbW = 0;
 	m_tbTargetMB = 0;
 	m_tbActive = false;
@@ -576,10 +577,12 @@ void Engine_Vulkan::Init()
 		if (endPtr && *endPtr == '\0' && v > 0)
 			m_maxTSPerSubmit = (unsigned int)v;
 	}
-	// Trapezoidal temporal blocking: "<k>" or "<k>:<W>".  See the header.
+	// Trapezoidal temporal blocking: "<k>" or "<k>:<W>" forces it, "0" turns
+	// it off, unset leaves it to ConfigureTemporalBlocking().
 	if (const char* env = std::getenv("OPENEMS_GPU_TEMPORAL_BLOCK"))
 	{
 		int k = 0, w = 0;
+		m_tbAuto = false;
 		if (std::sscanf(env, "%d:%d", &k, &w) >= 1 && k > 0)
 		{
 			m_tbK = (unsigned int)k;
@@ -2769,7 +2772,7 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 
 namespace
 {
-//! Sort four parallel TF/SF arrays by field index, stably.
+//! Sort four parallel TF/SF arrays by x, then by field index, stably.
 /*!
   Injection points on the TF/SF box's edges belong to two faces, so several
   entries write the same field element. The shaders own one run of equal
@@ -2777,17 +2780,32 @@ namespace
   tfsf_voltage.comp), which requires the entries to arrive grouped. The sort is
   stable so that entries sharing an index keep the relative order the CPU
   extension applies them in.
+
+  Sorting by x first is what lets the blocked schedule give an x-slab a
+  contiguous entry range.  It cannot split a run: entries sharing a field
+  index share its x.  The x of each sorted entry is returned in `sortedX`.
 */
 void SortTFSFByFieldIndex(std::vector<uint32_t>& idx, std::vector<float>& amp,
-                          std::vector<float>& delta, std::vector<uint32_t>& delay)
+                          std::vector<float>& delta, std::vector<uint32_t>& delay,
+                          uint32_t N, uint32_t strideYZ, std::vector<uint32_t>& sortedX)
 {
 	const size_t n = idx.size();
-	if (n < 2) return;
+	const auto xOf = [N, strideYZ](uint32_t i) { return (i % N) / strideYZ; };
+	sortedX.resize(n);
+	if (n < 2)
+	{
+		for (size_t i = 0; i < n; ++i) sortedX[i] = xOf(idx[i]);
+		return;
+	}
 
 	std::vector<uint32_t> order(n);
 	for (size_t i = 0; i < n; ++i) order[i] = (uint32_t)i;
 	std::stable_sort(order.begin(), order.end(),
-	                 [&idx](uint32_t a, uint32_t b) { return idx[a] < idx[b]; });
+	                 [&idx, &xOf](uint32_t a, uint32_t b)
+	                 {
+	                 	const uint32_t xa = xOf(idx[a]), xb = xOf(idx[b]);
+	                 	return (xa != xb) ? (xa < xb) : (idx[a] < idx[b]);
+	                 });
 
 	std::vector<uint32_t> sIdx(n), sDelay(n);
 	std::vector<float>    sAmp(n), sDelta(n);
@@ -2799,6 +2817,7 @@ void SortTFSFByFieldIndex(std::vector<uint32_t>& idx, std::vector<float>& amp,
 		sDelay[i] = delay[order[i]];
 	}
 	idx.swap(sIdx); amp.swap(sAmp); delta.swap(sDelta); delay.swap(sDelay);
+	for (size_t i = 0; i < n; ++i) sortedX[i] = xOf(idx[i]);
 }
 } // namespace
 
@@ -2929,8 +2948,13 @@ void Engine_Vulkan::SetupGPU_TFSF()
 			}
 		}
 
-		SortTFSFByFieldIndex(vIdx, vAmp, vDelta, vDelay);
-		SortTFSFByFieldIndex(cIdx, cAmp, cDelta, cDelay);
+		{
+			std::vector<uint32_t> sortedX;
+			SortTFSFByFieldIndex(vIdx, vAmp, vDelta, vDelay, N, sYZ, sortedX);
+			BuildSlabEntryIndex(sortedX, m_tfsfVoltXStart);
+			SortTFSFByFieldIndex(cIdx, cAmp, cDelta, cDelay, N, sYZ, sortedX);
+			BuildSlabEntryIndex(sortedX, m_tfsfCurrXStart);
+		}
 
 		m_gpuTFSF.voltCount = voltTotal;
 		m_gpuTFSF.currCount = currTotal;
@@ -3150,14 +3174,30 @@ void Engine_Vulkan::SetupGPU_RLC()
 		VkDeviceSize fSize = cnt * sizeof(float);
 		VkDeviceSize iSize = cnt * sizeof(uint32_t);
 
+		// Elements in order of x, so that the blocked schedule can give an
+		// x-slab a contiguous range of them.  Each element owns its state and
+		// rotates its own history, so the order is free; the sort is stable
+		// so that elements sharing an x keep the order the CPU visits them in.
+		std::vector<uint32_t> order(cnt);
+		for (uint32_t i = 0; i < cnt; i++) order[i] = i;
+		std::stable_sort(order.begin(), order.end(), [rlc](uint32_t a, uint32_t b)
+		                 { return rlc->v_RLC_pos[0][a] < rlc->v_RLC_pos[0][b]; });
+		{
+			std::vector<uint32_t> sortedX(cnt);
+			for (uint32_t i = 0; i < cnt; i++)
+				sortedX[i] = rlc->v_RLC_pos[0][order[i]];
+			BuildSlabEntryIndex(sortedX, m_rlcXStart);
+		}
+
 		// Pre-linearize indices: dir*N + x*sYZ + y*Nz + z
 		std::vector<uint32_t> linIdx(cnt);
 		for (uint32_t i = 0; i < cnt; i++)
 		{
-			uint32_t dir = rlc->v_RLC_dir[i];
-			uint32_t x   = rlc->v_RLC_pos[0][i];
-			uint32_t y   = rlc->v_RLC_pos[1][i];
-			uint32_t z   = rlc->v_RLC_pos[2][i];
+			const uint32_t e = order[i];
+			uint32_t dir = rlc->v_RLC_dir[e];
+			uint32_t x   = rlc->v_RLC_pos[0][e];
+			uint32_t y   = rlc->v_RLC_pos[1][e];
+			uint32_t z   = rlc->v_RLC_pos[2][e];
 			linIdx[i] = dir * N + x * sYZ + y * numLines[2] + z;
 		}
 
@@ -3177,8 +3217,11 @@ void Engine_Vulkan::SetupGPU_RLC()
 		// Coefficient buffers
 		auto uploadCoef = [&](GpuBuf& gb, FDTD_FLOAT* data_ptr)
 		{
+			std::vector<float> sorted(cnt);
+			for (uint32_t i = 0; i < cnt; i++)
+				sorted[i] = data_ptr[order[i]];
 			CreateGpuBuf(gb, fSize, usage, dLoc);
-			UploadGpuBuf(gb, data_ptr, fSize);
+			UploadGpuBuf(gb, sorted.data(), fSize);
 		};
 		uploadCoef(m_gpuRLC.i2v, rlc->v_RLC_i2v);
 		uploadCoef(m_gpuRLC.ilv, rlc->v_RLC_ilv);
@@ -4354,19 +4397,18 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	m_tbAnnounced = true;
 	m_tbActive    = false;
 	m_tbEdges.clear();
-	if (m_tbK == 0)
+	if (m_tbK == 0 && !m_tbAuto)
 		return;
 
 	// Refuse rather than risk: an extension without a slab path would be
 	// applied to the whole grid at a timestep only one tile has reached.  Name
 	// what refused, so adding a slab path later is an obvious next step rather
 	// than a mystery.
+	//
+	// GPU probes need nothing: the gather is recorded once at the end of each
+	// batch, after the last trapezoid, when the whole grid is at one timestep.
 	const char* refuse = nullptr;
 	if (m_hasCPUExtensions)                     refuse = "extensions are running on the CPU";
-	else if (m_hasGPU_Mur)                      refuse = "Mur ABC has no slab path yet";
-	else if (m_hasGPU_TFSF)                     refuse = "TF/SF has no slab path yet";
-	else if (m_hasGPU_RLC)                      refuse = "lumped RLC has no slab path yet";
-	else if (m_hasGPU_Probes)                   refuse = "GPU probes have no slab path yet";
 	else if (m_steadyPipeline != VK_NULL_HANDLE)
 		refuse = "steady-state detection integrates energy over the whole grid, "
 		         "which a blocked schedule never has at one timestep";
@@ -4376,38 +4418,70 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 		return;
 	}
 
+	// What a tile has to hold is everything the sweep streams per cell, not
+	// just the fields.  With an uncompressed operator a cell's coefficients
+	// (vv, vi, ii, iv: 48 B) are twice its fields (volt+curr: 24 B), and a tile
+	// sized from the fields alone is three times the target: 1.22x where 3.2x
+	// was available on a 5 M-cell grid (PERFORMANCE.md §5.8).  A compressed
+	// operator adds its per-cell index; its tables are shared by every cell,
+	// so they come off the target once rather than per plane.
 	const int      NX         = (int)numLines[0];
-	const uint64_t planeBytes = (uint64_t)numLines[1] * numLines[2] * 24; // volt+curr, 3 comp, fp32
-	const uint64_t totalBytes = planeBytes * (uint64_t)NX;
+	const uint64_t plane      = (uint64_t)numLines[1] * numLines[2];
+	const uint64_t cellBytes  = 24 + ((m_opIdxBits == 0) ? 48 : m_opIdxBits / 8);
+	const uint64_t tableBytes = (m_opIdxBits == 0) ? 0 : 4 * (uint64_t)m_coeffCompBufSize;
+	const uint64_t planeBytes = plane * cellBytes;
+	const uint64_t totalBytes = planeBytes * (uint64_t)NX + tableBytes;
+
+	// The default: discrete cards only.  Integrated GPUs gain from nothing to
+	// 1.4x, depending on whether they share a large CPU L3 and are bandwidth-
+	// rather than compute-bound (PERFORMANCE.md §5.5, §5.8): opt-in there.
+	VkPhysicalDeviceProperties props{};
+	vkGetPhysicalDeviceProperties(m_physDevice, &props);
+	if (m_tbAuto && props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+		return;
 
 	// Vulkan exposes no last-level-cache size, so the tile target is a
 	// tunable.  Integrated GPUs share the CPU's LLC and get a smaller default.
 	unsigned int targetMB = m_tbTargetMB;
 	if (targetMB == 0)
-	{
-		VkPhysicalDeviceProperties props{};
-		vkGetPhysicalDeviceProperties(m_physDevice, &props);
 		targetMB = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 16 : 64;
-	}
 	const uint64_t target = (uint64_t)targetMB << 20;
 
-	if (totalBytes <= target)
+	// A grid between the target and the card's real cache is resident
+	// already, and blocking it costs a few percent (PERFORMANCE.md §5.5).
+	// The cache size is not queryable, so by default the grid has to be twice
+	// the target -- beyond the 96-128 MB of the cards measured -- before
+	// blocking is worth its wedges.  Asked for explicitly, the target alone
+	// decides.
+	const uint64_t engageAbove = m_tbAuto ? 2 * target : target;
+	if (totalBytes <= engageAbove)
 	{
 		cout << "Engine_Vulkan: temporal blocking disabled — grid already fits the "
-		          << targetMB << " MB tile target (" << (totalBytes >> 20)
-		          << " MB of field state)" << endl;
+		          << (engageAbove >> 20) << " MB "
+		          << (m_tbAuto ? "default threshold" : "tile target") << " ("
+		          << (totalBytes >> 20) << " MB of fields and coefficients)" << endl;
 		return;
 	}
 
 	int W = (int)m_tbW;
 	if (W <= 0)
-		W = (int)std::max<uint64_t>(1, target / std::max<uint64_t>(1, planeBytes));
+	{
+		// Shared tables stay resident whichever tile runs, but never let them
+		// take more than half the target.
+		const uint64_t budget = target - std::min(tableBytes, target / 2);
+		W = (int)std::max<uint64_t>(1, budget / std::max<uint64_t>(1, planeBytes));
+	}
 	if (W > NX) W = NX;
 
 	// W >= 2k is a hard constraint of the geometry: a core narrows by one line
 	// per side per timestep, so a tile narrower than 2k inverts and the wedges
 	// that fill behind it start to overlap — which double-updates cells.
-	int k = (int)m_tbK;
+	//
+	// By default the block is as deep as the tile allows, up to 32.  Depth
+	// divides the DRAM traffic, and with fewer, wider wedges it also cuts the
+	// barriers per timestep: on the TL model k=W/2 beat k=16 at the same tile
+	// on both cards measured (PERFORMANCE.md §5.8).
+	int k = m_tbAuto ? std::max(2, std::min(32, W / 2)) : (int)m_tbK;
 	if (W < 2 * k)
 	{
 		const int kFit = W / 2;
@@ -4424,8 +4498,38 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 		k = kFit;
 	}
 
+	// A local absorbing sheet normal to x reads lines next to the one it
+	// writes, at the same timestep, so all of them have to sit in one slab.
+	// During a block of k steps a slab boundary only ever sweeps the lines
+	// [e-k, e+k] around an interior tile edge e, so an edge at least k lines
+	// clear of the sheet's footprint [lo,hi] keeps the sheet inside one core
+	// tile for the whole block.  Edges are pushed right past any footprint
+	// they would cut; that only widens tiles, so W >= 2k still holds.
+	std::vector<std::pair<int, int>> keepWhole;
+	for (const GpuLocalABCData& data : m_gpuLocalABC)
+		if (data.pc.ny == 0)
+		{
+			int lo, hi;
+			LocalABCFootprintX(data.pc, data.superAbsorption, lo, hi);
+			keepWhole.emplace_back(lo, hi);
+		}
+	const auto clearOfSheets = [&](int e)
+	{
+		for (bool moved = true; moved; )
+		{
+			moved = false;
+			for (const auto& f : keepWhole)
+				if (e >= f.first + 1 - k && e <= f.second + k)
+				{
+					e = f.second + k + 1;
+					moved = true;
+				}
+		}
+		return e;
+	};
+
 	m_tbEdges.push_back(0);
-	for (int x = W; x < NX; x += W)
+	for (int x = clearOfSheets(W); x < NX; x = clearOfSheets(x + W))
 		m_tbEdges.push_back(x);
 	m_tbEdges.push_back(NX);
 
@@ -4434,9 +4538,8 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	// last x-line after the line inward from it has already dropped out — fine
 	// for the Yee update, whose stencil wants the neighbour one timestep
 	// behind, and fatal for any boundary extension that reads one cell inward
-	// at the timestep it writes the edge.  Nothing here needs that yet; the
-	// fold is what will let Mur be blocked when it gets a slab path, and it
-	// costs one slightly wider tile.
+	// at the timestep it writes the edge, which is what Mur does
+	// (RecordMurSlabPhase()).  It costs one slightly wider tile.
 	if (m_tbEdges.size() >= 3)
 	{
 		const size_t last = m_tbEdges.size() - 1;
@@ -4455,10 +4558,11 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	m_tbW      = (unsigned int)W;
 	m_tbActive = true;
 
-	cout << "Engine_Vulkan: trapezoidal temporal blocking active — k=" << k
+	cout << "Engine_Vulkan: trapezoidal temporal blocking active"
+	          << (m_tbAuto ? " (default)" : "") << " — k=" << k
 	          << " W=" << W << " (" << (m_tbEdges.size() - 1) << " tiles, "
 	          << ((uint64_t)W * planeBytes >> 20) << " MB/tile, "
-	          << (totalBytes >> 20) << " MB of field state)" << endl;
+	          << (totalBytes >> 20) << " MB of fields and coefficients)" << endl;
 }
 
 void Engine_Vulkan::RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const
@@ -4544,6 +4648,187 @@ bool Engine_Vulkan::RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, in
 	return any;
 }
 
+bool Engine_Vulkan::RecordMurSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1, uint32_t ts) const
+{
+	if (m_gpuMur.empty() || x1 <= x0)
+		return false;
+
+	VkPipeline pipe = (phase == 0) ? m_murPreVoltPipeline
+	                : (phase == 1) ? m_murPostVoltPipeline
+	                               : m_murApplyVoltPipeline;
+	VkPipelineLayout layout = (phase == 2) ? m_murApplyPipeLayout : m_murUpdatePipeLayout;
+
+	bool any = false;
+	for (const auto& m : m_gpuMur)
+	{
+		if (ts < m.startTS)
+			continue;
+		MurPC pc = m.pc;
+		uint32_t threads = 0;
+		if (pc.ny == 0)
+		{
+			// Normal to x: the face writes its boundary line and reads the line
+			// next to it at the same timestep, so it belongs to the one slab
+			// that holds both (Engine_Ext_Mur_ABC::SlabTouches()).  The schedule
+			// guarantees that slab: the first tile never narrows below 3 lines
+			// at x=0, and the short-tail fold keeps the last tile >= k+3 lines
+			// so its sloping left side never passes x=NX-2.
+			const int lo = (int)std::min(pc.lineNr, pc.lineNrShift);
+			const int hi = (int)std::max(pc.lineNr, pc.lineNrShift);
+			if (lo < x0 || hi >= x1)
+				continue;
+			threads = m.totalCells;
+		}
+		else
+		{
+			// Normal to y or z: the read and the write share their x, so the
+			// face is clipped to the slab like any other x-range.
+			const uint32_t extX = (pc.ny == 1) ? pc.numLinesPP : pc.numLinesP;
+			const uint32_t lo = (uint32_t)x0;
+			const uint32_t hi = std::min((uint32_t)x1, extX);
+			if (hi <= lo)
+				continue;
+			pc.xLo = lo;
+			pc.xHi = hi;
+			threads = (hi - lo) * ((pc.ny == 1) ? pc.numLinesP : pc.numLinesPP);
+		}
+		const VkDescriptorSet desc = (phase == 0) ? m.preDesc : (phase == 1) ? m.postDesc : m.applyDesc;
+		if (!any)
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &desc, 0, nullptr);
+		vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &pc);
+		vkCmdDispatch(cmd, (threads + 255) / 256, 1, 1);
+		any = true;
+	}
+	return any;
+}
+
+bool Engine_Vulkan::RecordRLCSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const
+{
+	if (!m_hasGPU_RLC || x1 <= x0)
+		return false;
+	const uint32_t b = m_rlcXStart[x0], e = m_rlcXStart[x1];
+	if (e <= b)
+		return false;
+
+	RlcPC pc = {m_gpuRLC.count, b, e};
+	if (phase == 0)
+	{
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcPreVoltPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_rlcPrePipeLayout, 0, 1, &m_gpuRLC.preDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_rlcPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
+	}
+	else
+	{
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyVoltPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_rlcApplyPipeLayout, 0, 1, &m_gpuRLC.applyDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
+	}
+	vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
+	return true;
+}
+
+void Engine_Vulkan::LocalABCFootprintX(const LocalAbcPC& pc, bool superAbsorption, int& lo, int& hi)
+{
+	lo = (int)std::min(pc.voltBoundary, pc.voltShift);
+	hi = (int)std::max(pc.voltBoundary, pc.voltShift);
+	if (superAbsorption)
+	{
+		lo = std::min(lo, (int)std::min(pc.currBoundary, pc.currShift));
+		hi = std::max(hi, (int)std::max(pc.currBoundary, pc.currShift));
+	}
+}
+
+bool Engine_Vulkan::RecordLocalABCSlabPhase(VkCommandBuffer cmd, uint32_t phase, int x0, int x1) const
+{
+	if (!m_localAbcPipeline || m_gpuLocalABC.empty() || x1 <= x0)
+		return false;
+
+	VkMemoryBarrier between{};
+	between.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	// As in RecordLocalABCPhase(): apply phases in reverse order, one at a time.
+	const bool writesField = (phase == 2 || phase == 5);
+	bool any = false;
+	for (size_t s = 0; s < m_gpuLocalABC.size(); ++s)
+	{
+		const GpuLocalABCData& data = m_gpuLocalABC[writesField ? m_gpuLocalABC.size() - 1 - s : s];
+		if (phase >= 3 && !data.superAbsorption)
+			continue;
+		LocalAbcPC pc = data.pc;
+		pc.phase = phase;
+		const bool curr = phase >= 3;
+		const uint32_t height = curr ? pc.sizeP - 1 : pc.sizeP;
+		const uint32_t width  = curr ? pc.sizePP - 1 : pc.sizePP;
+		uint32_t threads = 0;
+		if (pc.ny == 0)
+		{
+			int lo, hi;
+			LocalABCFootprintX(pc, data.superAbsorption, lo, hi);
+			if (lo < x0 || hi >= x1)
+				continue;
+			threads = height * width;
+		}
+		else
+		{
+			// x is the j axis of a sheet normal to y, the i axis of one normal to z.
+			const uint32_t n  = (pc.ny == 1) ? width : height;
+			const int      lo = std::max(x0, (int)pc.startX);
+			const int      hi = std::min(x1, (int)(pc.startX + n));
+			if (hi <= lo)
+				continue;
+			pc.xLo = (uint32_t)x0;
+			pc.xHi = (uint32_t)x1;
+			threads = (uint32_t)(hi - lo) * ((pc.ny == 1) ? height : width);
+		}
+		if (threads == 0)
+			continue;
+		if (writesField && any)
+			CmdComputeBarrier(cmd, between);
+		if (!any)
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_localAbcPipeline);
+		const VkDescriptorSet desc = curr ? data.currDesc : data.voltDesc;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_localAbcPipeLayout, 0, 1, &desc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_localAbcPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(LocalAbcPC), &pc);
+		vkCmdDispatch(cmd, (threads + 255) / 256, 1, 1);
+		any = true;
+	}
+	return any;
+}
+
+bool Engine_Vulkan::RecordTFSFSlabPhase(VkCommandBuffer cmd, bool volt, int x0, int x1, uint32_t ts) const
+{
+	if (!m_hasGPU_TFSF || x1 <= x0)
+		return false;
+	const uint32_t count = volt ? m_gpuTFSF.voltCount : m_gpuTFSF.currCount;
+	if (count == 0)
+		return false;
+	const std::vector<uint32_t>& xStart = volt ? m_tfsfVoltXStart : m_tfsfCurrXStart;
+	const uint32_t b = xStart[x0], e = xStart[x1];
+	if (e <= b)
+		return false;
+	Excitation* exc = const_cast<Operator*>(Op)->GetExcitationSignal();
+	if (!exc)
+		return false;
+
+	const uint32_t sigLen = (uint32_t)exc->GetLength();
+	const int sigPeriod = (exc->GetSignalPeriod() > 0)
+	                    ? (int)(exc->GetSignalPeriod() / exc->GetTimestep()) : 0;
+	// The flat path injects the voltage at ts+1 and the current at ts.
+	TfsfPC pc = {count, (int32_t)(volt ? ts + 1 : ts), sigLen, sigPeriod, b, e};
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volt ? m_tfsfVoltPipeline : m_tfsfCurrPipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfPipeLayout, 0, 1,
+	                        volt ? &m_gpuTFSF.voltDesc : &m_gpuTFSF.currDesc, 0, nullptr);
+	vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &pc);
+	vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
+	return true;
+}
+
 void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, int dir,
                                     uint32_t t0, const GridPC& gridV, const GridPC& gridC,
                                     const FusedPC& fused, const VkMemoryBarrier& barrier,
@@ -4561,36 +4846,48 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 	if (A < 0)  A = 0;
 	if (B > NX) B = NX;
 
-	for (int t = 0; t < k; ++t)
+	// The interval [A,B) one step on, and the E range of that step.
+	const auto step = [NX, dir](int A_, int B_, int& An, int& Bn, int& eLo, int& eHi)
 	{
-		int An = (A <= 0)  ? 0  : A + dir;
-		int Bn = (B >= NX) ? NX : B - dir;
+		An = (A_ <= 0)  ? 0  : A_ + dir;
+		Bn = (B_ >= NX) ? NX : B_ - dir;
 		if (An < 0)  An = 0;
 		if (Bn > NX) Bn = NX;
-
-		int eLo, eHi;
 		if (dir > 0) { eLo = An;                     eHi = (Bn >= NX) ? NX : Bn + 1; }
 		else         { eLo = (An <= 0) ? 0 : An + 1; eHi = (Bn >= NX) ? NX : Bn; }
 		if (eHi > NX)  eHi = NX;
 		if (eHi < eLo) eHi = eLo;
+	};
+
+	bool preMerged = false;  // this step's Mur/RLC pre-voltage already ran with the last current update
+	for (int t = 0; t < k; ++t)
+	{
+		int An, Bn, eLo, eHi;
+		step(A, B, An, Bn, eLo, eHi);
 
 		const uint32_t ts = t0 + (uint32_t)t;
 
-		// --- Pre-voltage: UPML (unfused), then dispersive ADE ---
+		// --- Pre-voltage: UPML (unfused), then dispersive ADE, Mur, lumped RLC ---
 		// Ordered exactly as the flat path has it: the pre passes run before
 		// the update, the apply passes after it and before the excitation.
 		// UPML goes first and alone, because it swaps field and flux in cells
-		// the dispersive pass may read.
+		// the others may read; the other three write disjoint state, so they
+		// share one barrier, as they do in the flat path.
 		const bool unfusedUPML = !m_hasFusedUPML && !m_gpuUPML.empty();
 		if (unfusedUPML && eHi > eLo)
 		{
 			RecordUPMLSlabPhase(cmd, 0, eLo, eHi);
 			CmdComputeBarrier(cmd, barrier);
 		}
-		if (RecordDispersiveSlabPhase(cmd, 0, eLo, eHi))
+		bool preVolt = RecordDispersiveSlabPhase(cmd, 0, eLo, eHi);
+		if (!preMerged)
 		{
-				CmdComputeBarrier(cmd, barrier);
+			preVolt = RecordMurSlabPhase(cmd, 0, eLo, eHi, ts) || preVolt;
+			preVolt = RecordRLCSlabPhase(cmd, 0, eLo, eHi) || preVolt;
+			preVolt = RecordLocalABCSlabPhase(cmd, 0, eLo, eHi) || preVolt;
 		}
+		if (preVolt)
+			CmdComputeBarrier(cmd, barrier);
 
 		// --- Voltage update on [eLo, eHi) ---
 		// With UPML fused into the main kernel this is one dispatch: PML
@@ -4634,11 +4931,33 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			}
 		}
 
+		// --- Post-voltage: Mur, TF/SF, local absorbing sheets ---
+		// The flat path runs the sheets after the TF/SF injection, so with a
+		// TF/SF box they get their own group.
+		bool postVolt = RecordMurSlabPhase(cmd, 1, eLo, eHi, ts);
+		postVolt = RecordTFSFSlabPhase(cmd, true, eLo, eHi, ts) || postVolt;
+		if (!m_hasGPU_TFSF)
+			postVolt = RecordLocalABCSlabPhase(cmd, 1, eLo, eHi) || postVolt;
+		if (postVolt)
+			CmdComputeBarrier(cmd, barrier);
+		if (m_hasGPU_TFSF && RecordLocalABCSlabPhase(cmd, 1, eLo, eHi))
+			CmdComputeBarrier(cmd, barrier);
+
 		// --- Dispersive apply-voltage ---
 		if (RecordDispersiveSlabPhase(cmd, 1, eLo, eHi))
 		{
 				CmdComputeBarrier(cmd, barrier);
 		}
+
+		// --- Mur, then lumped RLC apply ---
+		// A lumped port puts its resistor and its excitation on the same
+		// edges, so the excitation below must see the RLC result.
+		if (RecordMurSlabPhase(cmd, 2, eLo, eHi, ts))
+			CmdComputeBarrier(cmd, barrier);
+		if (RecordRLCSlabPhase(cmd, 1, eLo, eHi))
+			CmdComputeBarrier(cmd, barrier);
+		if (RecordLocalABCSlabPhase(cmd, 2, eLo, eHi))
+			CmdComputeBarrier(cmd, barrier);
 
 		// --- Voltage excitation, restricted to the same x-range ---
 		if (hasExcVolt && eHi > eLo)
@@ -4678,13 +4997,35 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			RecordUPMLSlabPhase(cmd, 2, An, hExc);
 			CmdComputeBarrier(cmd, barrier);
 		}
-		if (RecordDispersiveSlabPhase(cmd, 2, An, hExc))
+		bool preCurr = RecordDispersiveSlabPhase(cmd, 2, An, hExc);
+		preCurr = RecordLocalABCSlabPhase(cmd, 3, An, hExc) || preCurr;
+		if (preCurr)
+			CmdComputeBarrier(cmd, barrier);
+
+		// --- Next step's Mur and RLC pre-voltage, alongside this current update ---
+		// Both only read voltages, which are final for step t+1 once this
+		// step's voltage half is done, and write state the current half never
+		// touches.  So they share the current update's barrier instead of
+		// paying for one of their own at the top of the next step -- on the
+		// RX 7900 XTX a barrier costs ~1.8 us, and the blocked schedule records
+		// one per slab per phase.  Not with unfused UPML, whose pre pass has to
+		// run between the field and them.
+		bool nextPre = false;
+		preMerged = false;
+		if (!unfusedUPML && t + 1 < k)
 		{
-				CmdComputeBarrier(cmd, barrier);
+			int An2, Bn2, eLo2, eHi2;
+			step(An, Bn, An2, Bn2, eLo2, eHi2);
+			nextPre = RecordMurSlabPhase(cmd, 0, eLo2, eHi2, ts + 1);
+			nextPre = RecordRLCSlabPhase(cmd, 0, eLo2, eHi2) || nextPre;
+			nextPre = RecordLocalABCSlabPhase(cmd, 0, eLo2, eHi2) || nextPre;
+			preMerged = true;
 		}
 
 		if (m_hasFusedUPML)
 		{
+			if (nextPre && hExc <= An)
+				CmdComputeBarrier(cmd, barrier);
 			if (hExc > An)
 			{
 				FusedPC pf = fused;
@@ -4701,6 +5042,8 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		}
 		else
 		{
+			if (nextPre && hHi <= An)
+				CmdComputeBarrier(cmd, barrier);
 			if (hHi > An)
 			{
 				GridPC pc = gridC;
@@ -4721,11 +5064,21 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			}
 		}
 
+		// --- TF/SF current injection ---
+		// Over the same range as the excitation below, for the same reason:
+		// the flat path applies every entry, including any on the last x-line.
+		if (RecordTFSFSlabPhase(cmd, false, An, hExc, ts))
+			CmdComputeBarrier(cmd, barrier);
+		if (RecordLocalABCSlabPhase(cmd, 4, An, hExc))
+			CmdComputeBarrier(cmd, barrier);
+
 		// --- Dispersive apply-current ---
 		if (RecordDispersiveSlabPhase(cmd, 3, An, hExc))
 		{
 				CmdComputeBarrier(cmd, barrier);
 		}
+		if (RecordLocalABCSlabPhase(cmd, 5, An, hExc))
+			CmdComputeBarrier(cmd, barrier);
 
 		// --- Current excitation ---
 		// The H sweep stops at NX-1, but the flat path's Apply2Current runs over

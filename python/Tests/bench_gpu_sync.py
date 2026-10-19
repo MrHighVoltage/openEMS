@@ -20,8 +20,8 @@ A VARIANT is MODE[/subN][/cmaxN]:
     tbK, tbKwW  OPENEMS_GPU_TEMPORAL_BLOCK=K or K:W: trapezoidal temporal
                 blocking of depth K, tile width W x-lines (default: from the
                 tile target)
-    tbmbN       OPENEMS_GPU_TEMPORAL_BLOCK_MB=N: tile target in MB (default 64
-                on a discrete card)
+    tbmbN       OPENEMS_GPU_TEMPORAL_BLOCK_MB=N: tile target in MB of fields
+                and coefficients (default 64 on a discrete card)
 
 Variants run one at a time, round-robin over --repeat rounds. --gpu pins the
 run to one card through Mesa's device-select layer (DRI_PRIME), which is the

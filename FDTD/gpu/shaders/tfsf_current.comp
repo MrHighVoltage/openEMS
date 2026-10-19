@@ -20,6 +20,11 @@ layout(push_constant) uniform PC {
     int  numTS;
     uint sigLen;
     int  sigPeriod;
+    // Temporal blocking: this dispatch owns points [entryBase, entryEnd).  The
+    // points are sorted by (x, field index) on the host, so an x-slab is a
+    // contiguous run and never splits the run of points sharing one field
+    // element.  The flat sweep passes (0, 0xFFFFFFFF).
+    uint entryBase, entryEnd;
 };
 
 int lookupDelay(int ts, uint d)
@@ -34,15 +39,15 @@ int lookupDelay(int ts, uint d)
 
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= count) return;
+    uint gid = gl_GlobalInvocationID.x + entryBase;
+    if (gid >= count || gid >= entryEnd) return;
 
     // Injection points on the TF/SF box's edges belong to two faces, so several
     // entries target the same field element -- 132 of 1452 voltage entries on a
     // 20^3 box. A plain `field[linIdx[gid]] +=` from each of them is a
     // read-modify-write race: contributions are silently dropped and the run is
-    // not even reproducible against itself. The host sorts the entries by field
-    // index (stably, so entries sharing one keep their original relative
+    // not even reproducible against itself. The host sorts the entries by x and
+    // then field index (stably, so entries sharing one keep their original relative
     // order), and the thread that owns the start of each run applies the whole
     // run itself.
     uint idx = linIdx[gid];

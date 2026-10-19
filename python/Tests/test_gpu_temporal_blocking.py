@@ -101,8 +101,9 @@ def _run(tag, boundary, block_env, extra_env=None, extra_setup=""):
     """Run one small GPU simulation in a subprocess.
 
     Returns (output, E_time_series, H_time_series). `block_env` is the value
-    of OPENEMS_GPU_TEMPORAL_BLOCK for this run, or None for the flat sweep;
-    the two runs being compared must differ in *only* that.
+    of OPENEMS_GPU_TEMPORAL_BLOCK for this run, or None for the flat sweep
+    (blocking explicitly off: it is on by default for large grids); the two
+    runs being compared must differ in *only* that.
     """
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     sim_path = os.path.join(tempfile.gettempdir(), "gputblk_%s" % tag)
@@ -124,6 +125,8 @@ def _run(tag, boundary, block_env, extra_env=None, extra_setup=""):
     if block_env:
         env["OPENEMS_GPU_TEMPORAL_BLOCK"] = block_env
         env["OPENEMS_GPU_TEMPORAL_BLOCK_MB"] = "1"
+    else:
+        env["OPENEMS_GPU_TEMPORAL_BLOCK"] = "0"
     env.update(extra_env or {})
 
     proc = subprocess.run([sys.executable, script_path], cwd=repo_root, env=env,
@@ -298,13 +301,59 @@ class GPUTemporalBlockingTest(unittest.TestCase):
             mat.AddBox([xl[%d], yl[10], zl[10]], [xl[%d], yl[22], zl[22]], priority=5)
             """ % (OBJ_X_LO, OBJ_X_HI))
 
-    def test_refuses_unsupported_extension_and_stays_correct(self):
-        """Mur has no slab path yet: blocking must decline, not silently differ."""
-        flat_out, flat_E, flat_H = _run("mur_flat", ["MUR"] * 6, None)
-        out, E, H = _run("mur_blocked", ["MUR"] * 6, BLOCK_ENV)
-        self.assertNotIn(ACTIVE_MARK, out,
-                         "blocking engaged with Mur active, which has no slab path")
-        self.assertIn("temporal blocking disabled", out, _relevant_lines(out))
+    def test_mur(self):
+        """Mur on all six faces.
+
+        A face normal to x writes its boundary line and reads the next one at
+        the same timestep, so it runs only in the slab that holds both; the
+        y- and z-normal faces are clipped to every slab.
+        """
+        self._compare("mur", ["MUR"] * 6, "")
+
+    def test_mur_with_pml(self):
+        """Mur on the x faces, UPML on the others: the Mur faces reach into
+        the PML regions, where the order of the two extensions matters."""
+        self._compare("mur_pml", ["MUR", "MUR", "PML_8", "PML_8", "PML_8", "PML_8"], "")
+
+    def test_lumped_rlc_and_port(self):
+        """A series RLC straddling a tile boundary, and a resistor on the
+        excitation's own edges (a lumped port), so the RLC result and the
+        excitation are applied to the same cells."""
+        self._compare("rlc", ["MUR"] * 6, """
+            rlc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, C=2e-12, LEtype=1)
+            rlc.AddBox([xl[%d], yl[14], zl[10]], [xl[%d], yl[18], zl[14]], priority=10)
+            port = CSX.AddLumpedElement("port_R", ny="z", caps=False, R=50.0)
+            port.AddBox([xl[%d], yl[10], zl[10]], [xl[%d] + 1, yl[22], zl[22]], priority=10)
+            """ % (OBJ_X_LO, OBJ_X_HI, EXC_X, EXC_X))
+
+    def test_tfsf(self):
+        """A TF/SF plane-wave box straddling a tile boundary: its x-normal
+        faces land in different tiles, its other faces are cut by every one."""
+        self._compare("tfsf", ["MUR"] * 6, """
+            pw = CSX.AddExcitation("planewave", exc_type=10, exc_val=[0, 0, 1])
+            pw.SetPropagationDir([1, 0, 0])
+            pw.AddBox([xl[%d], yl[6], zl[6]], [xl[%d], yl[26], zl[26]])
+            """ % (OBJ_X_LO, OBJ_X_HI))
+
+    def test_local_absorbing_sheet(self):
+        """A local absorbing sheet normal to z, cut by every tile edge."""
+        self._compare("abs", ["PEC"] * 6, """
+            from CSXCAD.CSProperties import ABCtype
+            ab = CSX.AddAbsorbingBC("abs1", NormalSignPositive=False,
+                                    AbsorbingBoundaryType=ABCtype.MUR_1ST)
+            ab.AddBox([xl[2], yl[2], zl[26]], [xl[-3], yl[-3], zl[26]], priority=20)
+            """)
+
+    def test_refuses_steady_state_detection_and_stays_correct(self):
+        """A periodic excitation switches on steady-state detection, which
+        needs the energy of the whole grid at one timestep -- something a
+        blocked schedule never has. Blocking must decline, not silently
+        differ."""
+        setup = "FDTD.SetSinusExcite(5e9)"
+        flat_out, flat_E, flat_H = _run("ssd_flat", ["PEC"] * 6, None, extra_setup=setup)
+        out, E, H = _run("ssd_blocked", ["PEC"] * 6, BLOCK_ENV, extra_setup=setup)
+        self.assertNotIn(ACTIVE_MARK, out, "blocking engaged with steady-state detection on")
+        self.assertIn("steady-state detection", out, _relevant_lines(out))
         self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
                         "the fallback path changed results")
 

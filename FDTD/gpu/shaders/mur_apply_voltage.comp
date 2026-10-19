@@ -20,7 +20,8 @@ layout(push_constant) uniform PC {
     uint lineNrShift;   // unused but keeps PC consistent
     uint numLinesP;
     uint numLinesPP;
-    uint edgeSkip;           // edges an earlier face owns
+    uint xLo, xHi;           // x-slab clip for faces normal to y or z
+    uint edgeSkip;           // edges an earlier face owns (apply only)
 };
 
 uint gridIdx(uint ny_dir, uint lineVal, uint i, uint j)
@@ -36,14 +37,45 @@ uint gridIdx(uint ny_dir, uint lineVal, uint i, uint j)
 uint compP(uint ny_dir)  { return (ny_dir + 1u) % 3u; }
 uint compPP(uint ny_dir) { return (ny_dir + 2u) % 3u; }
 
+// Temporal blocking: a dispatch may cover only the face cells whose x lies in
+// [xLo, xHi).  x is the face's j axis when the face is normal to y, and its i
+// axis when normal to z.  A face normal to x is never clipped -- it runs whole
+// or not at all.  The flat sweep passes (0, 0xFFFFFFFF), which gives the
+// plain row-major (i, j) walk over the whole face.
+bool faceCell(uint t, out uint i, out uint j)
+{
+    i = 0u; j = 0u;
+    if (ny == 1u)
+    {
+        uint hi = min(xHi, numLinesPP);
+        if (hi <= xLo) return false;
+        uint w = hi - xLo;
+        if (t >= numLinesP * w) return false;
+        i = t / w;
+        j = xLo + t % w;
+    }
+    else if (ny == 2u)
+    {
+        uint hi = min(xHi, numLinesP);
+        if (hi <= xLo) return false;
+        if (t >= (hi - xLo) * numLinesPP) return false;
+        i = xLo + t / numLinesPP;
+        j = t % numLinesPP;
+    }
+    else
+    {
+        if (t >= numLinesP * numLinesPP) return false;
+        i = t / numLinesPP;
+        j = t % numLinesPP;
+    }
+    return true;
+}
+
 void main()
 {
-    uint gid = gl_GlobalInvocationID.x;
-    uint totalCells = numLinesP * numLinesPP;
-    if (gid >= totalCells) return;
-
-    uint i = gid / numLinesPP;
-    uint j = gid % numLinesPP;
+    uint i, j;
+    if (!faceCell(gl_GlobalInvocationID.x, i, j)) return;
+    uint gid = i * numLinesPP + j;
     uint N = Nx * Ny * Nz;
 
     uint nP  = compP(ny);

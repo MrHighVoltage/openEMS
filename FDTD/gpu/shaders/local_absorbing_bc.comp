@@ -13,7 +13,21 @@ layout(push_constant) uniform PC {
     uint startX, startY, startZ;
     uint voltBoundary, voltShift, currBoundary, currShift;
     uint sizeP, sizePP, countVolt, countCurr, phase;
+    // Temporal blocking: only the cells whose global x lies in [xLo, xHi).
+    // x is the sheet's j axis when it is normal to y, its i axis when normal
+    // to z; a sheet normal to x is never clipped (it runs whole or not at
+    // all).  The flat sweep passes (0, 0xFFFFFFFF): the whole sheet.
+    uint xLo, xHi;
 };
+
+// [lo, hi) of a sheet axis that starts at global x = start and has n cells,
+// clipped to the slab.
+uvec2 clipToSlab(uint start, uint n)
+{
+    uint lo = (xLo > start) ? min(xLo - start, n) : 0u;
+    uint hi = (xHi > start) ? min(xHi - start, n) : 0u;
+    return uvec2(lo, max(lo, hi));
+}
 
 uint fieldIndex(uint component, uint normal, uint i, uint j)
 {
@@ -28,12 +42,16 @@ void main()
 {
     bool currentPhase = phase >= 3u;
     uint count = currentPhase ? countCurr : countVolt;
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= count) return;
-
-    uint width = currentPhase ? sizePP - 1u : sizePP;
-    uint i = gid / width;
-    uint j = gid % width;
+    uint width  = currentPhase ? sizePP - 1u : sizePP;
+    uint height = currentPhase ? sizeP - 1u : sizeP;
+    uvec2 iRange = (ny == 2u) ? clipToSlab(startX, height) : uvec2(0u, height);
+    uvec2 jRange = (ny == 1u) ? clipToSlab(startX, width)  : uvec2(0u, width);
+    uint w = jRange.y - jRange.x;
+    uint t = gl_GlobalInvocationID.x;
+    if (w == 0u || t >= (iRange.y - iRange.x) * w) return;
+    uint i = iRange.x + t / w;
+    uint j = jRange.x + t % w;
+    uint gid = i * width + j;
     uint coeffIndex = i * sizePP + j;
     uint boundary = currentPhase ? currBoundary : voltBoundary;
     uint shifted = currentPhase ? currShift : voltShift;
