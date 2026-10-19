@@ -1,0 +1,204 @@
+/*
+ * FDTD E-field (voltage) update with the Mur ABC's post and apply phases
+ * folded in -- update_voltages.comp plus the faces.
+ *
+ * The flat Mur ABC needs three phases around the Yee update: pre (save
+ * V(shift) - c*V(pos) before it), post (add c*V(shift) after it) and apply
+ * (write the sum into V(pos)).  Post and apply are tiny dispatches, each
+ * behind a barrier, and on the blocked schedule they repeat in every slab
+ * step.  Here the thread that updates a shift cell already holds the new
+ * V(shift), so it finishes the boundary value itself:
+ *
+ *   V(pos, comp) = mur(comp) + c(comp) * Vnew(shift, comp)
+ *
+ * for the face's two tangential components.  The pos cell's own thread skips
+ * exactly those components, so every element has one writer.  No other
+ * thread reads V in this kernel, so nothing sees the boundary early.  The
+ * result is the flat order -- every post reads the pure Yee value, then
+ * every apply writes -- as long as nothing runs between post and apply on a
+ * boundary cell; the host only enables this kernel when no UPML, dispersive
+ * material, TF/SF box or absorbing sheet exists.
+ *
+ * Where faces meet, the face earlier in the extension list owns the shared
+ * component (edgeSkip, as in mur_apply_voltage.comp).
+ *
+ * One cell can be a boundary cell of one face and a shift cell of another
+ * (x=0, y=1 for the x-min and y-min faces).  The first face's shift thread
+ * writes the shared component there while the cell's own thread may still be
+ * reading its old value to finish the second face.  So the Mur value is
+ * computed from V(shift) as the pre phase saved it, with the same fma as the
+ * Yee update -- the same bits, and no read of anything this kernel writes.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf   { float volt[];    };
+layout(set=0, binding=1) buffer CurrBuf   { float curr[];    };
+layout(set=0, binding=2) buffer OpIdxBuf  { uint  opIdx[];   };
+layout(set=0, binding=3) buffer VVBuf     { float vv_comp[]; };
+layout(set=0, binding=4) buffer VIBuf     { float vi_comp[]; };
+// Mur faces: all faces' state and coefficients, concatenated (faceOff), and
+// 8 words of metadata per face: ny, lineNr, lineNrShift, numLinesP,
+// numLinesPP, edgeSkip, faceOff, unused.
+layout(set=0, binding=5) readonly buffer MurNyPBuf    { float murP[];    };
+layout(set=0, binding=6) readonly buffer MurNyPPBuf   { float murPP[];   };
+layout(set=0, binding=7) readonly buffer CoeffNyPBuf  { float coeffP[];  };
+layout(set=0, binding=8) readonly buffer CoeffNyPPBuf { float coeffPP[]; };
+layout(set=0, binding=9) readonly buffer MurFaceBuf   { uint  face[];    };
+// V(shift) before this update, saved by mur_pre_voltage.comp.  See below.
+layout(set=0, binding=10) readonly buffer VoldNyPBuf  { float voldP[];   };
+layout(set=0, binding=11) readonly buffer VoldNyPPBuf { float voldPP[];  };
+
+layout(push_constant) uniform PC {
+    uint Nx, Ny, Nz, numComp;
+    // Temporal-blocking slab: this dispatch owns linear cell indices
+    // [gidBase, gidEnd).  The flat sweep passes (0, Nx*Ny*Nz), which is
+    // exactly the whole grid, so the flat path is unchanged.
+    uint gidBase, gidEnd;
+};
+
+// --- Compressed-operator index width -------------------------------------
+// opIdx is one index per cell into the compressed coefficient tables, read
+// once per cell per kernel -- on large grids it is ~10% of all memory traffic
+// (measured). The needed width is known at operator setup, so it is a
+// specialization constant: the driver folds this to a single path at pipeline
+// creation, leaving no runtime branch. The buffer stays declared `uint` and
+// narrow values are unpacked by hand, so no 8/16-bit storage feature is
+// required. Packing is little-endian within each dword: cell c occupies bits
+// [(c%k)*bits, +bits) of word c/k, matching the host-side packer.
+layout(constant_id = 0) const uint OPIDX_BITS = 32;
+// Number of Mur faces (1..6), so the face loop unrolls.
+layout(constant_id = 1) const uint MUR_FACES = 6;
+
+uint fetchOpIdx(uint cell)
+{
+    // 0 = no deduplication: the tables hold one entry per cell and no index
+    // buffer is uploaded, so the cell number indexes them directly.
+    if (OPIDX_BITS == 0u)
+        return cell;
+    if (OPIDX_BITS == 8u)
+        return bitfieldExtract(opIdx[cell >> 2], int((cell & 3u) << 3), 8);
+    if (OPIDX_BITS == 16u)
+        return bitfieldExtract(opIdx[cell >> 1], int((cell & 1u) << 4), 16);
+    return opIdx[cell];
+}
+
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x + gidBase;
+    uint N = Nx * Ny * Nz;
+    if (gid >= gidEnd) return;
+
+    // Decompose linear index → (x, y, z).  z changes fastest for coalescing.
+    uint z = gid % Nz;
+    uint y = (gid / Nz) % Ny;
+    uint x = gid / (Ny * Nz);
+
+    // Shifted indices: clamp to 0 at boundaries
+    uint xm = max(x, 1u) - 1u;
+    uint ym = max(y, 1u) - 1u;
+    uint zm = max(z, 1u) - 1u;
+
+    uint sYZ = Ny * Nz;
+
+    // Per-cell compressed coefficient index (same for all 3 components)
+    uint oi = fetchOpIdx(gid);
+
+    // Fetch compressed coefficients for all 3 components
+    float vv0 = vv_comp[oi];
+    float vi0 = vi_comp[oi];
+    float vv1 = vv_comp[numComp + oi];
+    float vi1 = vi_comp[numComp + oi];
+    float vv2 = vv_comp[2u * numComp + oi];
+    float vi2 = vi_comp[2u * numComp + oi];
+
+    uint base = x * sYZ;
+    uint here = base + y * Nz + z;
+
+    // H at "here": each of the three components feeds two of the three curls
+    // below.  Load each once -- see the header note on load reuse.
+    float cx = curr[       here];
+    float cy = curr[   N + here];
+    float cz = curr[2u*N + here];
+
+    // All three curls are formed before the first store: a store to volt[]
+    // would otherwise force a reload of curr[] on any compiler that cannot
+    // prove the two storage buffers do not alias.
+    // curl_x = curr_z(x,y,z) - curr_z(x,ym,z) - curr_y(x,y,z) + curr_y(x,y,zm)
+    float curl0 = cz - curr[2u*N + base + ym*Nz + z ]
+                - cy + curr[   N + base + y*Nz  + zm];
+    // curl_y = curr_x(x,y,z) - curr_x(x,y,zm) - curr_z(x,y,z) + curr_z(xm,y,z)
+    float curl1 = cx - curr[          base + y*Nz + zm]
+                - cz + curr[2u*N + xm*sYZ + y*Nz + z ];
+    // curl_z = curr_y(x,y,z) - curr_y(xm,y,z) - curr_x(x,y,z) + curr_x(x,ym,z)
+    float curl2 = cy - curr[   N + xm*sYZ + y*Nz + z ]
+                - cx + curr[        base + ym*Nz + z];
+
+    uint idx0 = here;
+    uint idx1 = N + here;
+    uint idx2 = 2u*N + here;
+    float vn0 = fma(vv0, volt[idx0], vi0 * curl0);
+    float vn1 = fma(vv1, volt[idx1], vi1 * curl1);
+    float vn2 = fma(vv2, volt[idx2], vi2 * curl2);
+
+    // No local arrays below: indexing one with a run-time component number
+    // sends it to scratch memory on AMD, which cost this kernel 5 %.  Selects
+    // stay in registers.
+    bool own0 = true, own1 = true, own2 = true;
+    // Only cells within one line of the domain edge can be on a face.
+    if (x <= 1u || x + 2u >= Nx || y <= 1u || y + 2u >= Ny || z <= 1u || z + 2u >= Nz)
+    {
+        for (uint f = 0u; f < MUR_FACES; ++f)
+        {
+            uint fny   = face[8u * f];
+            uint line  = face[8u * f + 1u];
+            uint shift = face[8u * f + 2u];
+            uint p = (fny == 0u) ? x : ((fny == 1u) ? y : z);
+            // On the boundary line: the face's shift thread writes the two
+            // tangential components (all but fny).
+            if (p == line)
+            {
+                own0 = own0 && fny == 0u;
+                own1 = own1 && fny == 1u;
+                own2 = own2 && fny == 2u;
+            }
+            // On the shift line: finish the boundary value next door.
+            if (p == shift)
+            {
+                uint nLP  = face[8u * f + 3u];
+                uint nLPP = face[8u * f + 4u];
+                uint skip = face[8u * f + 5u];
+                uint off  = face[8u * f + 6u];
+                uint nP  = (fny == 2u) ? 0u : fny + 1u;
+                uint nPP = (fny == 0u) ? 2u : fny - 1u;
+                uint i = (nP == 0u) ? x : ((nP == 1u) ? y : z);
+                uint j = (nPP == 0u) ? x : ((nPP == 1u) ? y : z);
+                uint fi = off + i * nLPP + j;
+                uint st = (fny == 0u) ? sYZ : ((fny == 1u) ? Nz : 1u);
+                uint posCell = (line > shift) ? here + st : here - st;
+                bool skipPP = ((skip & 1u) != 0u && i == 0u) || ((skip & 2u) != 0u && i == nLP - 1u);
+                bool skipP  = ((skip & 4u) != 0u && j == 0u) || ((skip & 8u) != 0u && j == nLPP - 1u);
+                if (!skipP)
+                {
+                    float vvc = (nP == 0u) ? vv0 : ((nP == 1u) ? vv1 : vv2);
+                    float vic = (nP == 0u) ? vi0 : ((nP == 1u) ? vi1 : vi2);
+                    float cc  = (nP == 0u) ? curl0 : ((nP == 1u) ? curl1 : curl2);
+                    volt[nP * N + posCell] = murP[fi] + coeffP[fi] * fma(vvc, voldP[fi], vic * cc);
+                }
+                if (!skipPP)
+                {
+                    float vvc = (nPP == 0u) ? vv0 : ((nPP == 1u) ? vv1 : vv2);
+                    float vic = (nPP == 0u) ? vi0 : ((nPP == 1u) ? vi1 : vi2);
+                    float cc  = (nPP == 0u) ? curl0 : ((nPP == 1u) ? curl1 : curl2);
+                    volt[nPP * N + posCell] = murPP[fi] + coeffPP[fi] * fma(vvc, voldPP[fi], vic * cc);
+                }
+            }
+        }
+    }
+
+    if (own0) volt[idx0] = vn0;
+    if (own1) volt[idx1] = vn1;
+    if (own2) volt[idx2] = vn2;
+}

@@ -22,6 +22,7 @@ layout(push_constant) uniform PC {
     uint numLinesPP;
     uint xLo, xHi;           // x-slab clip for faces normal to y or z
     uint edgeSkip;           // edges an earlier face owns (apply only)
+    uint faceOff;            // this face's first element in the concatenated buffers
 };
 
 uint gridIdx(uint ny_dir, uint lineVal, uint i, uint j)
@@ -92,7 +93,7 @@ void main()
     bool skipPP = ((edgeSkip & 1u) != 0u && i == 0u) || ((edgeSkip & 2u) != 0u && i == numLinesP - 1u);
     bool skipP  = ((edgeSkip & 4u) != 0u && j == 0u) || ((edgeSkip & 8u) != 0u && j == numLinesPP - 1u);
     if (!skipP)
-        volt[nP  * N + gPos] = mur_nyP[gid];
+        volt[nP  * N + gPos] = mur_nyP[faceOff + gid];
     if (!skipPP)
-        volt[nPP * N + gPos] = mur_nyPP[gid];
+        volt[nPP * N + gPos] = mur_nyPP[faceOff + gid];
 }

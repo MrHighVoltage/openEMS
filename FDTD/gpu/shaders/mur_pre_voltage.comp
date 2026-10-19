@@ -19,6 +19,9 @@ layout(set=0, binding=1) buffer MurNyPBuf   { float mur_nyP[];   };   // [numLin
 layout(set=0, binding=2) buffer MurNyPPBuf  { float mur_nyPP[];  };   // [numLinesP * numLinesPP]
 layout(set=0, binding=3) buffer CoeffNyPBuf { float coeff_nyP[]; };   // [numLinesP * numLinesPP]
 layout(set=0, binding=4) buffer CoeffNyPPBuf{ float coeff_nyPP[];};   // [numLinesP * numLinesPP]
+// V(shift) as read here, for update_voltages_mur.comp (all faces concatenated, like the rest)
+layout(set=0, binding=5) buffer VoldNyPBuf  { float vold_nyP[];  };
+layout(set=0, binding=6) buffer VoldNyPPBuf { float vold_nyPP[]; };
 
 layout(push_constant) uniform PC {
     uint Nx, Ny, Nz;         // global grid
@@ -29,6 +32,7 @@ layout(push_constant) uniform PC {
     uint numLinesPP;         // face dimension along nyPP
     uint xLo, xHi;           // x-slab clip for faces normal to y or z
     uint edgeSkip;           // edges an earlier face owns (apply only)
+    uint faceOff;            // this face's first element in the concatenated buffers
 };
 
 // Compute the flat grid index for a position given normal direction
@@ -97,11 +101,16 @@ void main()
     // pos_shift: neighbor face
     uint gShift   = gridIdx(ny, lineNrShift, i, j);
 
-    float c_nyP  = coeff_nyP[gid];
-    float c_nyPP = coeff_nyPP[gid];
+    uint fi = faceOff + gid;
+    float c_nyP  = coeff_nyP[fi];
+    float c_nyPP = coeff_nyPP[fi];
+    float sP  = volt[nP  * N + gShift];
+    float sPP = volt[nPP * N + gShift];
 
     // V(nyP, pos_shift) - coeff * V(nyP, pos)
-    mur_nyP[gid]  = volt[nP  * N + gShift] - c_nyP  * volt[nP  * N + gPos];
+    mur_nyP[fi]  = sP  - c_nyP  * volt[nP  * N + gPos];
     // V(nyPP, pos_shift) - coeff * V(nyPP, pos)
-    mur_nyPP[gid] = volt[nPP * N + gShift] - c_nyPP * volt[nPP * N + gPos];
+    mur_nyPP[fi] = sPP - c_nyPP * volt[nPP * N + gPos];
+    vold_nyP[fi]  = sP;
+    vold_nyPP[fi] = sPP;
 }

@@ -24,6 +24,7 @@ layout(push_constant) uniform PC {
     uint numLinesPP;
     uint xLo, xHi;           // x-slab clip for faces normal to y or z
     uint edgeSkip;           // edges an earlier face owns (apply only)
+    uint faceOff;            // this face's first element in the concatenated buffers
 };
 
 uint gridIdx(uint ny_dir, uint lineVal, uint i, uint j)
@@ -85,6 +86,7 @@ void main()
 
     uint gShift = gridIdx(ny, lineNrShift, i, j);
 
-    mur_nyP[gid]  += coeff_nyP[gid]  * volt[nP  * N + gShift];
-    mur_nyPP[gid] += coeff_nyPP[gid] * volt[nPP * N + gShift];
+    uint fi = faceOff + gid;
+    mur_nyP[fi]  += coeff_nyP[fi]  * volt[nP  * N + gShift];
+    mur_nyPP[fi] += coeff_nyPP[fi] * volt[nPP * N + gShift];
 }

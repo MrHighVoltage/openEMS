@@ -97,7 +97,7 @@ if (WITH_GPU)
 		dispersive_pre_voltage dispersive_pre_current
 		dispersive_apply_voltage dispersive_apply_current
 		tfsf_voltage tfsf_current
-		mur_pre_voltage mur_post_voltage mur_apply_voltage
+		mur_pre_voltage mur_post_voltage mur_apply_voltage update_voltages_mur
 		rlc_pre_voltage rlc_apply_voltage
 		gather_probes reduce_energy validate_fields
 		steady_state_sample

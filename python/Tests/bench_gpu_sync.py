@@ -22,6 +22,8 @@ A VARIANT is MODE[/subN][/cmaxN]:
                 tile target)
     tbmbN       OPENEMS_GPU_TEMPORAL_BLOCK_MB=N: tile target in MB of fields
                 and coefficients (default 64 on a discrete card)
+    murfuse0    OPENEMS_GPU_MUR_FUSION=0: Mur post/apply as their own
+                dispatches instead of folded into the voltage update
 
 Variants run one at a time, round-robin over --repeat rounds. --gpu pins the
 run to one card through Mesa's device-select layer (DRI_PRIME), which is the
@@ -67,6 +69,8 @@ def variant(spec):
 			env["OPENEMS_GPU_TEMPORAL_BLOCK"] = opt[2:].replace("w", ":")
 		elif re.match(r"^tbmb\d+$", opt):
 			env["OPENEMS_GPU_TEMPORAL_BLOCK_MB"] = opt[4:]
+		elif opt == "murfuse0":
+			env["OPENEMS_GPU_MUR_FUSION"] = "0"
 		else:
 			raise SystemExit("unknown option %r in %r" % (opt, spec))
 	return args, env

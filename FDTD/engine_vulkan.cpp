@@ -2089,7 +2089,7 @@ void Engine_Vulkan::SetupGPUExtensions()
 		{
 			numMur++;
 			totalDescSets += 3;
-			totalStorageBindings += 13;
+			totalStorageBindings += 17;  // pre 7, post 7, apply 3
 		}
 		else if (auto* rlc = dynamic_cast<Operator_Ext_LumpedRLC*>(ext))
 		{
@@ -2176,6 +2176,7 @@ void Engine_Vulkan::SetupGPUExtensions()
 	CreateExtensionPipelines();
 	SetupGPU_LocalABC();
 	SetupGPU_SteadyState();
+	SetupMurFusion();
 
 	if (startupTrace)
 	{
@@ -2215,9 +2216,10 @@ void Engine_Vulkan::CreateExtensionDescriptorLayouts()
 	// TF/SF: 6 bindings (field, amp, delta, idx, delay, signal)
 	m_tfsfDescLayout = makeLayout(6);
 
-	// Mur: pre=5, post=5, apply=3
-	m_murPreDescLayout   = makeLayout(5);
-	m_murPostDescLayout  = makeLayout(5);
+	// Mur: pre=7 (with the saved V(shift)), post=7 (it shares the pre pipeline
+	// layout), apply=3
+	m_murPreDescLayout   = makeLayout(7);
+	m_murPostDescLayout  = makeLayout(7);
 	m_murApplyDescLayout = makeLayout(3);
 
 	// RLC: pre=6, apply=16
@@ -3051,6 +3053,7 @@ void Engine_Vulkan::SetupGPU_Mur()
 	VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
+	std::vector<float> coeffP, coeffPP;
 	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
 	{
 		Operator_Extension* ext = Op->GetExtension(eIdx);
@@ -3070,63 +3073,56 @@ void Engine_Vulkan::SetupGPU_Mur()
 		data.pc.lineNrShift = mur->m_LineNr_Shift;
 		data.pc.numLinesP   = numLinesP;
 		data.pc.numLinesPP  = numLinesPP;
-
-		VkDeviceSize bufSize = total * sizeof(FDTD_FLOAT);
-
-		// Intermediate value buffers (zero-init)
-		CreateGpuBuf(data.murNyP,  bufSize, rwUsage, dLoc);
-		CreateGpuBuf(data.murNyPP, bufSize, rwUsage, dLoc);
-		{
-			std::vector<float> zeros(total, 0.0f);
-			UploadGpuBuf(data.murNyP,  zeros.data(), bufSize);
-			UploadGpuBuf(data.murNyPP, zeros.data(), bufSize);
-		}
-
-		// Coefficient buffers
-		CreateGpuBuf(data.coeffNyP,  bufSize, usage, dLoc);
-		CreateGpuBuf(data.coeffNyPP, bufSize, usage, dLoc);
-		UploadGpuBuf(data.coeffNyP,  mur->m_Mur_Coeff_nyP.data(),  bufSize);
-		UploadGpuBuf(data.coeffNyPP, mur->m_Mur_Coeff_nyPP.data(), bufSize);
-
-		auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
-		{
-			VkDescriptorSetAllocateInfo ai{};
-			ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-			ai.descriptorPool     = m_extDescPool;
-			ai.descriptorSetCount = 1;
-			ai.pSetLayouts        = &layout;
-			VkDescriptorSet set;
-			VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &set));
-			return set;
-		};
-
-		// pre = [volt, murNyP, murNyPP, coeffNyP, coeffNyPP]
-		data.preDesc = allocDescSet(m_murPreDescLayout);
-		{
-			VkBuffer bufs[5]      = {m_voltBuf, data.murNyP.buffer, data.murNyPP.buffer,
-			                          data.coeffNyP.buffer, data.coeffNyPP.buffer};
-			VkDeviceSize sizes[5] = {m_fieldBufSize, bufSize, bufSize, bufSize, bufSize};
-			WriteDescriptorBuffers(m_device, data.preDesc, bufs, sizes, 5);
-		}
-
-		// post = same layout as pre
-		data.postDesc = allocDescSet(m_murPostDescLayout);
-		{
-			VkBuffer bufs[5]      = {m_voltBuf, data.murNyP.buffer, data.murNyPP.buffer,
-			                          data.coeffNyP.buffer, data.coeffNyPP.buffer};
-			VkDeviceSize sizes[5] = {m_fieldBufSize, bufSize, bufSize, bufSize, bufSize};
-			WriteDescriptorBuffers(m_device, data.postDesc, bufs, sizes, 5);
-		}
-
-		// apply = [volt, murNyP, murNyPP]
-		data.applyDesc = allocDescSet(m_murApplyDescLayout);
-		{
-			VkBuffer bufs[3]      = {m_voltBuf, data.murNyP.buffer, data.murNyPP.buffer};
-			VkDeviceSize sizes[3] = {m_fieldBufSize, bufSize, bufSize};
-			WriteDescriptorBuffers(m_device, data.applyDesc, bufs, sizes, 3);
-		}
-
+		data.pc.faceOff     = (uint32_t)coeffP.size();
+		coeffP.insert(coeffP.end(), mur->m_Mur_Coeff_nyP.data(), mur->m_Mur_Coeff_nyP.data() + total);
+		coeffPP.insert(coeffPP.end(), mur->m_Mur_Coeff_nyPP.data(), mur->m_Mur_Coeff_nyPP.data() + total);
 		m_gpuMur.push_back(std::move(data));
+	}
+	if (m_gpuMur.empty())
+		return;
+
+	// One set of buffers for all faces, each face at its faceOff: the fused
+	// voltage kernel (SetupMurFusion()) reaches every face through them.
+	m_murAllSize = coeffP.size() * sizeof(FDTD_FLOAT);
+	{
+		std::vector<float> zeros(coeffP.size(), 0.0f);
+		for (GpuBuf* b : {&m_murAllNyP, &m_murAllNyPP, &m_murAllVoldNyP, &m_murAllVoldNyPP})
+		{
+			CreateGpuBuf(*b, m_murAllSize, rwUsage, dLoc);
+			UploadGpuBuf(*b, zeros.data(), m_murAllSize);
+		}
+		CreateGpuBuf(m_murAllCoeffNyP,  m_murAllSize, usage, dLoc);
+		CreateGpuBuf(m_murAllCoeffNyPP, m_murAllSize, usage, dLoc);
+		UploadGpuBuf(m_murAllCoeffNyP,  coeffP.data(),  m_murAllSize);
+		UploadGpuBuf(m_murAllCoeffNyPP, coeffPP.data(), m_murAllSize);
+	}
+
+	auto allocDescSet = [&](VkDescriptorSetLayout layout) -> VkDescriptorSet
+	{
+		VkDescriptorSetAllocateInfo ai{};
+		ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		ai.descriptorPool     = m_extDescPool;
+		ai.descriptorSetCount = 1;
+		ai.pSetLayouts        = &layout;
+		VkDescriptorSet set;
+		VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &set));
+		return set;
+	};
+	// pre/post = [volt, mur nyP, mur nyPP, coeff nyP, coeff nyPP, vold nyP, vold nyPP]
+	// apply    = [volt, mur nyP, mur nyPP]
+	const VkDeviceSize sz = m_murAllSize;
+	VkBuffer prePost[7]      = {m_voltBuf, m_murAllNyP.buffer, m_murAllNyPP.buffer,
+	                            m_murAllCoeffNyP.buffer, m_murAllCoeffNyPP.buffer,
+	                            m_murAllVoldNyP.buffer, m_murAllVoldNyPP.buffer};
+	VkDeviceSize prePostSz[7] = {m_fieldBufSize, sz, sz, sz, sz, sz, sz};
+	for (GpuMurData& data : m_gpuMur)
+	{
+		data.preDesc = allocDescSet(m_murPreDescLayout);
+		WriteDescriptorBuffers(m_device, data.preDesc, prePost, prePostSz, 7);
+		data.postDesc = allocDescSet(m_murPostDescLayout);
+		WriteDescriptorBuffers(m_device, data.postDesc, prePost, prePostSz, 7);
+		data.applyDesc = allocDescSet(m_murApplyDescLayout);
+		WriteDescriptorBuffers(m_device, data.applyDesc, prePost, prePostSz, 3);
 	}
 
 	// Two faces with different normals share an edge, and both write the
@@ -3150,6 +3146,114 @@ void Engine_Vulkan::SetupGPU_Mur()
 	}
 
 	m_hasGPU_Mur = !m_gpuMur.empty();
+}
+
+// Fold the Mur ABC's post and apply phases into the Yee voltage update
+// (update_voltages_mur.comp): the thread that updates a shift cell writes the
+// face's boundary value itself.  That saves two dispatches and two barriers
+// per timestep in the flat sweep, and per slab step in the blocked one, where
+// on an RX 7900 XTX each barrier costs ~1.8 us.
+void Engine_Vulkan::SetupMurFusion()
+{
+	m_murFused = false;
+	if (!m_hasGPU_Mur || m_gpuMur.empty() || m_gpuMur.size() > 6)
+		return;
+	if (const char* env = std::getenv("OPENEMS_GPU_MUR_FUSION"))
+		if (std::atoi(env) == 0)
+			return;
+	// The flat order is Yee, every post, then the dispersive apply, TF/SF
+	// injection, absorbing sheets and UPML post, then every Mur apply.  Folded,
+	// the applies move ahead of all of those, so only without them is it the
+	// same order.
+	if (!m_gpuUPML.empty() || !m_gpuDisp.empty() || m_hasGPU_TFSF || !m_gpuLocalABC.empty())
+		return;
+	for (const auto& m : m_gpuMur)
+		if (m.startTS != 0)
+			return;
+
+	const uint32_t nFaces = (uint32_t)m_gpuMur.size();
+	std::vector<uint32_t> meta(8 * nFaces, 0);
+	for (uint32_t f = 0; f < nFaces; ++f)
+	{
+		const MurPC& pc = m_gpuMur[f].pc;
+		const uint32_t row[8] = {pc.ny, pc.lineNr, pc.lineNrShift, pc.numLinesP, pc.numLinesPP,
+		                         pc.edgeSkip, pc.faceOff, 0};
+		std::copy(row, row + 8, meta.begin() + 8 * f);
+	}
+	const VkDeviceSize metaSize = meta.size() * sizeof(uint32_t);
+	CreateGpuBuf(m_murFaceBuf, metaSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	UploadGpuBuf(m_murFaceBuf, meta.data(), metaSize);
+
+	const uint32_t nBindings = 12;
+	std::vector<VkDescriptorSetLayoutBinding> bindings(nBindings);
+	for (uint32_t i = 0; i < nBindings; i++)
+		bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+	VkDescriptorSetLayoutCreateInfo dli{};
+	dli.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	dli.bindingCount = nBindings;
+	dli.pBindings    = bindings.data();
+	VK_CHECK(vkCreateDescriptorSetLayout(m_device, &dli, nullptr, &m_murFusedDescLayout));
+
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nBindings};
+	VkDescriptorPoolCreateInfo dpi{};
+	dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	dpi.maxSets       = 1;
+	dpi.poolSizeCount = 1;
+	dpi.pPoolSizes    = &poolSize;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_murFusedDescPool));
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool     = m_murFusedDescPool;
+	ai.descriptorSetCount = 1;
+	ai.pSetLayouts        = &m_murFusedDescLayout;
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_murFusedDescSet));
+	const VkDeviceSize sz = m_murAllSize;
+	VkBuffer bufs[nBindings] = {m_voltBuf, m_currBuf, m_opIndexBuf, m_vvCompBuf, m_viCompBuf,
+	                            m_murAllNyP.buffer, m_murAllNyPP.buffer,
+	                            m_murAllCoeffNyP.buffer, m_murAllCoeffNyPP.buffer, m_murFaceBuf.buffer,
+	                            m_murAllVoldNyP.buffer, m_murAllVoldNyPP.buffer};
+	VkDeviceSize sizes[nBindings] = {m_fieldBufSize, m_fieldBufSize, m_opIndexBufSize,
+	                                 m_coeffCompBufSize, m_coeffCompBufSize,
+	                                 sz, sz, sz, sz, metaSize, sz, sz};
+	WriteDescriptorBuffers(m_device, m_murFusedDescSet, bufs, sizes, nBindings);
+
+	VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC)};
+	VkPipelineLayoutCreateInfo pli{};
+	pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pli.setLayoutCount         = 1;
+	pli.pSetLayouts            = &m_murFusedDescLayout;
+	pli.pushConstantRangeCount = 1;
+	pli.pPushConstantRanges    = &pcRange;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_murFusedPipeLayout));
+
+	const uint32_t spec[2] = {m_opIdxBits, nFaces};
+	VkSpecializationMapEntry specEntry[2] = {
+		{0, 0 * sizeof(uint32_t), sizeof(uint32_t)},
+		{1, 1 * sizeof(uint32_t), sizeof(uint32_t)},
+	};
+	VkSpecializationInfo specInfo{};
+	specInfo.mapEntryCount = 2;
+	specInfo.pMapEntries   = specEntry;
+	specInfo.dataSize      = sizeof(spec);
+	specInfo.pData         = spec;
+	VkShaderModule mod = CreateShaderModule(gpu_spirv::update_voltages_mur_data,
+	                                        gpu_spirv::update_voltages_mur_size);
+	VkPipelineShaderStageCreateInfo stage{};
+	stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+	stage.module = mod;
+	stage.pName  = "main";
+	stage.pSpecializationInfo = &specInfo;
+	VkComputePipelineCreateInfo ci{};
+	ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	ci.stage  = stage;
+	ci.layout = m_murFusedPipeLayout;
+	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_murFusedPipeline));
+	vkDestroyShaderModule(m_device, mod, nullptr);
+
+	m_murFused = true;
+	cout << "Engine_Vulkan: Mur post/apply folded into the voltage update (" << nFaces << " faces)" << endl;
 }
 
 void Engine_Vulkan::SetupGPU_RLC()
@@ -4652,6 +4756,8 @@ bool Engine_Vulkan::RecordMurSlabPhase(VkCommandBuffer cmd, int phase, int x0, i
 {
 	if (m_gpuMur.empty() || x1 <= x0)
 		return false;
+	if (m_murFused && phase != 0)
+		return false;  // post and apply run inside the voltage update
 
 	VkPipeline pipe = (phase == 0) ? m_murPreVoltPipeline
 	                : (phase == 1) ? m_murPostVoltPipeline
@@ -4913,13 +5019,19 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		{
 			if (eHi > eLo)
 			{
+				// With m_murFused this also finishes the Mur faces: a face
+				// normal to x writes x=0 from x=1 (and NX-1 from NX-2), both of
+				// which this slab holds whenever it holds either (see
+				// RecordMurSlabPhase()); faces normal to y or z stay on one x.
 				GridPC pv = gridV;
 				pv.gidBase = (uint32_t)eLo * planeV;
 				pv.gidEnd  = std::min((uint32_t)eHi * planeV, gridV.gidEnd);
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				const VkPipelineLayout vLayout = m_murFused ? m_murFusedPipeLayout : m_fdtdPipeLayout;
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                  m_murFused ? m_murFusedPipeline : m_updateVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vLayout, 0, 1,
+				                        m_murFused ? &m_murFusedDescSet : &m_updateVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, vLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 				                   0, sizeof(GridPC), &pv);
 				vkCmdDispatch(cmd, (pv.gidEnd - pv.gidBase + 255) / 256, 1, 1);
 				CmdComputeBarrier(cmd, barrier);
@@ -5207,7 +5319,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		bool needPostCurrBarrier = (m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE);
 		bool hasVoltLateWritesFused = hasExcVolt || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
 		bool hasCurrLateWritesFused = hasExcCurr || m_hasGPU_TFSF || hasDispCurrADE;
-		bool hasVoltLateWrites = hasExcVolt || m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
+		// With m_murFused the Mur post and apply happen inside the voltage
+		// update (SetupMurFusion()); only the separate phases need the rest.
+		const bool murSeparate = m_hasGPU_Mur && !m_murFused;
+		bool hasVoltLateWrites = hasExcVolt || m_hasGPU_UPML || murSeparate || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
 		bool hasCurrLateWrites = hasExcCurr || m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE;
 		bool useAsyncProbeCopy = m_hasDedicatedTransferQueue && m_hasGPU_Probes &&
 		                         (m_probeCacheCount > 0) && !m_probeOutMapped &&
@@ -5592,13 +5707,17 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				RecordGPUFieldValidation(cmd, 0);
 			stageMark();
 
-			// --- Voltage update ---
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-			                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
-			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(GridPC), &gridPC);
-			vkCmdDispatch(cmd, voltGroups, 1, 1);
+			// --- Voltage update (with Mur post and apply, when fused) ---
+			{
+				const VkPipelineLayout vLayout = m_murFused ? m_murFusedPipeLayout : m_fdtdPipeLayout;
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+				                  m_murFused ? m_murFusedPipeline : m_updateVoltPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vLayout, 0, 1,
+				                        m_murFused ? &m_murFusedDescSet : &m_updateVoltDescSet, 0, nullptr);
+				vkCmdPushConstants(cmd, vLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(GridPC), &gridPC);
+				vkCmdDispatch(cmd, voltGroups, 1, 1);
+			}
 
 			CmdComputeBarrier(cmd, barrier);
 			stageMark();
@@ -5623,10 +5742,11 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				CmdComputeBarrier(cmd, barrier);
 
 			// Mur post-voltage (accumulates shifted field)
-			if (!m_gpuMur.empty())
+			if (murSeparate)
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPostVoltPipeline);
 			for (const auto& m : m_gpuMur)
 			{
+				if (!murSeparate) break;
 				if (ts < m.startTS) continue;
 				uint32_t groups = (m.totalCells + 255) / 256;
 				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -5648,7 +5768,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			}
 
 			// Barrier for post-voltage writes
-			if (m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF)
+			if (m_hasGPU_UPML || murSeparate || m_hasGPU_TFSF)
 			{
 				CmdComputeBarrier(cmd, barrier);
 			}
@@ -5673,10 +5793,12 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			}
 
 			// Mur apply (overwrites boundary voltages)
-			if (!m_gpuMur.empty())
+			if (murSeparate)
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
 			for (const auto &m : m_gpuMur)
 			{
+				if (!murSeparate)
+					break;
 				if (ts < m.startTS)
 					continue;
 				uint32_t groups = (m.totalCells + 255) / 256;
@@ -5686,7 +5808,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
 			// Mur and RLC can share cells; the CPU applies them in this order.
-			if (m_hasGPU_Mur && m_hasGPU_RLC)
+			if (murSeparate && m_hasGPU_RLC)
 				CmdComputeBarrier(cmd, barrier);
 
 			// RLC apply
@@ -5703,7 +5825,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			// A lumped port puts its resistor and its excitation on the same
 			// edges.  Without this barrier the excitation's += and the RLC's
 			// write are unordered.
-			if ((m_hasGPU_Mur || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
+			if ((murSeparate || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
 				CmdComputeBarrier(cmd, barrier);
 			RecordLocalABCPhase(cmd, 2);
 
@@ -6349,12 +6471,17 @@ void Engine_Vulkan::CleanupExtensions()
 	m_gpuTFSF = GpuTFSFData{};
 
 	// --- Destroy Mur ABC GPU data ---
-	for (auto& m : m_gpuMur)
-	{
-		DestroyGpuBuf(m.murNyP);    DestroyGpuBuf(m.murNyPP);
-		DestroyGpuBuf(m.coeffNyP);  DestroyGpuBuf(m.coeffNyPP);
-	}
+	for (GpuBuf* b : {&m_murAllNyP, &m_murAllNyPP, &m_murAllCoeffNyP, &m_murAllCoeffNyPP,
+	                  &m_murAllVoldNyP, &m_murAllVoldNyPP, &m_murFaceBuf})
+		DestroyGpuBuf(*b);
 	m_gpuMur.clear();
+	if (m_murFusedPipeline)   vkDestroyPipeline(m_device, m_murFusedPipeline, nullptr);
+	if (m_murFusedPipeLayout) vkDestroyPipelineLayout(m_device, m_murFusedPipeLayout, nullptr);
+	if (m_murFusedDescPool)   vkDestroyDescriptorPool(m_device, m_murFusedDescPool, nullptr);
+	if (m_murFusedDescLayout) vkDestroyDescriptorSetLayout(m_device, m_murFusedDescLayout, nullptr);
+	m_murFusedPipeline = VK_NULL_HANDLE; m_murFusedPipeLayout = VK_NULL_HANDLE;
+	m_murFusedDescPool = VK_NULL_HANDLE; m_murFusedDescLayout = VK_NULL_HANDLE;
+	m_murFused = false;
 
 	// --- Destroy RLC GPU data ---
 	DestroyGpuBuf(m_gpuRLC.il);

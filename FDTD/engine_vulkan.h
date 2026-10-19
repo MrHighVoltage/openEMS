@@ -519,8 +519,10 @@ private:
 	//! normal to y or z to an x-slab; the default covers the whole face.
 	//! edgeSkip marks the edges of the face that an earlier face also writes
 	//! (see SetupGPU_Mur); the apply shader leaves those cells to that face.
+	//! faceOff is the face's first element in the concatenated Mur buffers.
 	struct MurPC    { uint32_t Nx, Ny, Nz, ny, lineNr, lineNrShift, numLinesP, numLinesPP;
-	                  uint32_t xLo = 0; uint32_t xHi = 0xFFFFFFFFu; uint32_t edgeSkip = 0; };
+	                  uint32_t xLo = 0; uint32_t xHi = 0xFFFFFFFFu; uint32_t edgeSkip = 0;
+	                  uint32_t faceOff = 0; };
 	//! Push constant struct for LumpedRLC shaders.  The elements are sorted by
 	//! x, so a slab is the entry range [entryBase, entryEnd).
 	struct RlcPC    { uint32_t count; uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
@@ -594,10 +596,9 @@ private:
 		uint32_t voltCount = 0, currCount = 0;
 	};
 
-	//! Per-face Mur ABC GPU state.
+	//! Per-face Mur ABC GPU state.  The buffers are shared by all faces
+	//! (m_murAll*), each face at pc.faceOff.
 	struct GpuMurData {
-		GpuBuf murNyP, murNyPP;                           // intermediate saved values
-		GpuBuf coeffNyP, coeffNyPP;                       // Mur coefficients
 		VkDescriptorSet preDesc   = VK_NULL_HANDLE;
 		VkDescriptorSet postDesc  = VK_NULL_HANDLE;
 		VkDescriptorSet applyDesc = VK_NULL_HANDLE;
@@ -658,6 +659,19 @@ private:
 	std::vector<GpuDispData>  m_gpuDisp;
 	GpuTFSFData               m_gpuTFSF;
 	std::vector<GpuMurData>   m_gpuMur;
+	//! All Mur faces' state, coefficients and saved V(shift), concatenated.
+	GpuBuf m_murAllNyP, m_murAllNyPP, m_murAllCoeffNyP, m_murAllCoeffNyPP, m_murAllVoldNyP, m_murAllVoldNyPP;
+	VkDeviceSize m_murAllSize = 0;
+	//! Mur post and apply folded into the Yee voltage update
+	//! (update_voltages_mur.comp); see SetupMurFusion().
+	bool m_murFused = false;
+	GpuBuf m_murFaceBuf;
+	VkDescriptorSetLayout m_murFusedDescLayout = VK_NULL_HANDLE;
+	VkDescriptorPool      m_murFusedDescPool   = VK_NULL_HANDLE;
+	VkDescriptorSet       m_murFusedDescSet    = VK_NULL_HANDLE;
+	VkPipelineLayout      m_murFusedPipeLayout = VK_NULL_HANDLE;
+	VkPipeline            m_murFusedPipeline   = VK_NULL_HANDLE;
+	void SetupMurFusion();
 	GpuRLCData                m_gpuRLC;
 	GpuProbeData              m_gpuProbes;
 

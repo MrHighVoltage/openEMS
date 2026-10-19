@@ -307,7 +307,7 @@ def compare_work(work):
 			log = (d / "openEMS.log").read_text()
 			engaged = re.search(r"k=(\d+) W=(\d+) \((\d+) tiles", log) if ACTIVE_MARK in log else None
 			diff = compare(ref, d)
-			informational = d.name == "ref-flat"
+			informational = d.name in ("ref-flat", "flat-mur-unfused")
 			verdict = "identical" if diff is None else ("DIFFERS (%s)" % diff)
 			if diff is not None and not informational:
 				verdict = "FAIL " + verdict
@@ -371,6 +371,9 @@ def main():
 		variants = [("flat", args.bin, flat), ("flat again", args.bin, flat)]
 		if args.ref:
 			variants.append(("ref flat", args.ref, flat))
+		# Mur's post and apply in their own dispatches instead of folded into the
+		# voltage update: the same physics, so reported, but rounding may differ.
+		variants.append(("flat Mur unfused", args.bin, dict(flat, OPENEMS_GPU_MUR_FUSION="0")))
 		# k:W sets the tile; the 1 MB target only keeps the "grid already fits"
 		# guard from refusing a small grid.  A bare k leaves the tile to the
 		# engine's own sizing.
@@ -401,7 +404,7 @@ def main():
 			else:
 				diff = compare(ref_dir, d)
 				verdict = "identical" if diff is None else ("DIFFERS (" + diff + ")")
-				if diff is not None and label != "ref flat":
+				if diff is not None and label not in ("ref flat", "flat Mur unfused"):
 					verdict = "FAIL " + verdict
 			if engaged:
 				t = re.search(r"k=(\d+) W=(\d+) \((\d+) tiles", log)
