@@ -29,6 +29,7 @@
 #include "extensions/engine_extension.h"
 #include "tools/denormal.h"
 
+#include <algorithm>
 #include <iomanip>
 
 using std::cout;
@@ -52,7 +53,8 @@ Engine_Multithread::Engine_Multithread(const Operator_Multithread* op) : ENGINE_
 	m_IterateBarrier = 0;
 	m_startBarrier = 0;
 	m_stopBarrier = 0;
-	m_max_numThreads = std::thread::hardware_concurrency();
+	m_cores = op->GetCoreSet();
+	m_max_numThreads = std::max(1u, CpuTopology::Get().MaxThreads(m_cores));
 	m_numThreads = 0;
 	m_last_speed = 0;
 	m_opt_speed = false;
@@ -194,6 +196,20 @@ void Engine_Multithread::changeNumThreads(unsigned int numThreads)
 		m_Eng_exts.at(n)->SetNumberOfThreads(m_numThreads);
 }
 
+bool Engine_Multithread::SetThreads(unsigned int numThreads, const CoreSet& cores)
+{
+	const CpuTopology& topo = CpuTopology::Get();
+	if (!topo.Offers(cores))
+		return false;
+	m_cores = cores;
+	m_max_numThreads = std::max(1u, topo.MaxThreads(cores));
+	// 0: calibrate again, one more thread per NextInterval(), as Init() does.
+	m_opt_speed = (numThreads == 0);
+	m_last_speed = 0;
+	this->changeNumThreads(m_opt_speed ? 1 : std::min(numThreads, m_max_numThreads));
+	return true;
+}
+
 bool Engine_Multithread::IterateTS(unsigned int iterTS)
 {
 	m_iterTS = iterTS;
@@ -308,6 +324,7 @@ void thread::operator()()
 
 	// speed up the calculation of denormal floating point values (flush-to-zero)
 	Denormal::Disable();
+	CpuTopology::Get().Restrict(m_enginePtr->m_cores, m_threadID, m_enginePtr->m_numThreads);
 
 	// Note: the loop must be unconditional. Testing m_stopThreads here would let
 	// a worker leave without ever arriving at m_startBarrier, while the shutdown

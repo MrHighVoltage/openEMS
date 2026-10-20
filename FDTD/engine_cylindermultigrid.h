@@ -44,6 +44,10 @@ public:
 	//! Iterate \a iterTS number of timesteps
 	virtual bool IterateTS(unsigned int iterTS);
 
+	//! Its own threads drive the inner grid's in lockstep: not to be changed while it runs.
+	virtual unsigned int GetNumThreads() const {return 0;}
+	virtual bool SetThreads(unsigned int numThreads, const CoreSet& cores) {UNUSED(numThreads); UNUSED(cores); return false;}
+
 protected:
 	Engine_CylinderMultiGrid(const Operator_CylinderMultiGrid* op);
 	const Operator_CylinderMultiGrid* Op_CMG;

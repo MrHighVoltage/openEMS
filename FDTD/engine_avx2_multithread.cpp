@@ -63,7 +63,8 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	m_IterateBarrier = nullptr;
 	m_startBarrier = nullptr;
 	m_stopBarrier = nullptr;
-	m_max_numThreads = std::thread::hardware_concurrency();
+	m_cores = op->GetCoreSet();
+	m_max_numThreads = std::max(1u, CpuTopology::Get().MaxThreads(m_cores));
 	m_numThreads = 0;
 	m_opt_speed = false;
 	m_stopThreads = true;
@@ -131,10 +132,29 @@ void Engine_AVX2_Multithread::Init()
 		m_numThreads = m_max_numThreads;
 
 	this->changeNumThreads(m_numThreads);
-	// The tile is sized from the L3 instances the threads occupy, so it waits
-	// for the final thread count; calibration runs on the flat path anyway.
-	if (!m_opt_speed)
-		ConfigureTemporalBlocking();
+	// The tile is sized from the L3 instances the threads occupy: while the
+	// count is calibrated every candidate gets its own, and the run's is
+	// announced once the count is settled (FinishCalibration()).
+	ConfigureTemporalBlocking(!m_opt_speed);
+}
+
+bool Engine_AVX2_Multithread::SetThreads(unsigned int numThreads, const CoreSet& cores)
+{
+	const CpuTopology& topo = CpuTopology::Get();
+	if (!topo.Offers(cores))
+		return false;
+	m_cores = cores;
+	m_max_numThreads = std::max(1u, topo.MaxThreads(cores));
+	m_opt_speed = false;
+	if (numThreads == 0)
+	{
+		m_opt_speed = true;
+		BuildCalibrationPlan();
+		numThreads = m_cal_plan.front();
+	}
+	this->changeNumThreads(std::min(numThreads, m_max_numThreads));
+	ConfigureTemporalBlocking(!m_opt_speed);
+	return true;
 }
 
 void Engine_AVX2_Multithread::Reset()
@@ -218,7 +238,7 @@ void Engine_AVX2_Multithread::changeNumThreads(unsigned int numThreads)
 bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 {
 	if (m_opt_speed)
-		return CalibrateIterateTS(iterTS);   // calibrate on the flat path
+		return CalibrateIterateTS(iterTS);
 
 	m_iterTS = iterTS;
 	m_blk_active = (m_blk_k > 1);
@@ -258,13 +278,13 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 // which openems.cpp sets to Nyquist/oversampling, typically 5-25 timesteps.
 // ----------------------------------------------------------------------------
 
-void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
+void Engine_AVX2_Multithread::ConfigureTemporalBlocking(bool announce)
 {
 	m_blk_edges.clear();
 	const TemporalBlockingPlan plan = PlanTemporalBlocking(m_blk_request, &m_blk_edges);
 	m_blk_k = plan.active ? plan.k : 0;
 	m_blk_W = plan.active ? plan.W : 0;
-	if (m_blk_quiet)
+	if (m_blk_quiet || !announce)
 		return;
 
 	if (plan.active)
@@ -278,10 +298,8 @@ bool Engine_AVX2_Multithread::SetTemporalBlocking(const TemporalBlockingRequest&
 {
 	m_blk_request = req;
 	m_blk_quiet = !announce;
-	// The tile is sized from the L3 instances the threads occupy, so while the
-	// thread count is still being calibrated it waits for FinishCalibration().
-	if (!m_opt_speed)
-		ConfigureTemporalBlocking();
+	// While the thread count is calibrated, FinishCalibration() announces it.
+	ConfigureTemporalBlocking(!m_opt_speed);
 	return true;
 }
 
@@ -330,7 +348,7 @@ TemporalBlockingPlan Engine_AVX2_Multithread::PlanTemporalBlocking(const Tempora
 	// and multi-CCX Ryzens (§5.3).
 	const double planeBytes = 2.0 * (double)m_vs_x * sizeof(f8vector);
 	const double fieldBytes = planeBytes * (double)numLines[0];
-	const LLC_Span llc = QueryLastLevelCaches(m_numThreads);
+	const LLC_Span llc = CpuTopology::Get().LastLevelCaches(m_cores, m_numThreads);
 	long cacheBytes = (long)llc.totalBytes;
 	if (cacheBytes <= 0)
 		cacheBytes = 32L * 1024 * 1024;
@@ -458,7 +476,7 @@ std::vector<TemporalBlockingRequest> Engine_AVX2_Multithread::TemporalBlockingCa
 	// without, always with k = W/2.
 	std::vector<TemporalBlockingRequest> out;
 	const double planeBytes = 2.0 * (double)m_vs_x * sizeof(f8vector);
-	const LLC_Span llc = QueryLastLevelCaches(m_numThreads);
+	const LLC_Span llc = CpuTopology::Get().LastLevelCaches(m_cores, m_numThreads);
 	const double cacheBytes = llc.totalBytes ? (double)llc.totalBytes : 32.0 * 1024 * 1024;
 	for (double share : {0.25, 0.35, 0.5, 0.7, 1.0, 1.4})
 	{
@@ -814,12 +832,13 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 	// changes the answer: the flat sweep's roll-off past 8 threads is DRAM
 	// contention (§4.3), and blocking removes the contention, so a thread count
 	// tuned against the flat path is tuned against a constraint that will not
-	// apply.
+	// apply. Every candidate count has its own tile (ConfigureTemporalBlocking()
+	// in AdvanceCalibration()), and a batch is at least one block deep.
 	m_blk_active = (m_blk_k > 1);
 
 	while (remaining > 0 && m_opt_speed)
 	{
-		const unsigned int batch = std::min(remaining, CAL_BATCH_TS);
+		const unsigned int batch = std::min(remaining, std::max(CAL_BATCH_TS, m_blk_k));
 
 		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 		m_iterTS = batch;
@@ -847,7 +866,9 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 
 	if (remaining > 0)
 	{
+		// Calibration ended inside this call: the rest on the settled schedule.
 		m_iterTS = remaining;
+		m_blk_active = (m_blk_k > 1);
 		m_startBarrier->wait();
 		m_stopBarrier->wait();
 	}
@@ -908,6 +929,8 @@ void Engine_AVX2_Multithread::AdvanceCalibration()
 	m_cal_steps = 0;
 	m_cal_warmup = true;
 	this->changeNumThreads(m_cal_plan.at(m_cal_index));
+	ConfigureTemporalBlocking(false);
+	m_blk_active = (m_blk_k > 1);
 }
 
 void Engine_AVX2_Multithread::FinishCalibration()
@@ -924,7 +947,10 @@ void Engine_AVX2_Multithread::FinishCalibration()
 		this->changeNumThreads(bestThreads);
 
 	cout << "AVX2 Multithreaded Engine: Best performance found using "
-	     << m_numThreads << " threads." << endl;
+	     << m_numThreads << " threads";
+	if (!m_cores.IsAll())
+		cout << " on the " << m_cores.ToString() << " cores";
+	cout << "." << endl;
 	ConfigureTemporalBlocking();
 }
 
@@ -1010,6 +1036,7 @@ void thread::operator()()
 {
 	// Flush denormals for this thread
 	Denormal::Disable();
+	CpuTopology::Get().Restrict(m_enginePtr->m_cores, m_threadID, m_enginePtr->m_numThreads);
 
 	// Note: the loop must be unconditional. Testing m_stopThreads here would let
 	// a worker leave without ever arriving at m_startBarrier, while the shutdown

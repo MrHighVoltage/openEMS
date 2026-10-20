@@ -34,6 +34,9 @@ Engine_CylinderMultiGrid* Engine_CylinderMultiGrid::New(const Operator_CylinderM
 Engine_CylinderMultiGrid::Engine_CylinderMultiGrid(const Operator_CylinderMultiGrid* op) : Engine_Cylinder(op)
 {
 	Op_CMG = op;
+	// The inner grid's engine has workers of its own; --cpu-cores applies to neither.
+	m_cores = CoreSet();
+	m_max_numThreads = std::max(1u, CpuTopology::Get().MaxThreads(m_cores));
 
 	m_WaitOnBase = new Barrier(2);
 	m_WaitOnChild = new Barrier(2);

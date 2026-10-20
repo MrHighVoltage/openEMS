@@ -23,6 +23,7 @@
 #include <vector>
 #include "operator.h"
 #include "temporal_blocking.h"
+#include "tools/cpu_topology.h"
 
 #include "tools/arraylib/array_nijk.h"
 
@@ -74,6 +75,20 @@ public:
 	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const {UNUSED(maxDepth); return {};}
 	//! True while the engine still tunes itself on the timesteps it runs.
 	virtual bool IsCalibrating() const {return false;}
+	//@}
+
+	//! \name Worker threads
+	//! The multithreaded CPU engines run on worker threads, and how many and
+	//! on which cores may change between any two IterateTS() calls too. The
+	//! others have none: a GPU engine, the single-threaded ones.
+	//@{
+	//! Worker threads in use; 0 if the engine has none to set.
+	virtual unsigned int GetNumThreads() const {return 0;}
+	//! The cores they may run on.
+	virtual CoreSet GetCoreSet() const {return CoreSet();}
+	//! From the next IterateTS() on, run \a numThreads workers on \a cores; 0
+	//! threads: calibrate the count there. False if this engine has no workers.
+	virtual bool SetThreads(unsigned int numThreads, const CoreSet& cores) {UNUSED(numThreads); UNUSED(cores); return false;}
 	//@}
 
 	//this access functions muss be overloaded by any new engine using a different storage model

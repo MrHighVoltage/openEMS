@@ -95,6 +95,11 @@ public:
 	//! Iterate \a iterTS number of timesteps
 	virtual bool IterateTS(unsigned int iterTS);
 
+	virtual bool IsCalibrating() const {return m_opt_speed;}
+	virtual unsigned int GetNumThreads() const {return m_numThreads;}
+	virtual CoreSet GetCoreSet() const {return m_cores;}
+	virtual bool SetThreads(unsigned int numThreads, const CoreSet& cores);
+
 	virtual void DoPreVoltageUpdates()  {throw std::runtime_error("Engine_Multithread::DoPreVoltageUpdates without thread ID is invalid");}
 	virtual void DoPreVoltageUpdates(int threadID);
 	virtual void DoPostVoltageUpdates() {throw std::runtime_error("Engine_Multithread::DoPostVoltageUpdates without thread ID is invalid");}
@@ -118,7 +123,8 @@ protected:
 	Barrier *m_IterateBarrier;
 	volatile unsigned int m_iterTS;
 	unsigned int m_numThreads; //!< number of worker threads
-	unsigned int m_max_numThreads; //!< max. number of worker threads
+	unsigned int m_max_numThreads; //!< max. number of worker threads: the hardware threads in m_cores
+	CoreSet m_cores;               //!< where the workers may run (--cpu-cores)
 	volatile bool m_stopThreads;
 	bool m_opt_speed;
 	float m_last_speed;

@@ -70,6 +70,10 @@ public:
 	//! Iterate number of timesteps
 	virtual bool IterateTS(unsigned int iterTS);
 
+	virtual unsigned int GetNumThreads() const {return m_numThreads;}
+	virtual CoreSet GetCoreSet() const {return m_cores;}
+	virtual bool SetThreads(unsigned int numThreads, const CoreSet& cores);
+
 	virtual void DoPreVoltageUpdates()  { throw std::runtime_error("Engine_AVX2_Multithread::DoPreVoltageUpdates without thread ID"); }
 	virtual void DoPreVoltageUpdates(int threadID);
 	virtual void DoPostVoltageUpdates() { throw std::runtime_error("Engine_AVX2_Multithread::DoPostVoltageUpdates without thread ID"); }
@@ -104,7 +108,8 @@ protected:
 	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const;
 	virtual bool IsCalibrating() const {return m_opt_speed;}
 	//! Resolve m_blk_request to k, the tile width and the tile edges, or leave blocking disabled.
-	void ConfigureTemporalBlocking();
+	//! \a announce: print the result, unless m_blk_quiet.
+	void ConfigureTemporalBlocking(bool announce = true);
 	//! PlanTemporalBlocking(), with the tile edges of an active plan.
 	TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req,
 	                                          std::vector<int>* edgesOut) const;
@@ -159,7 +164,8 @@ protected:
 	std::vector<SyncStats> m_sync;
 	volatile unsigned int m_iterTS;
 	unsigned int m_numThreads;
-	unsigned int m_max_numThreads;
+	unsigned int m_max_numThreads; //!< hardware threads in m_cores
+	CoreSet m_cores;               //!< where the workers may run (--cpu-cores)
 	volatile bool m_stopThreads;
 	bool m_opt_speed;
 

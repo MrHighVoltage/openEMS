@@ -24,6 +24,7 @@
 #include "Common/operator_base.h"
 
 #include "tools/arraylib/array_nijk.h"
+#include "tools/cpu_topology.h"
 
 class Operator_Extension;
 class Operator_Ext_Excitation;
@@ -55,6 +56,10 @@ public:
 
 	virtual Engine* CreateEngine();
 	virtual Engine* GetEngine() const {return m_Engine;}
+
+	//! The cores the engine's worker threads may run on (--cpu-cores); set before CreateEngine().
+	void SetCoreSet(const CoreSet& cores) {m_coreSet = cores;}
+	const CoreSet& GetCoreSet() const {return m_coreSet;}
 
 	virtual bool SetGeometryCSX(ContinuousStructure* geo);
 
@@ -241,6 +246,8 @@ public:
 protected:
 	//! use New() for creating a new Operator
 	Operator();
+
+	CoreSet m_coreSet;
 
 	virtual void Init();
 	void Delete();

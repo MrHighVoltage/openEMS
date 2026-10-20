@@ -16,6 +16,7 @@
 */
 
 #include "openems.h"
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -45,6 +46,7 @@
 #include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/engine_interface_cylindrical_fdtd.h"
 #include "FDTD/schedule_benchmark.h"
+#include "tools/cpu_topology.h"
 #if OPENEMS_ENABLE_AVX2
 #include "FDTD/operator_avx2.h"
 #include "FDTD/operator_avx2_multithread.h"
@@ -103,6 +105,7 @@ openEMS::openEMS()
 	m_engine = EngineType_Multithreaded; // default portable engine type
 #endif
 	m_engine_numThreads = 0;
+	m_numThreadsGiven = false;
 	m_gpuTBMBOption = 0;
 	m_benchmark = false;
 	m_benchmarkTS = 0;
@@ -320,16 +323,35 @@ openEMS::optionDesc()
 #endif
 	);
 
-	optdesc.addIntOption("numThreads", 0,
+	// The default -1 tells "not given" from an explicit 0: the parser calls
+	// back with the default when an option is absent.
+	optdesc.addIntOption("numThreads", -1,
 		[this](int val)
 		{
-			this->SetNumberOfThreads(val);
+			m_numThreadsGiven = (val >= 0);
+			this->SetNumberOfThreads(std::max(val, 0));
 			if (val > 0)
 				cout << "openEMS - fixed number of threads: "
 					 << m_engine_numThreads << endl;
 		},
-		"Force use n threads for multithreaded engine "
-		"(needs: --engine=multithreaded)"
+		"Force use n threads for the multithreaded engines; 0: find the "
+		"fastest count at the start of the run (default)"
+	);
+
+	optdesc.addStringOption("cpu-cores", "",
+		[this](const std::string& val)
+		{
+			CoreSet cores;
+			if (val.empty() || CoreSet::Parse(val, cores))
+				m_cpuCoresOption = val;
+			else
+				cerr << "openEMS - ignoring --cpu-cores=" << val << " (expected all, physical, performance, "
+				        "performance+smt, efficiency or efficiency+smt)" << endl;
+		},
+		"Cores the worker threads of the multithreaded engines run on: all "
+		"(default); physical, one thread per core; performance or efficiency, "
+		"one kind of core of a hybrid CPU, one thread per core, and with +smt "
+		"every thread of those cores"
 	);
 
 	// Temporal blocking. Each replaces the environment variable of the same
@@ -1626,8 +1648,27 @@ int openEMS::SetupFDTD()
 	auto engCreateStart = std::chrono::steady_clock::now();
 	if (gpuStartupTrace)
 		cout << "openEMS::SetupFDTD: creating engine..." << endl;
+	// --cpu-cores: the engine starts its workers there.
+	if (!m_cpuCoresOption.empty())
+	{
+		CoreSet cores;
+		CoreSet::Parse(m_cpuCoresOption, cores);
+		if (CpuTopology::Get().Offers(cores))
+			FDTD_Op->SetCoreSet(cores);
+		else
+			cerr << "openEMS - --cpu-cores=" << m_cpuCoresOption << " ignored: threads cannot be kept to "
+			        "those cores here (" << CpuTopology::Get().Describe() << ")" << endl;
+	}
 	FDTD_Eng = FDTD_Op->CreateEngine();
 	ApplyTemporalBlockingOptions();
+	if (!FDTD_Op->GetCoreSet().IsAll())
+	{
+		if (FDTD_Eng->GetNumThreads() > 0)
+			cout << "openEMS - worker threads on the " << FDTD_Op->GetCoreSet().ToString() << " cores: "
+			     << CpuTopology::Get().DescribeSet(FDTD_Op->GetCoreSet()) << endl;
+		else
+			cerr << "openEMS - --cpu-cores ignored: this engine has no worker threads to place" << endl;
+	}
 	if (gpuStartupTrace)
 	{
 		auto engCreateEnd = std::chrono::steady_clock::now();

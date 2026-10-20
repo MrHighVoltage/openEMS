@@ -629,7 +629,13 @@ cdef class openEMS:
         see `./openEMS --help`). Examples are:
 
         * verbose (int) -- set the openEMS verbosity level 0..3
-        * numThreads (int) -- set the number of threads (default 0 --> max)
+        * numThreads (int) -- the number of worker threads of the
+          multithreaded engines (default 0: find the fastest count at the
+          start of the run)
+        * cpu_cores (str) -- the cores those threads run on: 'all'
+          (default), 'physical' (one thread per core), 'performance' or
+          'efficiency' (one kind of core of a hybrid CPU, one thread per
+          core; 'performance+smt', 'efficiency+smt': every thread of them)
         * disable_dumps (bool) -- disable all field dumps for faster simulation
         * debug_material (bool) - dump material distribution to a vtk file for
           debugging.

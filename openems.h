@@ -174,6 +174,8 @@ protected:
 #endif
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
+	bool m_numThreadsGiven; //!< --numThreads was given, 0 (calibrate) included
+	std::string m_cpuCoresOption; //!< --cpu-cores; empty where not given
 
 	//! --gpu-temporal-block, --gpu-temporal-block-mb, --avx2-temporal-block;
 	//! empty or 0 where not given.
