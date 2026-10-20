@@ -183,6 +183,12 @@ protected:
 	//! Hand the temporal-blocking options to the engine just created.
 	void ApplyTemporalBlockingOptions();
 
+	//! --benchmark: measure the engine's temporal-blocking schedules instead of simulating.
+	bool m_benchmark;
+	unsigned int m_benchmarkTS; //!< --benchmark-timesteps; 0 = about 3 s of the flat sweep
+	//! The --engine value that selects the engine in use.
+	std::string EngineOptionValue() const;
+
 	//! Setup an operator matching the requested engine
 	virtual bool SetupOperator();
 

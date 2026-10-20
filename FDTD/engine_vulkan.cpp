@@ -4599,7 +4599,8 @@ TemporalBlockingPlan Engine_Vulkan::PlanTemporalBlocking(const TemporalBlockingR
 	// (PERFORMANCE.md §5.5).  Whether a GPU can use that cache at all is not
 	// queryable either and depends on the SoC -- the Vega 7 cannot, and
 	// Intel's GPUs left the CPU's ring with Meteor Lake -- but a tile its
-	// cache cannot hold costs only the wedges: under 1 % on the Vega 7.
+	// cache cannot hold costs only the wedges: about 1 % on the Vega 7.
+	// --benchmark measures the schedules where the guess matters.
 	uint64_t target = (uint64_t)req.targetMB << 20;
 	unsigned int llcMB = 0;
 	if (target == 0 && integrated)

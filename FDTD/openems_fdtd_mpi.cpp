@@ -437,6 +437,11 @@ void openEMS_FDTD_MPI::RunFDTD()
 {
 	if (!m_MPI_Enabled)
 		return openEMS::RunFDTD();
+	if (m_benchmark)
+	{
+		cerr << "openEMS_FDTD_MPI: --benchmark is not supported with MPI; not running" << endl;
+		return;
+	}
 
 	cout << "Running MPI-FDTD engine... this may take a while... grab a cup of coffee?!?" << endl;
 

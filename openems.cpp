@@ -24,6 +24,8 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <filesystem>
+#include <memory>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -42,6 +44,7 @@
 #include "FDTD/extensions/engine_ext_steadystate.h"
 #include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/engine_interface_cylindrical_fdtd.h"
+#include "FDTD/schedule_benchmark.h"
 #if OPENEMS_ENABLE_AVX2
 #include "FDTD/operator_avx2.h"
 #include "FDTD/operator_avx2_multithread.h"
@@ -101,6 +104,8 @@ openEMS::openEMS()
 #endif
 	m_engine_numThreads = 0;
 	m_gpuTBMBOption = 0;
+	m_benchmark = false;
+	m_benchmarkTS = 0;
 
 	m_Abort = false;
 	m_Exc = 0;
@@ -390,6 +395,27 @@ openEMS::optionDesc()
 	);
 #endif
 
+	optdesc.addBoolSwitch("benchmark",
+		[this](bool val)
+		{
+			m_benchmark = val;
+			if (val)
+				cout << "openEMS - benchmark mode: measuring the engine's temporal-blocking "
+				        "schedules on this model instead of simulating it" << endl;
+		},
+		"Measure the engine's temporal-blocking schedules on this model, and "
+		"print the options that run it fastest, instead of simulating it. "
+		"Writes nothing into the simulation directory."
+	);
+
+	optdesc.addIntOption("benchmark-timesteps", 0,
+		[this](int val)
+		{
+			m_benchmarkTS = (val > 0) ? (unsigned int)val : 0;
+		},
+		"Timesteps per --benchmark run (default: about 3 s of the flat sweep)"
+	);
+
 	optdesc.addBoolSwitch("no-simulation",
 		[this](bool val)
 		{
@@ -429,6 +455,26 @@ void openEMS::SetLibraryArguments(std::vector<std::string> allOptions)
 {
 	collectCommandLineArguments();
 	g_settings.parseLibraryArguments(allOptions);
+}
+
+std::string openEMS::EngineOptionValue() const
+{
+	switch (m_engine)
+	{
+	case EngineType_Basic:               return "basic";
+	case EngineType_SSE:                 return "sse";
+	case EngineType_SSE_Compressed:      return "sse-compressed";
+	case EngineType_Multithreaded:       return "multithreaded";
+	case EngineType_AVX2:                return "avx2";
+	case EngineType_AVX2_Multithreaded:  return "avx2-multithreaded";
+#ifdef MPI_SUPPORT
+	case EngineType_MPI:                 return "MPI";
+#endif
+#ifdef WITH_GPU
+	case EngineType_GPU:                 return "gpu";
+#endif
+	}
+	return "fastest";
 }
 
 void openEMS::ApplyTemporalBlockingOptions()
@@ -791,7 +837,7 @@ bool openEMS::SetupProcessing()
 						cerr << "openEMS::SetupFDTD: unknown dump box type... skipping!" << endl;
 					if (ProcField)
 					{
-						ProcField->SetEnable(Enable_Dumps);
+						ProcField->SetEnable(Enable_Dumps && !m_benchmark);
 						ProcField->SetProcessInterval(Nyquist/m_OverSampling);
 						if (db->GetStopTime()>0 || db->GetStartTime()>0)
 							ProcField->SetProcessStartStopTime(db->GetStartTime(), db->GetStopTime());
@@ -1531,8 +1577,11 @@ int openEMS::SetupFDTD()
 
 	if (!m_Exc->buildExcitationSignal(NrTS))
 		exit(2);
-	m_Exc->DumpVoltageExcite("et");
-	m_Exc->DumpCurrentExcite("ht");
+	if (!m_benchmark)
+	{
+		m_Exc->DumpVoltageExcite("et");
+		m_Exc->DumpCurrentExcite("ht");
+	}
 
 	timeval OpDoneTime;
 	gettimeofday(&OpDoneTime,NULL);
@@ -1660,6 +1709,56 @@ void openEMS::RunFDTD()
 {
 	cout << "Running FDTD engine... this may take a while... grab a cup of coffee?!?" << endl;
 
+	// --benchmark measures the schedules on this model and writes nothing into
+	// the simulation directory: the probes stay, since they set the batch
+	// lengths, but write into a scratch directory removed afterwards, and the
+	// run's length and end criterion give way to the benchmark's.
+	struct BenchmarkScope
+	{
+		std::filesystem::path home, scratch;
+		unsigned int* nrTS = nullptr;
+		unsigned int savedNrTS = 0;
+		double* endCrit = nullptr;
+		double savedEndCrit = 0;
+		~BenchmarkScope()
+		{
+			std::error_code ec;
+			if (!scratch.empty())
+			{
+				std::filesystem::current_path(home, ec);
+				std::filesystem::remove_all(scratch, ec);
+			}
+			if (nrTS)
+				*nrTS = savedNrTS;
+			if (endCrit)
+				*endCrit = savedEndCrit;
+		}
+	} benchScope;
+	if (m_benchmark)
+	{
+		std::error_code ec;
+		benchScope.home = std::filesystem::current_path(ec);
+		const std::filesystem::path scratch = std::filesystem::temp_directory_path(ec) /
+			("openEMS-benchmark-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+		if (!ec && std::filesystem::create_directory(scratch, ec) && !ec)
+		{
+			benchScope.scratch = scratch;
+			std::filesystem::current_path(scratch, ec);
+		}
+		if (ec || benchScope.scratch.empty())
+		{
+			cerr << "RunFDTD: --benchmark needs a scratch directory and could not make "
+			     << scratch << ": " << ec.message() << endl;
+			return;
+		}
+		benchScope.nrTS = &NrTS;
+		benchScope.savedNrTS = NrTS;
+		benchScope.endCrit = &endCrit;
+		benchScope.savedEndCrit = endCrit;
+		NrTS = 2000000000u;
+		endCrit = -1;
+	}
+
 	Signal::SetupHandlerForSIGINT(SIGNAL_EXIT_GRACEFUL);
 
 	//special handling of a field processing, needed to realize the end criteria...
@@ -1719,6 +1818,12 @@ void openEMS::RunFDTD()
 
 	int prevTS=0,currTS=0;
 	double numCells = FDTD_Op->GetNumberCells();
+	std::unique_ptr<ScheduleBenchmark> bench;
+	if (m_benchmark)
+		bench.reset(new ScheduleBenchmark(FDTD_Eng, numCells, m_benchmarkTS));
+	// The benchmark prints its own lines instead of the status every 4 s.
+	std::ostream nullOut(nullptr);
+	std::ostream& status = bench ? nullOut : cout;
 	double speed = 0;
 	double t_diff;
 	double t_run;
@@ -1748,6 +1853,11 @@ void openEMS::RunFDTD()
 
 		int step=PA->Process();
 		if ((step<0) || (step>(int)NrTS)) step=NrTS;
+		if (bench)
+		{
+			bench->NoteInterval(step);
+			step = bench->Clamp(step, FDTD_Eng->GetNumberOfTimesteps());
+		}
 
 #ifdef WITH_GPU
 	bool hasFieldDumps = false;
@@ -1836,6 +1946,10 @@ void openEMS::RunFDTD()
 
 		while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
 		{
+			// Every iteration ends with the GPU drained, so the schedule can change here.
+			currTS = FDTD_Eng->GetNumberOfTimesteps();
+			if (bench && currTS >= bench->Boundary() && !bench->Advance(currTS))
+				break;
 			// Submit speculative timesteps (GPU starts, numTS NOT advanced).
 			// Auto mode uses PA->Process() cadence: submit up to the next processing
 			// horizon so probe gathers / dumps still happen on schedule.
@@ -1845,6 +1959,8 @@ void openEMS::RunFDTD()
 			if (step > 0 && speculativeNow > step) speculativeNow = step;
 			currTS = FDTD_Eng->GetNumberOfTimesteps();
 			int tsLeft = (int)(NrTS - currTS);
+			if (bench)
+				tsLeft = bench->Clamp(tsLeft, currTS);
 			if (speculativeNow > tsLeft) speculativeNow = tsLeft;
 			if (speculativeNow < 1) break;
 			// This call lands exactly on the next processing horizon iff
@@ -1866,6 +1982,8 @@ void openEMS::RunFDTD()
 			gpuEng->EnablePipelinedReading(true);
 			step = PA->Process();
 			gpuEng->EnablePipelinedReading(false);
+			if (bench)
+				bench->NoteInterval(step);
 
 			// Drain+commit speculative step(s) → advance numTS
 			gpuEng->DrainGPU();
@@ -1878,6 +1996,8 @@ void openEMS::RunFDTD()
 				int remaining = step - speculativeNow;
 				currTS = FDTD_Eng->GetNumberOfTimesteps();
 				if (remaining > (int)(NrTS - currTS)) remaining = NrTS - currTS;
+				if (bench)
+					remaining = bench->Clamp(remaining, currTS);
 				if (remaining > 0)
 				{
 					FDTD_Eng->IterateTS(remaining);
@@ -1916,8 +2036,8 @@ void openEMS::RunFDTD()
 			{
 				t_run = CalcDiffTime(currTime,startTime);
 				speed = numCells*(currTS-prevTS)/t_diff;
-				cout << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
-				cout << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
+				status << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
+				status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
 				if (Eng_Ext_SSD==NULL)
 				{
 					if (!sampleEnergy())
@@ -1926,14 +2046,14 @@ void openEMS::RunFDTD()
 						change = currE/maxE;
 					if (!validateChange())
 						break;
-					cout << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
+					status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
 				}
 				else
 				{
 					change = Eng_Ext_SSD->GetLastDiff();
 					if (!validateChange())
 						break;
-					cout << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
+					status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
 				}
 				prevTime=currTime;
 				prevTS=currTS;
@@ -1968,12 +2088,29 @@ void openEMS::RunFDTD()
 	// instead of blocking synchronously the moment a dump needs the data.
 	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !numericalFailure && !CheckAbortCond())
 	{
+		if (bench)
+		{
+			currTS = FDTD_Eng->GetNumberOfTimesteps();
+			if (currTS >= bench->Boundary())
+			{
+#ifdef WITH_GPU
+				// Time a run to its end, not to its last submit.
+				if (gpuEng)
+					gpuEng->DrainGPU();
+#endif
+				if (!bench->Advance(currTS))
+					break;
+			}
+			step = bench->Clamp(step, currTS);
+		}
 		FDTD_Eng->IterateTS(step);
 #ifdef WITH_GPU
 		if (gpuEng && hasFieldDumps && gpuEng->HasDumpTransferQueue())
 			gpuEng->BeginAsyncFieldDownload();
 #endif
 		step=PA->Process();
+		if (bench)
+			bench->NoteInterval(step);
 
 		if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
 		{
@@ -1993,8 +2130,8 @@ void openEMS::RunFDTD()
 		{
 			t_run = CalcDiffTime(currTime,startTime);
 			speed = numCells*(currTS-prevTS)/t_diff;
-			cout << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
-			cout << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
+			status << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
+			status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
 			if (Eng_Ext_SSD==NULL)
 			{
 				if (!sampleEnergy())
@@ -2003,14 +2140,14 @@ void openEMS::RunFDTD()
 					change = currE/maxE;
 				if (!validateChange())
 					break;
-				cout << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
+				status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
 			}
 			else
 			{
 				change = Eng_Ext_SSD->GetLastDiff();
 				if (!validateChange())
 					break;
-				cout << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
+				status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
 			}
 			prevTime=currTime;
 			prevTS=currTS;
@@ -2075,7 +2212,7 @@ void openEMS::RunFDTD()
 			cout << "RunFDTD: steady-state criterion reached; stopping simulation." << endl;
 	}
 
-	if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
+	if (!bench && (change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
 		cerr << "RunFDTD: Warning: Max. number of timesteps was reached before the end-criteria of -" << fabs(10.0*log10(endCrit)) << "dB was reached... " << endl << \
 				"\tYou may want to choose a higher number of max. timesteps... " << endl;
 
@@ -2096,6 +2233,20 @@ void openEMS::RunFDTD()
 
 	//*************** postproc ************//
 	PA->PostProcess();
+
+	if (bench)
+	{
+		std::string optionName;
+#ifdef WITH_GPU
+		if (gpuEng)
+			optionName = "gpu-temporal-block";
+#endif
+#if OPENEMS_ENABLE_AVX2
+		if (dynamic_cast<Engine_AVX2_Multithread*>(FDTD_Eng))
+			optionName = "avx2-temporal-block";
+#endif
+		bench->Report(cout, EngineOptionValue(), optionName);
+	}
 
 	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
 }
