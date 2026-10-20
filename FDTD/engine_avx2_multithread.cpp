@@ -18,7 +18,7 @@
 #include "engine_avx2_multithread.h"
 #include "extensions/engine_extension.h"
 #include "tools/denormal.h"
-#include "tools/cache_topology.h"
+#include "tools/cpu_topology.h"
 
 #include <algorithm>
 #include <cstdlib>

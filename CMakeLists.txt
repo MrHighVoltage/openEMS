@@ -192,19 +192,6 @@ else()
 endif()
 
 message(STATUS "Found package VTK. Using version " ${VTK_VERSION})
-option(WITH_HWLOC "Size AVX2 temporal-blocking tiles from the system hwloc's cache topology" ON)
-if (WITH_HWLOC)
-	find_package(PkgConfig QUIET)
-	if (PKG_CONFIG_FOUND)
-		pkg_check_modules(HWLOC QUIET IMPORTED_TARGET hwloc)
-	endif()
-	if (HWLOC_FOUND)
-		ADD_DEFINITIONS(-DOPENEMS_HAVE_HWLOC)
-		message(STATUS "Found hwloc ${HWLOC_VERSION}: cache topology from hwloc")
-	else()
-		message(STATUS "hwloc not found: cache topology from sysconf (one L3 instance)")
-	endif()
-endif()
 
 set( vtk_LIBS ${VTK_LIBRARIES} )
 message(STATUS "vtk libraries " ${vtk_LIBS})
@@ -293,10 +280,6 @@ TARGET_LINK_LIBRARIES( openEMS
   ${MPI_LIBRARIES}
   Threads::Threads
 )
-
-if (HWLOC_FOUND)
-  TARGET_LINK_LIBRARIES(openEMS PkgConfig::HWLOC)
-endif()
 
 if (WITH_GPU)
   TARGET_LINK_LIBRARIES(openEMS Vulkan::Vulkan)

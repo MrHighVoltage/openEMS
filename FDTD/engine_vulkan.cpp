@@ -32,7 +32,7 @@
 #include "Common/processing.h"
 #include "gpu_shader_spirv.h"
 #include "tools/constants.h"
-#include "tools/cache_topology.h"
+#include "tools/cpu_topology.h"
 
 #include <iostream>
 #include <cstring>
@@ -4605,9 +4605,12 @@ TemporalBlockingPlan Engine_Vulkan::PlanTemporalBlocking(const TemporalBlockingR
 	unsigned int llcMB = 0;
 	if (target == 0 && integrated)
 	{
+		// Only an L3: where the CPU's last level is its L2 (Apple, most ARM
+		// SoCs), that cache belongs to a cluster of cores, not to the GPU.
 		const LLC_Span llc = QueryLastLevelCaches(1);
-		llcMB = (unsigned int)(llc.instanceBytes >> 20);
-		target = llc.instanceBytes ? (uint64_t)(0.8 * (double)llc.instanceBytes) : 16ull << 20;
+		const uint64_t l3 = (llc.level >= 3) ? llc.instanceBytes : 0;
+		llcMB = (unsigned int)(l3 >> 20);
+		target = l3 ? (uint64_t)(0.8 * (double)l3) : 16ull << 20;
 	}
 	else if (target == 0)
 		target = 64ull << 20;
