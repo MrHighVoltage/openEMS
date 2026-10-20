@@ -184,10 +184,14 @@ protected:
 	std::string m_avx2TBOption;
 	//! Hand the temporal-blocking options to the engine just created.
 	void ApplyTemporalBlockingOptions();
+	//! The engine's temporal-blocking option, empty if it has none.
+	std::string TemporalBlockingOptionName() const;
+	//! Warn if the run leaves settings to their defaults that --benchmark would set.
+	void WarnUntunedSettings() const;
 
-	//! --benchmark: measure the engine's temporal-blocking schedules instead of simulating.
+	//! --benchmark: measure the settings the engine runs this model fastest with, instead of simulating.
 	bool m_benchmark;
-	unsigned int m_benchmarkTS; //!< --benchmark-timesteps; 0 = about 3 s of the flat sweep
+	unsigned int m_benchmarkTS; //!< --benchmark-timesteps; 0 = from the measured speed
 	//! The --engine value that selects the engine in use.
 	std::string EngineOptionValue() const;
 

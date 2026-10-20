@@ -17,6 +17,7 @@
 
 #include "openems.h"
 #include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -45,7 +46,7 @@
 #include "FDTD/extensions/engine_ext_steadystate.h"
 #include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/engine_interface_cylindrical_fdtd.h"
-#include "FDTD/schedule_benchmark.h"
+#include "FDTD/engine_benchmark.h"
 #include "tools/cpu_topology.h"
 #if OPENEMS_ENABLE_AVX2
 #include "FDTD/operator_avx2.h"
@@ -422,12 +423,13 @@ openEMS::optionDesc()
 		{
 			m_benchmark = val;
 			if (val)
-				cout << "openEMS - benchmark mode: measuring the engine's temporal-blocking "
-				        "schedules on this model instead of simulating it" << endl;
+				cout << "openEMS - benchmark mode: measuring the engine's settings "
+				        "on this model instead of simulating it" << endl;
 		},
-		"Measure the engine's temporal-blocking schedules on this model, and "
-		"print the options that run it fastest, instead of simulating it. "
-		"Writes nothing into the simulation directory."
+		"Measure the settings the engine runs this model fastest with -- "
+		"threads, cores, temporal-blocking schedule -- and print the options "
+		"for them, instead of simulating it. Writes nothing into the "
+		"simulation directory."
 	);
 
 	optdesc.addIntOption("benchmark-timesteps", 0,
@@ -435,7 +437,8 @@ openEMS::optionDesc()
 		{
 			m_benchmarkTS = (val > 0) ? (unsigned int)val : 0;
 		},
-		"Timesteps per --benchmark run (default: about 3 s of the flat sweep)"
+		"Timesteps per --benchmark run of a schedule (default: about 2 s of "
+		"the fastest thread setting; on a GPU 3 s of the flat sweep)"
 	);
 
 	optdesc.addBoolSwitch("no-simulation",
@@ -548,6 +551,48 @@ void openEMS::ApplyTemporalBlockingOptions()
 	if (!m_avx2TBOption.empty())
 		cerr << "openEMS - --avx2-temporal-block ignored: built without the AVX2 engines" << endl;
 #endif
+}
+
+std::string openEMS::TemporalBlockingOptionName() const
+{
+#ifdef WITH_GPU
+	if (dynamic_cast<Engine_Vulkan*>(FDTD_Eng))
+		return "gpu-temporal-block";
+#endif
+#if OPENEMS_ENABLE_AVX2
+	if (dynamic_cast<Engine_AVX2_Multithread*>(FDTD_Eng))
+		return "avx2-temporal-block";
+#endif
+	return "";
+}
+
+void openEMS::WarnUntunedSettings() const
+{
+	// The options --benchmark prints, where the run leaves them to defaults.
+	std::vector<std::string> unset;
+	if (FDTD_Eng->GetNumThreads() > 0)
+	{
+		if (!m_numThreadsGiven)
+			unset.push_back("--numThreads");
+		if (m_cpuCoresOption.empty() && CpuTopology::Get().DistinctSets().size() > 1)
+			unset.push_back("--cpu-cores");
+	}
+	const std::string tb = TemporalBlockingOptionName();
+	if (!tb.empty())
+	{
+		std::string env = "OPENEMS_" + tb;
+		std::transform(env.begin(), env.end(), env.begin(), [](char c) {return c == '-' ? '_' : (char)std::toupper(c);});
+		const std::string& option = (tb == "gpu-temporal-block") ? m_gpuTBOption : m_avx2TBOption;
+		if (option.empty() && !std::getenv(env.c_str()))
+			unset.push_back("--" + tb);
+	}
+	if (unset.empty())
+		return;
+	cerr << "openEMS - Warning: running on default performance settings, not on ones tuned for this model and machine (";
+	for (size_t i = 0; i < unset.size(); ++i)
+		cerr << (i ? ", " : "") << unset[i];
+	cerr << " not set)." << endl
+	     << "\tMore speed may be possible: --benchmark measures the settings on this model and prints the options to use." << endl;
 }
 
 void openEMS::SetNumberOfThreads(int val)
@@ -1669,6 +1714,8 @@ int openEMS::SetupFDTD()
 		else
 			cerr << "openEMS - --cpu-cores ignored: this engine has no worker threads to place" << endl;
 	}
+	if (!m_benchmark)
+		WarnUntunedSettings();
 	if (gpuStartupTrace)
 	{
 		auto engCreateEnd = std::chrono::steady_clock::now();
@@ -1859,9 +1906,10 @@ void openEMS::RunFDTD()
 
 	int prevTS=0,currTS=0;
 	double numCells = FDTD_Op->GetNumberCells();
-	std::unique_ptr<ScheduleBenchmark> bench;
+	std::unique_ptr<EngineBenchmark> bench;
 	if (m_benchmark)
-		bench.reset(new ScheduleBenchmark(FDTD_Eng, numCells, m_benchmarkTS));
+		bench.reset(new EngineBenchmark(FDTD_Eng, numCells, m_benchmarkTS,
+		                                m_numThreadsGiven ? m_engine_numThreads : 0));
 	// The benchmark prints its own lines instead of the status every 4 s.
 	std::ostream nullOut(nullptr);
 	std::ostream& status = bench ? nullOut : cout;
@@ -2276,18 +2324,7 @@ void openEMS::RunFDTD()
 	PA->PostProcess();
 
 	if (bench)
-	{
-		std::string optionName;
-#ifdef WITH_GPU
-		if (gpuEng)
-			optionName = "gpu-temporal-block";
-#endif
-#if OPENEMS_ENABLE_AVX2
-		if (dynamic_cast<Engine_AVX2_Multithread*>(FDTD_Eng))
-			optionName = "avx2-temporal-block";
-#endif
-		bench->Report(cout, EngineOptionValue(), optionName);
-	}
+		bench->Report(cout, EngineOptionValue(), TemporalBlockingOptionName());
 
 	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
 }

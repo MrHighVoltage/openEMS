@@ -657,11 +657,13 @@ cdef class openEMS:
           CPU's L3 cache on an integrated one)
         * avx2_temporal_block (str) -- the same for the avx2-multithreaded
           engine: 'off' (default), '<k>' or '<k>:<W>'
-        * benchmark (bool) -- instead of simulating, measure the engine's
-          temporal-blocking schedules on this model and print the options
-          that run it fastest; writes nothing into sim_path
-        * benchmark_timesteps (int) -- timesteps per benchmark run (default:
-          about 3 s of the flat sweep)
+        * benchmark (bool) -- instead of simulating, measure the settings
+          the engine runs this model fastest with (threads, cores,
+          temporal-blocking schedule) and print the options for them;
+          writes nothing into sim_path
+        * benchmark_timesteps (int) -- timesteps per benchmark run of a
+          schedule (default: about 2 s of the fastest thread setting; on a
+          GPU 3 s of the flat sweep)
         """
         if cleanup and os.path.exists(sim_path):
             self._cleanup_sim_path(sim_path, verbose=kw.get('verbose'))

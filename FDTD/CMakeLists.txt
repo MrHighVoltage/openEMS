@@ -45,7 +45,7 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_sse_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_cylindrical_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/temporal_blocking.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/schedule_benchmark.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_benchmark.cpp
   ${AVX2_SOURCES}
   PARENT_SCOPE
 )
