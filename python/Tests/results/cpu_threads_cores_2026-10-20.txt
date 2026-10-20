@@ -1,0 +1,503 @@
+Threads and cores in --benchmark, and a portable CPU topology (2026-10-20)
+==========================================================================
+
+Build: portable bundle (python/Tests/build_portable_bench_gpu.sh) of the tree
+that became the commits after 7cd7231; its banner still says g7cd7231.
+Model: tests/gpuprof cases/tl_skin_sub1.xml (5.03 M cells), as in §5.7-5.9.
+Hosts: cytex (i9-13900K, RX 6800, UHD 770), srv002 (i7-6700K), srv003
+(Ryzen 5 5600G). One simulation at a time per host. Barrier spin 0 (default).
+
+1. tools/cpu_topology: real machines, fake sysfs trees, Windows and ARM64
+-------------------------------------------------------------------------
+tests/topology/topo_test.cpp; fixtures from tests/topology/make_fixtures.py.
+"restrict" lines start a thread, restrict it to the set and read back its
+affinity.
+
+## Linux x86-64 (cytex), real machine
+describe: 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+kinds: 2, cores: 24, cpus: 32
+set performance: 8 performance cores; max 8; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6 8 10 12 14
+set performance+smt: 8 performance cores, 16 threads; max 16; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+set efficiency: 16 efficiency cores; max 16; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set physical: 24 cores; max 24; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6 8 10 12 14 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set all: 24 cores, 32 threads; max 32; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+LLC for 1 thread: 1 x 36864 KB
+main thread: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 
+restrict performance: ok -> 0 2 4 6 8 10 12 14 
+restrict performance+smt: ok -> 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 
+restrict efficiency: ok -> 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 
+restrict physical: ok -> 0 2 4 6 8 10 12 14 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 
+restrict all: ok -> 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 
+offers efficiency: 1
+
+## same, under taskset -c 0-7
+describe: 4 cores (8 threads); L3 1 x 36 MB (sysfs)
+kinds: 1, cores: 4, cpus: 8
+set physical: 4 cores; max 4; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6
+set all: 4 cores, 8 threads; max 8; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 1 2 3 4 5 6 7
+
+## fixture i13900k
+describe: 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+kinds: 2, cores: 24, cpus: 32
+set performance: 8 performance cores; max 8; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6 8 10 12 14
+set performance+smt: 8 performance cores, 16 threads; max 16; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+set efficiency: 16 efficiency cores; max 16; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set physical: 24 cores; max 24; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6 8 10 12 14 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set all: 24 cores, 32 threads; max 32; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+LLC for 1 thread: 1 x 36864 KB
+
+## fixture i13900k_nopmu
+describe: 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+kinds: 2, cores: 24, cpus: 32
+set performance: 8 performance cores; max 8; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6 8 10 12 14
+set performance+smt: 8 performance cores, 16 threads; max 16; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+set efficiency: 16 efficiency cores; max 16; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set physical: 24 cores; max 24; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6 8 10 12 14 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set all: 24 cores, 32 threads; max 32; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+LLC for 1 thread: 1 x 36864 KB
+
+## fixture rk3588
+describe: 4 performance cores + 4 efficiency cores; L3 1 x 3 MB (sysfs)
+kinds: 2, cores: 8, cpus: 8
+set performance: 4 performance cores; max 4; LLC L3 1 x 3072 KB = 3072 KB (sysfs); cpus 4 5 6 7
+set efficiency: 4 efficiency cores; max 4; LLC L3 1 x 3072 KB = 3072 KB (sysfs); cpus 0 1 2 3
+set all: 8 cores; max 8; LLC L3 1 x 3072 KB = 3072 KB (sysfs); cpus 0 1 2 3 4 5 6 7
+LLC for 1 thread: 1 x 3072 KB
+
+## fixture arm3tier
+describe: 1 performance core + 4 mid-1 cores + 3 efficiency cores; L3 1 x 8 MB (sysfs)
+kinds: 3, cores: 8, cpus: 8
+set performance: 1 performance core; max 1; LLC L3 1 x 8192 KB = 8192 KB (sysfs); cpus 7
+set efficiency: 3 efficiency cores; max 3; LLC L3 1 x 8192 KB = 8192 KB (sysfs); cpus 0 1 2
+set all: 8 cores; max 8; LLC L3 1 x 8192 KB = 8192 KB (sysfs); cpus 0 1 2 3 4 5 6 7
+LLC for 1 thread: 1 x 8192 KB
+
+## fixture r7950x3d
+describe: 16 cores (32 threads); L3 1 x 96 MB + 1 x 32 MB (sysfs)
+kinds: 1, cores: 16, cpus: 32
+set physical: 16 cores; max 16; LLC L3 2 x 98304 KB = 131072 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+set all: 16 cores, 32 threads; max 32; LLC L3 2 x 98304 KB = 131072 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+LLC for 1 thread: 1 x 98304 KB
+
+## fixture hx370
+describe: 4 performance cores (8 threads) + 8 efficiency cores (16 threads); L3 1 x 16 MB + 1 x 8 MB (sysfs)
+kinds: 2, cores: 12, cpus: 24
+set performance: 4 performance cores; max 4; LLC L3 1 x 16384 KB = 16384 KB (sysfs); cpus 0 1 2 3
+set performance+smt: 4 performance cores, 8 threads; max 8; LLC L3 1 x 16384 KB = 16384 KB (sysfs); cpus 0 1 2 3 12 13 14 15
+set efficiency: 8 efficiency cores; max 8; LLC L3 1 x 8192 KB = 8192 KB (sysfs); cpus 4 5 6 7 8 9 10 11
+set efficiency+smt: 8 efficiency cores, 16 threads; max 16; LLC L3 1 x 8192 KB = 8192 KB (sysfs); cpus 4 5 6 7 8 9 10 11 16 17 18 19 20 21 22 23
+set physical: 12 cores; max 12; LLC L3 2 x 16384 KB = 24576 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11
+set all: 12 cores, 24 threads; max 24; LLC L3 2 x 16384 KB = 24576 KB (sysfs); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+LLC for 1 thread: 1 x 16384 KB
+
+## fixture armnocache
+describe: 16 cores; last-level cache unknown (sysfs)
+kinds: 1, cores: 16, cpus: 16
+set all: 16 cores; max 16; LLC L0 0 x 0 KB = 0 KB (unknown); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+LLC for 1 thread: 0 x 0 KB
+
+## Windows x64 build (MinGW-w64, Debian bookworm), under Wine on cytex
+describe: 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (Windows)
+kinds: 2, cores: 24, cpus: 32
+set performance: 8 performance cores; max 8; LLC L3 1 x 36864 KB = 36864 KB (Windows); cpus 0 2 4 6 8 10 12 14
+set performance+smt: 8 performance cores, 16 threads; max 16; LLC L3 1 x 36864 KB = 36864 KB (Windows); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+set efficiency: 16 efficiency cores; max 16; LLC L3 1 x 36864 KB = 36864 KB (Windows); cpus 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set physical: 24 cores; max 24; LLC L3 1 x 36864 KB = 36864 KB (Windows); cpus 0 2 4 6 8 10 12 14 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+set all: 24 cores, 32 threads; max 32; LLC L3 1 x 36864 KB = 36864 KB (Windows); cpus 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+LLC for 1 thread: 1 x 36864 KB
+main thread: group 0 mask 0xffffffff
+restrict performance: ok -> group 0 mask 0x5555
+restrict performance+smt: ok -> group 0 mask 0xffff
+restrict efficiency: ok -> group 0 mask 0xffff0000
+restrict physical: ok -> group 0 mask 0xffff5555
+restrict all: ok -> group 0 mask 0xffffffff
+offers efficiency: 1
+
+## Linux arm64 build (Debian bookworm, g++), under qemu-user
+aarch64
+describe: 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+kinds: 2, cores: 24, cpus: 32
+set performance: 8 performance cores; max 8; LLC L3 1 x 36864 KB = 36864 KB (sysfs); cpus 0 2 4 6 8 10 12 14
+=== rk3588
+describe: 4 performance cores + 4 efficiency cores; L3 1 x 3 MB (sysfs)
+kinds: 2, cores: 8, cpus: 8
+=== arm3tier
+describe: 1 performance core + 4 mid-1 cores + 3 efficiency cores; L3 1 x 8 MB (sysfs)
+kinds: 3, cores: 8, cpus: 8
+=== armnocache
+describe: 16 cores; last-level cache unknown (sysfs)
+kinds: 1, cores: 16, cpus: 16
+arm64 rc=0
+
+2. Bit-identity of the thread and core options (tests/gpuprof/identity_threads.py)
+---------------------------------------------------------------------------------
+TL model with the excitation pushed up and full E/H dumps every ~100
+timesteps (tblock_identity.py's build_xml), 600 timesteps; every dump of every
+variant against the previous build's (7cd7231) flat run on 8 threads.
+
+  ref flat 8 threads                       flat                   406.68 MC/s  reference
+  new flat 8 threads                       flat                   413.48 MC/s  identical
+  new flat calibrated                      flat cal=6             386.18 MC/s  identical
+  new 18:37 8 performance                  k=18 W=37             1473.46 MC/s  identical
+  new 16 calibrated (blocked)              k=16 W=37 cal=6       1067.86 MC/s  identical
+  new 8:16 12 performance+smt              k=8 W=16              1033.49 MC/s  identical
+  new 16 16 efficiency                     k=16 W=37             971.429 MC/s  identical
+  new 16 physical calibrated               k=16 W=37 cal=8       1116.29 MC/s  identical
+  ref multithreaded 4                      flat                   371.72 MC/s  reference
+  new multithreaded 4 efficiency           flat                   281.07 MC/s  identical
+  new multithreaded 6 performance+smt      flat                   403.94 MC/s  identical
+all identical
+
+3. Normal runs on cytex (tests/gpuprof/verify_cpu_settings.sh, 2000 timesteps)
+------------------------------------------------------------------------------
+The lines under each run count the process's threads by the CPUs they may run
+on, read from /proc while the engine runs; the main thread keeps every CPU.
+Identity is section 2's: this model's port files hold only t=0 in 2000
+timesteps.
+
+=== default: 
+openEMS - Warning: running on default performance settings, not on ones tuned for this model and machine (--numThreads, --cpu-cores, --avx2-temporal-block not set).
+	More speed may be possible: --benchmark measures the settings on this model and prints the options to use.
+AVX2 Multithreaded Engine: Best performance found using 8 threads.
+Speed: 404.26 MCells/s 
+      9 openEMS 0-31
+=== tb16: --avx2-temporal-block=16
+openEMS - Warning: running on default performance settings, not on ones tuned for this model and machine (--numThreads, --cpu-cores not set).
+	More speed may be possible: --benchmark measures the settings on this model and prints the options to use.
+AVX2 Multithreaded Engine: Best performance found using 8 threads.
+AVX2 temporal blocking ACTIVE (prototype): k=16, tile width 37 x-lines, 17.6215 MB per tile, 7 tiles; L3 1 x 36 MB (sysfs); coefficient tables 116.159 MB; split by y-row, barrier elision on, barrier spin 0 us
+Speed: 1419.66 MCells/s 
+      9 openEMS 0-31
+=== rec: --numThreads=8 --cpu-cores=performance --avx2-temporal-block=18:37
+AVX2 temporal blocking ACTIVE (prototype): k=18, tile width 37 x-lines, 17.6215 MB per tile, 7 tiles; L3 1 x 36 MB (sysfs); coefficient tables 116.159 MB; split by y-row, barrier elision on, barrier spin 0 us
+openEMS - worker threads on the performance cores: 8 performance cores
+Speed: 1656.70 MCells/s 
+      8 openEMS 0,2,4,6,8,10,12,14
+      1 openEMS 0-31
+=== eff: --numThreads=16 --cpu-cores=efficiency --avx2-temporal-block=off
+openEMS - worker threads on the efficiency cores: 16 efficiency cores
+Speed: 336.06 MCells/s 
+      1 openEMS 0-31
+     16 openEMS 16-31
+=== bogus: --numThreads=4 --cpu-cores=bogus --avx2-temporal-block=off
+openEMS - ignoring --cpu-cores=bogus (expected all, physical, performance, performance+smt, efficiency or efficiency+smt)
+openEMS - Warning: running on default performance settings, not on ones tuned for this model and machine (--cpu-cores not set).
+	More speed may be possible: --benchmark measures the settings on this model and prints the options to use.
+Speed: 381.12 MCells/s 
+      5 openEMS 0-31
+
+4. --benchmark
+--------------
+
+### cytex, avx2-multithreaded
+Benchmark: warming up on the flat sweep...
+Benchmark: warm-up 2.0 s, flat 342.0 MC/s on 32 threads
+Benchmark: CPU 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+Benchmark threads   1 on performance      k=18 W=37        490.7 MC/s
+Benchmark threads   2 on performance      k=18 W=37        733.5 MC/s
+Benchmark threads   4 on performance      k=18 W=37       1090.0 MC/s
+Benchmark threads   8 on performance      k=18 W=37       1694.7 MC/s
+Benchmark threads   6 on performance      k=18 W=37       1449.1 MC/s
+Benchmark threads  16 on performance+smt  k=18 W=37       1544.2 MC/s
+Benchmark threads  12 on performance+smt  k=18 W=37       1482.6 MC/s
+Benchmark threads   1 on efficiency       k=18 W=37        245.3 MC/s
+Benchmark threads   2 on efficiency       k=18 W=37        438.3 MC/s
+Benchmark threads   4 on efficiency       k=18 W=37        767.7 MC/s
+Benchmark threads   8 on efficiency       k=18 W=37        936.7 MC/s
+Benchmark threads  16 on efficiency       k=18 W=37       1036.5 MC/s
+Benchmark threads  12 on efficiency       k=18 W=37       1017.7 MC/s
+Benchmark threads  16 on all              k=18 W=37       1258.6 MC/s
+Benchmark threads  12 on all              k=18 W=37       1337.9 MC/s
+Benchmark: 8 settings x 2 rounds of 680 timesteps
+Benchmark   1/16    8 on performance      flat             420.2 MC/s
+Benchmark   2/16    8 on performance      k=9 W=18        1284.6 MC/s
+Benchmark   3/16    8 on performance      k=13 W=26       1536.6 MC/s
+Benchmark   4/16    8 on performance      k=18 W=37       1706.3 MC/s
+Benchmark   5/16    8 on performance      k=26 W=52       1590.3 MC/s
+Benchmark   6/16    8 on performance      k=32 W=75        937.4 MC/s
+Benchmark   7/16    8 on performance      k=32 W=105       819.2 MC/s
+Benchmark   8/16   16 on performance+smt  k=18 W=37       1540.6 MC/s
+Benchmark   9/16   16 on performance+smt  k=18 W=37       1539.5 MC/s
+Benchmark  10/16    8 on performance      k=32 W=105       818.6 MC/s
+Benchmark  11/16    8 on performance      k=32 W=75        930.4 MC/s
+Benchmark  12/16    8 on performance      k=26 W=52       1592.4 MC/s
+Benchmark  13/16    8 on performance      k=18 W=37       1705.3 MC/s
+Benchmark  14/16    8 on performance      k=13 W=26       1538.2 MC/s
+Benchmark  15/16    8 on performance      k=9 W=18        1284.4 MC/s
+Benchmark  16/16    8 on performance      flat             420.1 MC/s
+Benchmark results (--engine=avx2-multithreaded): 5.03 M cells; probes kept, field dumps off
+  CPU: 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+
+  threads  cores              schedule          MC/s
+        1  performance        k=18 W=37        490.7
+        2  performance        k=18 W=37        733.5
+        4  performance        k=18 W=37       1090.0
+        6  performance        k=18 W=37       1449.1
+        8  performance        k=18 W=37       1694.7   best
+       12  performance+smt    k=18 W=37       1482.6
+       16  performance+smt    k=18 W=37       1544.2
+        1  efficiency         k=18 W=37        245.3
+        2  efficiency         k=18 W=37        438.3
+        4  efficiency         k=18 W=37        767.7
+        8  efficiency         k=18 W=37        936.7
+       12  efficiency         k=18 W=37       1017.7
+       16  efficiency         k=18 W=37       1036.5
+       12  all                k=18 W=37       1337.9
+       16  all                k=18 W=37       1258.6
+  performance        = 8 performance cores
+  performance+smt    = 8 performance cores, 16 threads
+  efficiency         = 16 efficiency cores
+  all                = 24 cores, 32 threads
+
+  680 timesteps per run, 2 rounds:
+  threads  cores              schedule         tile      MC/s   round 1   round 2    vs flat
+        8  performance        flat                 -     420.1     420.2     420.1          -   configured schedule
+        8  performance        k=9 W=18          9 MB    1284.5    1284.6    1284.4   +205.7 %
+        8  performance        k=13 W=26        12 MB    1537.4    1536.6    1538.2   +265.9 %
+        8  performance        k=18 W=37        18 MB    1705.8    1706.3    1705.3   +306.0 %
+        8  performance        k=26 W=52        25 MB    1591.4    1590.3    1592.4   +278.8 %
+        8  performance        k=32 W=75        36 MB     933.9     937.4     930.4   +122.3 %
+        8  performance        k=32 W=105       50 MB     818.9     819.2     818.6    +94.9 %
+       16  performance+smt    k=18 W=37        18 MB    1540.0    1540.6    1539.5   +266.5 %
+
+  Fastest: 8 threads on performance, k=18 W=37, 1705.8 MC/s, 4.06x the flat sweep.
+  The configured schedule (flat, on these threads): 420.1 MC/s, 75.4 % below the recommendation.
+  To run this model with the recommendation on this machine:
+    openEMS <model.xml> --engine=avx2-multithreaded --numThreads=8 --cpu-cores=performance --avx2-temporal-block=18:37
+    FDTD.Run(sim_path, engine='avx2-multithreaded', numThreads=8, cpu_cores='performance', avx2_temporal_block='18:37')
+rc=0 files left: tl.xml 
+
+### cytex, multithreaded
+Benchmark: warming up on the flat sweep...
+Benchmark: warm-up 2.2 s, flat 330.2 MC/s on 32 threads
+Benchmark: CPU 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+Benchmark threads   1 on performance      flat             250.3 MC/s
+Benchmark threads   2 on performance      flat             323.1 MC/s
+Benchmark threads   4 on performance      flat             371.5 MC/s
+Benchmark threads   8 on performance      flat             413.9 MC/s
+Benchmark threads   6 on performance      flat             410.2 MC/s
+Benchmark threads  16 on performance+smt  flat             353.5 MC/s
+Benchmark threads  12 on performance+smt  flat             364.9 MC/s
+Benchmark threads   1 on efficiency       flat             111.7 MC/s
+Benchmark threads   2 on efficiency       flat             187.7 MC/s
+Benchmark threads   4 on efficiency       flat             273.1 MC/s
+Benchmark threads   8 on efficiency       flat             299.8 MC/s
+Benchmark threads  16 on efficiency       flat             324.8 MC/s
+Benchmark threads  12 on efficiency       flat             320.6 MC/s
+Benchmark threads  16 on all              flat             336.3 MC/s
+Benchmark threads  12 on all              flat             342.8 MC/s
+Benchmark: 2 settings x 2 rounds of 170 timesteps
+Benchmark   1/4    6 on performance      flat             410.8 MC/s
+Benchmark   2/4    8 on performance      flat             410.1 MC/s
+Benchmark   3/4    8 on performance      flat             413.8 MC/s
+Benchmark   4/4    6 on performance      flat             410.0 MC/s
+Benchmark results (--engine=multithreaded): 5.03 M cells; probes kept, field dumps off
+  CPU: 8 performance cores (16 threads) + 16 efficiency cores; L3 1 x 36 MB (sysfs)
+
+  threads  cores              schedule          MC/s
+        1  performance        flat             250.3
+        2  performance        flat             323.1
+        4  performance        flat             371.5
+        6  performance        flat             410.2   best
+        8  performance        flat             413.9
+       12  performance+smt    flat             364.9
+       16  performance+smt    flat             353.5
+        1  efficiency         flat             111.7
+        2  efficiency         flat             187.7
+        4  efficiency         flat             273.1
+        8  efficiency         flat             299.8
+       12  efficiency         flat             320.6
+       16  efficiency         flat             324.8
+       12  all                flat             342.8
+       16  all                flat             336.3
+  performance        = 8 performance cores
+  performance+smt    = 8 performance cores, 16 threads
+  efficiency         = 16 efficiency cores
+  all                = 24 cores, 32 threads
+
+  170 timesteps per run, 2 rounds:
+  threads  cores              schedule         tile      MC/s   round 1   round 2    vs flat
+        6  performance        flat                 -     410.4     410.8     410.0          -   configured schedule
+        8  performance        flat                 -     412.0     410.1     413.8          -
+
+  Fastest: 8 threads on performance, flat, 412.0 MC/s.
+  Recommended: 6 threads on performance, flat, 410.4 MC/s, within 1 % of the fastest on fewer threads.
+  To run this model with the recommendation on this machine:
+    openEMS <model.xml> --engine=multithreaded --numThreads=6 --cpu-cores=performance
+    FDTD.Run(sim_path, engine='multithreaded', numThreads=6, cpu_cores='performance')
+rc=0 files left: tl.xml 
+
+### srv002 (i7-6700K), avx2-multithreaded
+Benchmark: warming up on the flat sweep...
+Benchmark: warm-up 2.1 s, flat 221.4 MC/s on 8 threads
+Benchmark: CPU 4 cores (8 threads); L3 1 x 8 MB (sysfs)
+Benchmark threads   1 on physical         k=4 W=8          259.2 MC/s
+Benchmark threads   2 on physical         k=4 W=8          362.6 MC/s
+Benchmark threads   4 on physical         k=4 W=8          409.9 MC/s
+Benchmark threads   3 on physical         k=4 W=8          400.0 MC/s
+Benchmark threads   8 on all              k=4 W=8          348.9 MC/s
+Benchmark threads   6 on all              k=4 W=8          367.8 MC/s
+Benchmark: 8 settings x 2 rounds of 170 timesteps
+Benchmark   1/16    4 on physical         flat             258.8 MC/s
+Benchmark   2/16    4 on physical         k=2 W=4          298.1 MC/s
+Benchmark   3/16    4 on physical         k=2 W=5          320.5 MC/s
+Benchmark   4/16    4 on physical         k=4 W=8          403.2 MC/s
+Benchmark   5/16    4 on physical         k=5 W=11         372.9 MC/s
+Benchmark   6/16    4 on physical         k=8 W=16         361.8 MC/s
+Benchmark   7/16    4 on physical         k=11 W=23        320.1 MC/s
+Benchmark   8/16    3 on physical         k=4 W=8          398.3 MC/s
+Benchmark   9/16    3 on physical         k=4 W=8          399.7 MC/s
+Benchmark  10/16    4 on physical         k=11 W=23        320.6 MC/s
+Benchmark  11/16    4 on physical         k=8 W=16         360.7 MC/s
+Benchmark  12/16    4 on physical         k=5 W=11         420.4 MC/s
+Benchmark  13/16    4 on physical         k=4 W=8          407.1 MC/s
+Benchmark  14/16    4 on physical         k=2 W=5          320.3 MC/s
+Benchmark  15/16    4 on physical         k=2 W=4          297.4 MC/s
+Benchmark  16/16    4 on physical         flat             254.9 MC/s
+Benchmark results (--engine=avx2-multithreaded): 5.03 M cells; probes kept, field dumps off
+  CPU: 4 cores (8 threads); L3 1 x 8 MB (sysfs)
+
+  threads  cores              schedule          MC/s
+        1  physical           k=4 W=8          259.2
+        2  physical           k=4 W=8          362.6
+        3  physical           k=4 W=8          400.0
+        4  physical           k=4 W=8          409.9   best
+        6  all                k=4 W=8          367.8
+        8  all                k=4 W=8          348.9
+  physical           = 4 cores
+  all                = 4 cores, 8 threads
+
+  170 timesteps per run, 2 rounds:
+  threads  cores              schedule         tile      MC/s   round 1   round 2    vs flat
+        4  physical           flat                 -     256.9     258.8     254.9          -   configured schedule
+        4  physical           k=2 W=4           2 MB     297.8     298.1     297.4    +15.9 %
+        4  physical           k=2 W=5           2 MB     320.4     320.5     320.3    +24.7 %
+        4  physical           k=4 W=8           4 MB     405.1     403.2     407.1    +57.7 %
+        4  physical           k=5 W=11          5 MB     396.7     372.9     420.4    +54.4 %
+        4  physical           k=8 W=16          8 MB     361.3     361.8     360.7    +40.6 %
+        4  physical           k=11 W=23        11 MB     320.4     320.1     320.6    +24.7 %
+        3  physical           k=4 W=8           4 MB     399.0     398.3     399.7    +55.3 %
+
+  Fastest: 4 threads on physical, k=4 W=8, 405.1 MC/s, 1.58x the flat sweep.
+  The configured schedule (flat, on these threads): 256.9 MC/s, 36.6 % below the recommendation.
+  The rounds differ by up to 12.0 % (other load, or clocks drifting): differences below that are noise.
+  To run this model with the recommendation on this machine:
+    openEMS <model.xml> --engine=avx2-multithreaded --numThreads=4 --cpu-cores=physical --avx2-temporal-block=4:8
+    FDTD.Run(sim_path, engine='avx2-multithreaded', numThreads=4, cpu_cores='physical', avx2_temporal_block='4:8')
+rc=0 files left: tl.xml 
+
+### srv003 (Ryzen 5 5600G), avx2-multithreaded
+Benchmark: warming up on the flat sweep...
+Benchmark: warm-up 2.0 s, flat 288.6 MC/s on 12 threads
+Benchmark: CPU 6 cores (12 threads); L3 1 x 16 MB (sysfs)
+Benchmark threads   1 on physical         k=8 W=16         391.6 MC/s
+Benchmark threads   2 on physical         k=8 W=16         478.3 MC/s
+Benchmark threads   4 on physical         k=8 W=16         684.6 MC/s
+Benchmark threads   6 on physical         k=8 W=16         760.2 MC/s
+Benchmark threads   5 on physical         k=8 W=16         739.1 MC/s
+Benchmark threads  12 on all              k=8 W=16         622.1 MC/s
+Benchmark threads   9 on all              k=8 W=16         650.8 MC/s
+Benchmark: 8 settings x 2 rounds of 310 timesteps
+Benchmark   1/16    6 on physical         flat             307.7 MC/s
+Benchmark   2/16    6 on physical         k=4 W=8          529.4 MC/s
+Benchmark   3/16    6 on physical         k=5 W=11         627.5 MC/s
+Benchmark   4/16    6 on physical         k=8 W=16         787.9 MC/s
+Benchmark   5/16    6 on physical         k=11 W=23        828.6 MC/s
+Benchmark   6/16    6 on physical         k=16 W=33        605.0 MC/s
+Benchmark   7/16    6 on physical         k=23 W=47        484.9 MC/s
+Benchmark   8/16    5 on physical         k=8 W=16         769.4 MC/s
+Benchmark   9/16    5 on physical         k=8 W=16         772.0 MC/s
+Benchmark  10/16    6 on physical         k=23 W=47        484.9 MC/s
+Benchmark  11/16    6 on physical         k=16 W=33        608.7 MC/s
+Benchmark  12/16    6 on physical         k=11 W=23        830.9 MC/s
+Benchmark  13/16    6 on physical         k=8 W=16         802.1 MC/s
+Benchmark  14/16    6 on physical         k=5 W=11         637.0 MC/s
+Benchmark  15/16    6 on physical         k=4 W=8          538.9 MC/s
+Benchmark  16/16    6 on physical         flat             310.0 MC/s
+Benchmark results (--engine=avx2-multithreaded): 5.03 M cells; probes kept, field dumps off
+  CPU: 6 cores (12 threads); L3 1 x 16 MB (sysfs)
+
+  threads  cores              schedule          MC/s
+        1  physical           k=8 W=16         391.6
+        2  physical           k=8 W=16         478.3
+        4  physical           k=8 W=16         684.6
+        5  physical           k=8 W=16         739.1
+        6  physical           k=8 W=16         760.2   best
+        9  all                k=8 W=16         650.8
+       12  all                k=8 W=16         622.1
+  physical           = 6 cores
+  all                = 6 cores, 12 threads
+
+  310 timesteps per run, 2 rounds:
+  threads  cores              schedule         tile      MC/s   round 1   round 2    vs flat
+        6  physical           flat                 -     308.9     307.7     310.0          -   configured schedule
+        6  physical           k=4 W=8           4 MB     534.2     529.4     538.9    +72.9 %
+        6  physical           k=5 W=11          5 MB     632.3     627.5     637.0   +104.7 %
+        6  physical           k=8 W=16          8 MB     795.0     787.9     802.1   +157.4 %
+        6  physical           k=11 W=23        11 MB     829.8     828.6     830.9   +168.7 %
+        6  physical           k=16 W=33        16 MB     606.8     605.0     608.7    +96.5 %
+        6  physical           k=23 W=47        22 MB     484.9     484.9     484.9    +57.0 %
+        5  physical           k=8 W=16          8 MB     770.7     769.4     772.0   +149.5 %
+
+  Fastest: 6 threads on physical, k=11 W=23, 829.8 MC/s, 2.69x the flat sweep.
+  The configured schedule (flat, on these threads): 308.9 MC/s, 62.8 % below the recommendation.
+  To run this model with the recommendation on this machine:
+    openEMS <model.xml> --engine=avx2-multithreaded --numThreads=6 --cpu-cores=physical --avx2-temporal-block=11:23
+    FDTD.Run(sim_path, engine='avx2-multithreaded', numThreads=6, cpu_cores='physical', avx2_temporal_block='11:23')
+rc=0 files left: tl.xml 
+
+### cytex, gpu on the RX 6800
+Benchmark: warming up on the flat sweep...
+Benchmark: warm-up 2.2 s, flat 3437.9 MC/s
+Benchmark: 13 schedules x 2 rounds of 2100 timesteps
+Benchmark   1/26  flat            3453.2 MC/s
+Benchmark   2/26  k=2 W=4         2893.8 MC/s
+Benchmark   3/26  k=2 W=5         3156.2 MC/s
+Benchmark   4/26  k=4 W=8         4359.1 MC/s
+Benchmark   5/26  k=5 W=11        5203.9 MC/s
+Benchmark   6/26  k=8 W=17        6190.6 MC/s
+Benchmark   7/26  k=11 W=22       6451.1 MC/s
+Benchmark   8/26  k=17 W=34       6727.2 MC/s
+Benchmark   9/26  k=22 W=45       6740.7 MC/s
+Benchmark  10/26  k=32 W=68       6742.1 MC/s
+Benchmark  11/26  k=32 W=91       6496.6 MC/s
+Benchmark  12/26  k=32 W=137      5755.2 MC/s
+Benchmark  13/26  k=32 W=183      4857.5 MC/s
+Benchmark  14/26  k=32 W=183      4863.4 MC/s
+Benchmark  15/26  k=32 W=137      5774.2 MC/s
+Benchmark  16/26  k=32 W=91       6509.2 MC/s
+Benchmark  17/26  k=32 W=68       6715.8 MC/s
+Benchmark  18/26  k=22 W=45       6649.1 MC/s
+Benchmark  19/26  k=17 W=34       6566.2 MC/s
+Benchmark  20/26  k=11 W=22       6287.3 MC/s
+Benchmark  21/26  k=8 W=17        6023.7 MC/s
+Benchmark  22/26  k=5 W=11        5228.6 MC/s
+Benchmark  23/26  k=4 W=8         4370.3 MC/s
+Benchmark  24/26  k=2 W=5         3172.6 MC/s
+Benchmark  25/26  k=2 W=4         2866.8 MC/s
+Benchmark  26/26  flat            3437.7 MC/s
+Benchmark results (--engine=gpu): 5.03 M cells; probes kept, field dumps off
+
+  2100 timesteps per run, 2 rounds:
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -    3445.4    3453.2    3437.7          -
+  k=2 W=4           6 MB    2880.3    2893.8    2866.8    -16.4 %
+  k=2 W=5           7 MB    3164.4    3156.2    3172.6     -8.2 %
+  k=4 W=8          11 MB    4364.7    4359.1    4370.3    +26.7 %
+  k=5 W=11         15 MB    5216.2    5203.9    5228.6    +51.4 %
+  k=8 W=17         24 MB    6107.2    6190.6    6023.7    +77.3 %
+  k=11 W=22        31 MB    6369.2    6451.1    6287.3    +84.9 %
+  k=17 W=34        48 MB    6646.7    6727.2    6566.2    +92.9 %
+  k=22 W=45        63 MB    6694.9    6740.7    6649.1    +94.3 %   as configured
+  k=32 W=68        95 MB    6729.0    6742.1    6715.8    +95.3 %
+  k=32 W=91       127 MB    6502.9    6496.6    6509.2    +88.7 %
+  k=32 W=137      191 MB    5764.7    5755.2    5774.2    +67.3 %
+  k=32 W=183      256 MB    4860.4    4857.5    4863.4    +41.1 %
+
+  Fastest: k=32 W=68, 6729.0 MC/s, 1.95x the flat sweep.
+  As configured (k=22 W=45): 6694.9 MC/s, 0.5 % below the recommendation.
+  The rounds differ by up to 2.7 % (other load, or clocks drifting): differences below that are noise.
+  To run this model with the recommendation on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=32:68
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='32:68')
+rc=0 files left: tl.xml 

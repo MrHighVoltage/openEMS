@@ -70,6 +70,10 @@ This is the one-page answer. §2 onward is the detail and the method.
   speed and saves 6 %. The Vega 7, which cannot use the L3, runs 1 % slower.
   `--benchmark` measures the schedules on a given model and prints the options
   for the fastest.
+- **`--benchmark` on the CPU** (2026-10-20) measures the thread count and the
+  kind of core as well as the schedule, on Linux, Windows and macOS without a
+  library. On the TL model its pick runs **4.1×** faster than a run with no
+  options on the i9-13900K: 8 P-cores, blocked (§5.10).
 - **Thread auto-tune on many-core machines.** Upstream's search leaves
   **15–53%** on the table on the 32-thread host; the fork's default lands within
   3–5% of its own pinned optimum there, and 99–100% on the four-core host (§3.3).
@@ -1546,8 +1550,8 @@ cases at 4:12 to 24:48 and the TL model at 2:5 to 16:45, probes included.
 
 **The default since 0107f8e.** An integrated GPU blocks too, with a tile of
 80 % of one instance of the CPU's L3. The size comes from the same query the
-AVX2 engine uses (hwloc, else `sysconf`), and is 16 MB where it cannot be
-read. Neither the size nor the sharing is something Vulkan reports:
+AVX2 engine uses (§5.10), and is 16 MB where it cannot be read or the CPU's
+last level is not an L3. Neither the size nor the sharing is something Vulkan reports:
 
 - No cache size is exposed, in core 1.4 or in any vendor extension. OpenCL's
   "global memory cache size" is no substitute: on the RX 6800 it reports
@@ -1657,10 +1661,10 @@ Two rules in the recommendation:
 What the benchmark does not see:
 
 - **Energy.** RAPL is neither portable nor readable without privileges.
-- **Thread count.** The AVX2 engine benchmarks at the thread count it
+- **Thread count.** The AVX2 engine benchmarked at the thread count it
   calibrated on the flat sweep: 6 of 32 on the i9-13900K. Blocking removes the
   DRAM contention that limits that count (§5.7 ran 8 P-cores), so more threads
-  may be faster blocked.
+  may be faster blocked. Measured since §5.10.
 - **Field dumps.** They are off. A dump interval shorter than the probe
   interval caps the depth in a real run, the same way probes do.
 - **Other meshes.** The options it prints are in x-lines, for this model.
@@ -1669,6 +1673,167 @@ Raw output: `python/Tests/results/gpu_igpu_tblock_2026-10-20.txt`. The scripts
 (`sweep_igpu_dram.sh`, `split_skl_imc.sh`, `run_igpu_checks.sh`,
 `energy_summary.py`, `verify_igpu_default.sh`, `run_benchmark_mode.sh`) are in
 the `tests/gpuprof` kit.
+
+### 5.10 Threads and cores in the benchmark, on any operating system (2026-10-20)
+
+§5.9's benchmark ran the AVX2 engine on the thread count the engine had
+calibrated on the flat sweep, 6 of 32 on the i9-13900K. That count does not
+suit a blocked run. The flat sweep is DRAM-bound: 8 P-cores reach 1.6× one
+of them (432 against 273 MC/s), and the calibration lands anywhere from 6 to
+8 threads. Blocked, the run scales 3.5× on the same 8 P-cores (§5.7). The
+benchmark now measures the threads and the cores they run on, before the
+schedules.
+
+**Sets of cores.** `--cpu-cores` keeps the worker threads to one of them:
+
+- `all`, the default;
+- `physical`, one thread per core;
+- `performance` or `efficiency`, one kind of core of a hybrid CPU, one thread
+  per core; `performance+smt` and `efficiency+smt` use every thread of them.
+
+They are named by kind, not by CPU number, so a value means the same on
+another machine and on every operating system. On a CPU with one kind,
+`performance` is every core.
+
+**What it measures**, for an engine with worker threads:
+
+1. **Threads.** For each set that differs on the machine, the thread count
+   doubles from 1 until a doubling gains no more than 1 %. One count halfway
+   to each neighbour of the best refines it. A set that contains a measured
+   one starts above that one's best: the P-cores with SMT start above the
+   P-cores' best. Every point runs the engine's default tile, as deep as the
+   probes allow, because blocking is what lets the threads scale. After each
+   change of threads 0.3 s is discarded (new threads, cold caches), then
+   about 2 s are measured. On a hybrid CPU, sets that mix kinds are skipped,
+   except `all`, which is what a run without `--cpu-cores` gets.
+2. **Schedules,** on the best threads and cores: the tile ladder, the flat
+   sweep, the configured schedule, and the runner-up of step 1. Each runs
+   about 2 s of the fastest setting, twice, the second round in reverse
+   order.
+
+The recommendation extends §5.9's rule. Anything more, a blocked schedule or
+more threads, has to be more than 1 % faster than what it replaces.
+
+On the TL model, at the default barrier spin of 0:
+
+| Host | Sets | Best of each set (MC/s) | Recommended | MC/s | vs flat | Time |
+|---|---|---|---|---|---|---|
+| i9-13900K | P, P+SMT, E, all | P 8: 1695, P+SMT 16: 1544, E 16: 1037, all 12: 1338 | 8 performance, 18:37 | **1706** | 4.06× | 95 s |
+| i7-6700K | physical, all | physical 4: 410, all 6: 368 | 4 physical, 4:8 | **405** | 1.58× | 59 s |
+| Ryzen 5 5600G | physical, all | physical 6: 760, all 9: 651 | 6 physical, 11:23 | **830** | 2.69× | 65 s |
+
+"vs flat" is the flat sweep on the same threads; "Time" is the benchmark
+without the setup. srv002's rounds differ by up to 12 %: it serves media in
+the background.
+
+- **SMT makes the blocked run slower** on all three at spin 0. At §5.7's
+  100 µs spin the 13900K's best was 8 P-cores with HT, 1857 MC/s. The
+  benchmark measures the spin the run uses, so settling D3 would move the
+  pick.
+- **E-cores alone** reach 1037 MC/s on 16 threads, 61 % of the 8 P-cores.
+- **A normal run with the recommendation** on the 13900K: 1657 MC/s over
+  2000 timesteps, against 404 with no options (flat, threads calibrated over
+  all 32), so **4.1×**. With only `--avx2-temporal-block=16` it is 1420.
+
+**The startup calibration runs on the blocked schedule again.** aae6b2e made
+the thread calibration measure the schedule the run uses. 4bfcd74 then moved
+the tile setup behind the calibration, because the tile depends on the
+threads, and that quietly put the calibration back on the flat sweep. Now
+every candidate count gets its own tile, and a calibration batch is at least
+one block deep. With `--avx2-temporal-block=16` on the 13900K it picked 8
+threads in both runs.
+
+**The `multithreaded` engine,** the default where the AVX2 engine is not
+built (ARM64, for one), has worker threads but no blocking. Its benchmark
+measures threads and cores on the flat sweep. On the 13900K: 6 P-cores,
+410 MC/s, with 8 within 0.4 %.
+
+**A warning when the settings are defaults.** A run that leaves to its
+defaults what `--benchmark` would set prints:
+
+```
+openEMS - Warning: running on default performance settings, not on ones tuned for this model and machine (--numThreads, --cpu-cores, --avx2-temporal-block not set).
+	More speed may be possible: --benchmark measures the settings on this model and prints the options to use.
+```
+
+It lists only what applies. `--cpu-cores` appears only where the machine
+offers more than one set, a schedule option only for an engine with
+blocking. An option set to its default (`--numThreads=0`, `--cpu-cores=all`,
+`--avx2-temporal-block=off`) counts as set, and the environment variables
+count too.
+
+**The CPU topology, without hwloc** (`tools/cpu_topology`). hwloc reports the
+kind of core only from 2.4 on, and the portable bundle builds against 1.11.
+On Linux it reads the same files as the code below, and it was optional, so
+builds without it had only `sysconf`'s one L3, which only glibc on x86 knows.
+It is replaced by the operating systems' own interfaces:
+
+- **Linux**, x86 and ARM alike, from sysfs:
+  - cores from `core_cpus_list`;
+  - kinds from the Intel hybrid PMUs (`cpu_core`, `cpu_atom`), else
+    `cpu_capacity` (ARM), else the highest clock, the first that splits the
+    CPUs. A kind starts where a CPU is more than 15 % slower than the next
+    faster one, so the 13900K's two favoured P-cores (5.8 GHz instead of 5.5)
+    stay P-cores;
+  - the last-level cache from the highest data or unified level: an L3 on
+    x86, often an L2 on ARM;
+  - the process's affinity.
+
+  Threads are restricted with `pthread_setaffinity_np`.
+- **Windows:** `GetLogicalProcessorInformationEx` gives cores, the efficiency
+  class and caches; `SetThreadGroupAffinity` restricts threads, spreading the
+  workers over the processor groups of a machine with more than 64 CPUs.
+- **macOS:** `sysctl` `hw.perflevelN.*` gives kinds, cores and caches. There
+  is no affinity. A thread's QoS class steers it instead: background confines
+  it to the efficiency cores, user-interactive prefers the performance cores.
+  So only `performance`, `efficiency` and `all` are offered there.
+- **Elsewhere:** the thread count only, and `all`.
+
+The integrated-GPU tile of §5.9 now takes only an L3. Where the CPU's last
+level is an L2 (Apple, most ARM SoCs) that cache belongs to a cluster of
+cores, not to the GPU, so the tile is 16 MB.
+
+Tested:
+
+- the 13900K itself, also under `taskset`;
+- seven fake sysfs trees: the 13900K with and without its PMU directories, an
+  RK3588, an ARM with three kinds, a 7950X3D (96 and 32 MB L3), a Ryzen AI 9
+  HX 370 (Zen 5 + Zen 5c) and an ARM server without cache information;
+- the Windows build (MinGW-w64) under Wine, which reports the 13900K's
+  efficiency classes and honours the group affinity;
+- the ARM64 Linux build under QEMU.
+
+macOS is untested: there is no SDK here.
+
+**Bit-identical**, with full E/H dumps against the previous build's flat run:
+8, 12 and 16 threads, calibrated counts, and the `performance`,
+`performance+smt`, `efficiency` and `physical` sets, flat and blocked. The
+`multithreaded` engine was checked on `efficiency` and `performance+smt`.
+
+**An ARM64 engine** needs nothing in the benchmark or the topology, which have
+no x86 code. An engine with worker threads implements
+`Engine::GetNumThreads()`, `GetCoreSet()` and `SetThreads()`, takes its
+cores from `Operator::GetCoreSet()`, and calls `CpuTopology::Restrict()` at
+the start of each worker. With temporal blocking it also implements the four
+blocking methods. `--benchmark`, `--cpu-cores` and the warning then work
+for it unchanged.
+
+Limits:
+
+- **Kinds are not mixed.** Every worker gets an equal share of the grid, so a
+  set of P- and E-cores runs at the pace of its E-cores (§5.7: 35 % of the
+  time waiting). Weighted shares, D2, would change that.
+- **macOS's QoS only steers.** `performance` there is a preference.
+- **No set per cache.** A 7950X3D's CCD with the large L3 is not offered on
+  its own.
+- **AMD Zen 5 + Zen 5c on Linux** falls back to the clock to find the kinds.
+  That is tested on a fake tree only.
+- **Windows' process affinity** is honoured only on machines with one
+  processor group.
+
+Raw output: `python/Tests/results/cpu_threads_cores_2026-10-20.txt`. The test
+programs are in `tests/topology` and `tests/gpuprof` (`identity_threads.py`,
+`verify_cpu_settings.sh`).
 
 ---
 

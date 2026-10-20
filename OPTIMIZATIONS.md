@@ -1267,8 +1267,9 @@ covering seven synthetic cases and the TL model; tables in PERFORMANCE.md §5.8.
   - Why the HD 530 loses 12–14 % on a flat run whose probe interval is below
     about 300 timesteps. Its clock stays at the maximum. The benchmark's
     3 s runs see this as a probe-dense model would.
-  - The AVX2 engine calibrates its thread count on the flat sweep, also when
-    it then runs blocked, and `--benchmark` inherits that count.
+  - ~~The AVX2 engine calibrates its thread count on the flat sweep, also
+    when it then runs blocked, and `--benchmark` inherits that count.~~
+    Fixed in §4.11.
   - Tiling in y and z, for GPUs whose cache is smaller than one x-plane.
 
 Four races in the flat path were found and fixed on the way (PERFORMANCE.md
@@ -1278,6 +1279,32 @@ Four races in the flat path were found and fixed on the way (PERFORMANCE.md
 - the shared edges of Mur faces;
 - unfused UPML against the Mur and dispersive passes that read the same cells;
 - crossing absorbing sheets.
+
+### 4.11 Threads and cores in `--benchmark`, and a portable CPU topology (2026-10-20)
+
+Details in PERFORMANCE.md §5.10; raw output in
+`python/Tests/results/cpu_threads_cores_2026-10-20.txt`.
+
+- **`--benchmark` measures threads and cores.** ✅ For each set of cores
+  (P, P+SMT, E, all; or physical and all), the thread count doubles until it
+  stops gaining 1 %, on the default tile. Then the schedules run on the best.
+  On the TL model: 8 P-cores at 18:37 on the i9-13900K (1706 MC/s, 4.06× flat),
+  4 cores at 4:8 on the i7-6700K, 6 cores at 11:23 on the Ryzen 5 5600G.
+  SMT lost on all three at the default spin.
+- **`--cpu-cores`.** ✅ `all`, `physical`, `performance[+smt]`,
+  `efficiency[+smt]`, also for the `multithreaded` engine.
+- **Calibration on the blocked schedule.** ✅ Undone by 4bfcd74 without
+  notice and restored.
+- **A warning** when a run leaves to defaults what `--benchmark` sets. ✅
+- **`tools/cpu_topology`** replaces hwloc and `sysconf`: sysfs on Linux,
+  `GetLogicalProcessorInformationEx` on Windows, `sysctl` and QoS classes on
+  macOS. ✅ Tested on Linux x86, Linux ARM64 (QEMU), Windows (Wine) and fake
+  sysfs trees. macOS is untested.
+- **Still open:**
+  - D2: weighted shares, so that P- and E-cores can work together.
+  - D3: the barrier spin. It decides whether SMT pays off.
+  - A set per L3 instance, e.g. for a 7950X3D's V-cache CCD.
+  - macOS: a build and a run on a real Mac.
 
 ---
 
