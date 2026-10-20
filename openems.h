@@ -175,6 +175,14 @@ protected:
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
 
+	//! --gpu-temporal-block, --gpu-temporal-block-mb, --avx2-temporal-block;
+	//! empty or 0 where not given.
+	std::string m_gpuTBOption;
+	unsigned int m_gpuTBMBOption;
+	std::string m_avx2TBOption;
+	//! Hand the temporal-blocking options to the engine just created.
+	void ApplyTemporalBlockingOptions();
+
 	//! Setup an operator matching the requested engine
 	virtual bool SetupOperator();
 

@@ -498,11 +498,10 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 	m_utilFence = VK_NULL_HANDLE;
 	m_cmdIdx = 0;
 	m_tbK = 0;
-	m_tbAuto = true;
 	m_tbW = 0;
-	m_tbTargetMB = 0;
 	m_tbActive = false;
 	m_tbAnnounced = false;
+	m_tbQuiet = false;
 	for (int i = 0; i < CMD_RING_SIZE; ++i)
 		m_gpuInFlight[i] = false;
 
@@ -578,16 +577,17 @@ void Engine_Vulkan::Init()
 		if (endPtr && *endPtr == '\0' && v > 0)
 			m_maxTSPerSubmit = (unsigned int)v;
 	}
-	// Trapezoidal temporal blocking: "<k>" or "<k>:<W>" forces it, "0" turns
-	// it off, unset leaves it to ConfigureTemporalBlocking().
+	// Trapezoidal temporal blocking, read as --gpu-temporal-block reads it:
+	// "<k>" or "<k>:<W>" forces it, "off" or "0" turns it off, "auto" or unset
+	// leaves it to ConfigureTemporalBlocking().  The command-line options
+	// replace these (openEMS::SetupFDTD()).
 	if (const char* env = std::getenv("OPENEMS_GPU_TEMPORAL_BLOCK"))
 	{
-		int k = 0, w = 0;
-		m_tbAuto = false;
-		if (std::sscanf(env, "%d:%d", &k, &w) >= 1 && k > 0)
+		if (!TemporalBlockingRequest::Parse(env, m_tbRequest))
 		{
-			m_tbK = (unsigned int)k;
-			m_tbW = (w > 0) ? (unsigned int)w : 0;
+			cerr << "Engine_Vulkan: cannot read OPENEMS_GPU_TEMPORAL_BLOCK=" << env
+			     << " (auto, off, <k> or <k>:<W>); temporal blocking off" << endl;
+			m_tbRequest.mode = TemporalBlockingRequest::OFF;
 		}
 	}
 	// How much field state one tile should occupy.  Vulkan exposes no
@@ -600,7 +600,7 @@ void Engine_Vulkan::Init()
 	if (const char* env = std::getenv("OPENEMS_GPU_TEMPORAL_BLOCK_MB"))
 	{
 		int mb = std::atoi(env);
-		if (mb > 0) m_tbTargetMB = (unsigned int)mb;
+		if (mb > 0) m_tbRequest.targetMB = (unsigned int)mb;
 	}
 
 	if (const char* env = std::getenv("OPENEMS_GPU_CHUNK_PROGRESS_SEC"))
@@ -4497,13 +4497,67 @@ void Engine_Vulkan::BuildSlabEntryIndex(const std::vector<uint32_t>& sortedX,
 //     choice double-updates those cells.
 // ---------------------------------------------------------------------------
 
+void Engine_Vulkan::TileGeometry(uint64_t& planeBytes, uint64_t& tableBytes,
+                                 uint64_t& totalBytes) const
+{
+	// What a tile has to hold is everything the sweep streams per cell, not
+	// just the fields.  With an uncompressed operator a cell's coefficients
+	// (vv, vi, ii, iv: 48 B) are twice its fields (volt+curr: 24 B), and a tile
+	// sized from the fields alone is three times the target: 1.22x where 3.2x
+	// was available on a 5 M-cell grid (PERFORMANCE.md §5.8).  A compressed
+	// operator adds its per-cell index; its tables are shared by every cell,
+	// so they come off the target once rather than per plane.
+	const uint64_t plane     = (uint64_t)numLines[1] * numLines[2];
+	const uint64_t cellBytes = 24 + ((m_opIdxBits == 0) ? 48 : m_opIdxBits / 8);
+	tableBytes = (m_opIdxBits == 0) ? 0 : 4 * (uint64_t)m_coeffCompBufSize;
+	planeBytes = plane * cellBytes;
+	totalBytes = planeBytes * (uint64_t)numLines[0] + tableBytes;
+}
+
 void Engine_Vulkan::ConfigureTemporalBlocking()
 {
 	m_tbAnnounced = true;
-	m_tbActive    = false;
-	m_tbEdges.clear();
-	if (m_tbK == 0 && !m_tbAuto)
+	const TemporalBlockingPlan plan = PlanTemporalBlocking(m_tbRequest, &m_tbEdges);
+	m_tbActive = plan.active;
+	m_tbK      = plan.k;
+	m_tbW      = plan.W;
+	if (m_tbQuiet)
 		return;
+
+	if (!plan.note.empty())
+		cout << "Engine_Vulkan: temporal blocking — " << plan.note << endl;
+	if (plan.active)
+		cout << "Engine_Vulkan: trapezoidal temporal blocking active"
+		     << (m_tbRequest.mode == TemporalBlockingRequest::AUTO ? " (default)" : "")
+		     << " — k=" << plan.k << " W=" << plan.W << " (" << plan.detail << ")" << endl;
+	else if (!plan.why.empty())
+		cout << "Engine_Vulkan: temporal blocking disabled — " << plan.why << endl;
+}
+
+bool Engine_Vulkan::SetTemporalBlocking(const TemporalBlockingRequest& req, bool announce)
+{
+	// Resolved when the next batch is recorded, like the first time; a batch
+	// already in flight keeps the edges it was recorded with.
+	m_tbRequest   = req;
+	m_tbQuiet     = !announce;
+	m_tbAnnounced = false;
+	return true;
+}
+
+TemporalBlockingPlan Engine_Vulkan::PlanTemporalBlocking(const TemporalBlockingRequest& req) const
+{
+	return PlanTemporalBlocking(req, nullptr);
+}
+
+TemporalBlockingPlan Engine_Vulkan::PlanTemporalBlocking(const TemporalBlockingRequest& req,
+                                                         std::vector<int>* edgesOut) const
+{
+	TemporalBlockingPlan plan;
+	if (edgesOut)
+		edgesOut->clear();
+	const bool isAuto = req.mode == TemporalBlockingRequest::AUTO;
+	if (req.mode == TemporalBlockingRequest::OFF || (!isAuto && req.k == 0))
+		return plan;
 
 	// Refuse rather than risk: an extension without a slab path would be
 	// applied to the whole grid at a timestep only one tile has reached.  Name
@@ -4512,38 +4566,29 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	//
 	// GPU probes need nothing: the gather is recorded once at the end of each
 	// batch, after the last trapezoid, when the whole grid is at one timestep.
-	const char* refuse = nullptr;
-	if (m_hasCPUExtensions)                     refuse = "extensions are running on the CPU";
-	else if (m_steadyPipeline != VK_NULL_HANDLE)
-		refuse = "steady-state detection integrates energy over the whole grid, "
-		         "which a blocked schedule never has at one timestep";
-	if (refuse)
+	if (m_hasCPUExtensions)
 	{
-		cout << "Engine_Vulkan: temporal blocking disabled — " << refuse << endl;
-		return;
+		plan.why = "extensions are running on the CPU";
+		return plan;
+	}
+	if (m_steadyPipeline != VK_NULL_HANDLE)
+	{
+		plan.why = "steady-state detection integrates energy over the whole grid, "
+		           "which a blocked schedule never has at one timestep";
+		return plan;
 	}
 
-	// What a tile has to hold is everything the sweep streams per cell, not
-	// just the fields.  With an uncompressed operator a cell's coefficients
-	// (vv, vi, ii, iv: 48 B) are twice its fields (volt+curr: 24 B), and a tile
-	// sized from the fields alone is three times the target: 1.22x where 3.2x
-	// was available on a 5 M-cell grid (PERFORMANCE.md §5.8).  A compressed
-	// operator adds its per-cell index; its tables are shared by every cell,
-	// so they come off the target once rather than per plane.
-	const int      NX         = (int)numLines[0];
-	const uint64_t plane      = (uint64_t)numLines[1] * numLines[2];
-	const uint64_t cellBytes  = 24 + ((m_opIdxBits == 0) ? 48 : m_opIdxBits / 8);
-	const uint64_t tableBytes = (m_opIdxBits == 0) ? 0 : 4 * (uint64_t)m_coeffCompBufSize;
-	const uint64_t planeBytes = plane * cellBytes;
-	const uint64_t totalBytes = planeBytes * (uint64_t)NX + tableBytes;
+	const int NX = (int)numLines[0];
+	uint64_t planeBytes, tableBytes, totalBytes;
+	TileGeometry(planeBytes, tableBytes, totalBytes);
 
 	// The default: discrete and integrated GPUs.  A CPU or virtual device
 	// (llvmpipe, a passthrough) has no cache of its own to block into.
 	VkPhysicalDeviceProperties props{};
 	vkGetPhysicalDeviceProperties(m_physDevice, &props);
 	const bool integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-	if (m_tbAuto && !integrated && props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-		return;
+	if (isAuto && !integrated && props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+		return plan;
 
 	// Vulkan exposes no cache size, so the tile target is a tunable with a
 	// default per device class.  An integrated GPU gets 80 % of one instance of
@@ -4555,7 +4600,7 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	// queryable either and depends on the SoC -- the Vega 7 cannot, and
 	// Intel's GPUs left the CPU's ring with Meteor Lake -- but a tile its
 	// cache cannot hold costs only the wedges: under 1 % on the Vega 7.
-	uint64_t target = (uint64_t)m_tbTargetMB << 20;
+	uint64_t target = (uint64_t)req.targetMB << 20;
 	unsigned int llcMB = 0;
 	if (target == 0 && integrated)
 	{
@@ -4572,18 +4617,23 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	// The cache size is not queryable, so by default the grid has to be twice
 	// the target -- beyond the 96-128 MB of the cards measured -- before
 	// blocking is worth its wedges.  Asked for explicitly, the target alone
-	// decides.
-	const uint64_t engageAbove = m_tbAuto ? 2 * target : target;
-	if (totalBytes <= engageAbove)
+	// decides, and a tile width asked for explicitly needs only the two tiles
+	// checked below.
+	if (req.W == 0)
 	{
-		cout << "Engine_Vulkan: temporal blocking disabled — grid already fits the "
-		          << (engageAbove >> 20) << " MB "
-		          << (m_tbAuto ? "default threshold" : "tile target") << " ("
-		          << (totalBytes >> 20) << " MB of fields and coefficients)" << endl;
-		return;
+		const uint64_t engageAbove = isAuto ? 2 * target : target;
+		if (totalBytes <= engageAbove)
+		{
+			std::ostringstream why;
+			why << "grid already fits the " << (engageAbove >> 20) << " MB "
+			    << (isAuto ? "default threshold" : "tile target") << " ("
+			    << (totalBytes >> 20) << " MB of fields and coefficients)";
+			plan.why = why.str();
+			return plan;
+		}
 	}
 
-	int W = (int)m_tbW;
+	int W = (int)req.W;
 	if (W <= 0)
 	{
 		// Shared tables stay resident whichever tile runs, but never let them
@@ -4601,20 +4651,22 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	// divides the DRAM traffic, and with fewer, wider wedges it also cuts the
 	// barriers per timestep: on the TL model k=W/2 beat k=16 at the same tile
 	// on both cards measured (PERFORMANCE.md §5.8).
-	int k = m_tbAuto ? std::max(2, std::min(32, W / 2)) : (int)m_tbK;
+	int k = isAuto ? std::max(2, std::min(32, W / 2)) : (int)req.k;
 	if (W < 2 * k)
 	{
 		const int kFit = W / 2;
 		if (kFit < 2)
 		{
-			cout << "Engine_Vulkan: temporal blocking disabled — a " << W
-			          << "-line tile cannot carry a depth-2 trapezoid; the y-z "
-			             "cross-section is too large for the "
-			          << targetMB << " MB target" << endl;
-			return;
+			std::ostringstream why;
+			why << "a " << W << "-line tile cannot carry a depth-2 trapezoid; the y-z "
+			       "cross-section is too large for the " << targetMB << " MB target";
+			plan.why = why.str();
+			return plan;
 		}
-		cout << "Engine_Vulkan: temporal blocking — k reduced from " << k << " to "
-		          << kFit << " to fit a " << W << "-line tile (W >= 2k)" << endl;
+		std::ostringstream note;
+		note << "k reduced from " << k << " to " << kFit << " to fit a " << W
+		     << "-line tile (W >= 2k)";
+		plan.note = note.str();
 		k = kFit;
 	}
 
@@ -4648,10 +4700,11 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 		return e;
 	};
 
-	m_tbEdges.push_back(0);
+	std::vector<int> edges;
+	edges.push_back(0);
 	for (int x = clearOfSheets(W); x < NX; x = clearOfSheets(x + W))
-		m_tbEdges.push_back(x);
-	m_tbEdges.push_back(NX);
+		edges.push_back(x);
+	edges.push_back(NX);
 
 	// Fold a short tail into its neighbour.  A tile narrows from its left, so a
 	// tail shorter than the block depth can end up as a slab that reaches the
@@ -4660,32 +4713,55 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	// behind, and fatal for any boundary extension that reads one cell inward
 	// at the timestep it writes the edge, which is what Mur does
 	// (RecordMurSlabPhase()).  It costs one slightly wider tile.
-	if (m_tbEdges.size() >= 3)
+	if (edges.size() >= 3)
 	{
-		const size_t last = m_tbEdges.size() - 1;
-		if (m_tbEdges[last] - m_tbEdges[last - 1] < k + 3)
-			m_tbEdges.erase(m_tbEdges.begin() + (long)last - 1);
+		const size_t last = edges.size() - 1;
+		if (edges[last] - edges[last - 1] < k + 3)
+			edges.erase(edges.begin() + (long)last - 1);
 	}
 
-	if (m_tbEdges.size() < 3)
+	if (edges.size() < 3)
 	{
-		cout << "Engine_Vulkan: temporal blocking disabled — " << NX
-		          << " x-lines make only one tile of width " << W << endl;
-		return;
+		std::ostringstream why;
+		why << NX << " x-lines make only one tile of width " << W;
+		plan.why = why.str();
+		return plan;
 	}
 
-	m_tbK      = (unsigned int)k;
-	m_tbW      = (unsigned int)W;
-	m_tbActive = true;
+	plan.active = true;
+	plan.k      = (unsigned int)k;
+	plan.W      = (unsigned int)W;
+	plan.tileMB = (double)W * (double)planeBytes / (1 << 20);
+	std::ostringstream detail;
+	detail << (edges.size() - 1) << " tiles, " << ((uint64_t)W * planeBytes >> 20) << " MB/tile, "
+	       << (totalBytes >> 20) << " MB of fields and coefficients";
+	if (llcMB && req.W == 0)
+		detail << "; target " << targetMB << " MB = 80 % of the CPU's " << llcMB << " MB L3";
+	plan.detail = detail.str();
+	if (edgesOut)
+		*edgesOut = edges;
+	return plan;
+}
 
-	cout << "Engine_Vulkan: trapezoidal temporal blocking active"
-	          << (m_tbAuto ? " (default)" : "") << " — k=" << k
-	          << " W=" << W << " (" << (m_tbEdges.size() - 1) << " tiles, "
-	          << ((uint64_t)W * planeBytes >> 20) << " MB/tile, "
-	          << (totalBytes >> 20) << " MB of fields and coefficients";
-	if (llcMB)
-		cout << "; target " << targetMB << " MB = 80 % of the CPU's " << llcMB << " MB L3";
-	cout << ")" << endl;
+std::vector<TemporalBlockingRequest> Engine_Vulkan::TemporalBlockingCandidates(unsigned int maxDepth) const
+{
+	// Tile targets from 4 to 256 MB, each as deep as the default would make
+	// it (k = W/2, at most 32): the last-level caches of the GPUs measured
+	// range from the 1 MB L2 of a Vega 7 to the 128 MB Infinity Cache of an
+	// RX 6800, and at a given tile k = W/2 was never slower (§5.8).
+	std::vector<TemporalBlockingRequest> out;
+	uint64_t planeBytes, tableBytes, totalBytes;
+	TileGeometry(planeBytes, tableBytes, totalBytes);
+	for (unsigned int mb : {4u, 6u, 8u, 12u, 16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u})
+	{
+		const uint64_t target = (uint64_t)mb << 20;
+		const uint64_t budget = target - std::min(tableBytes, target / 2);
+		const unsigned int W = (unsigned int)std::min<uint64_t>(numLines[0], budget / std::max<uint64_t>(1, planeBytes));
+		const unsigned int k = std::min({32u, W / 2, maxDepth});
+		if (k >= 2)
+			out.push_back(TemporalBlockingRequest::Forced(k, W));
+	}
+	return out;
 }
 
 void Engine_Vulkan::RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const

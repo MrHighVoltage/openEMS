@@ -550,7 +550,8 @@ cdef class openEMS:
 
     def _SetLibraryArguments(self, arguments):
         allOptions = []
-        integerOptions = ["verbose", "numthreads"]
+        integerOptions = ["verbose", "numthreads", "gpu-temporal-block",
+                          "gpu-temporal-block-mb", "avx2-temporal-block"]
 
         for key, val in arguments.items():
             key = key.replace("_", "-")
@@ -641,6 +642,14 @@ cdef class openEMS:
           for debugging
         * nativeFieldDumps (bool) - dump all fields using the native field
           components
+        * gpu_temporal_block (str) -- trapezoidal temporal blocking in the
+          gpu engine: 'auto' (default), 'off', '<k>' or '<k>:<W>' (blocks of
+          k timesteps over tiles of W x-lines)
+        * gpu_temporal_block_mb (int) -- MB of fields and coefficients one
+          GPU tile should hold (default: 64 on a discrete card, 80 % of the
+          CPU's L3 cache on an integrated one)
+        * avx2_temporal_block (str) -- the same for the avx2-multithreaded
+          engine: 'off' (default), '<k>' or '<k>:<W>'
         """
         if cleanup and os.path.exists(sim_path):
             self._cleanup_sim_path(sim_path, verbose=kw.get('verbose'))

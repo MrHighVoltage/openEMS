@@ -95,6 +95,11 @@ public:
 
 	virtual bool IterateTS(unsigned int iterTS);
 
+	virtual TemporalBlockingRequest GetTemporalBlocking() const {return m_tbRequest;}
+	virtual bool SetTemporalBlocking(const TemporalBlockingRequest& req, bool announce = true);
+	virtual TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req) const;
+	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const;
+
 	//! GPU-side energy estimation — avoids downloading entire field arrays.
 	double CalcFastEnergyGPU() const;
 
@@ -329,12 +334,12 @@ private:
 	// whole grid; bit-identical to the flat sweep.  See
 	// ConfigureTemporalBlocking() for the schedule, the guards and the
 	// default (on for discrete GPUs when the grid is well beyond the cache).
-	unsigned int m_tbK;      //!< timesteps per block; 0 = not requested
-	bool         m_tbAuto;   //!< OPENEMS_GPU_TEMPORAL_BLOCK unset: decide from device and grid
-	unsigned int m_tbW;      //!< tile width in x-lines; 0 = derive from m_tbTargetMB
-	unsigned int m_tbTargetMB; //!< MB of fields and coefficients one tile should occupy
+	TemporalBlockingRequest m_tbRequest; //!< as asked for: option, environment or default
+	unsigned int m_tbK;        //!< resolved timesteps per block
+	unsigned int m_tbW;        //!< resolved tile width in x-lines
 	bool         m_tbActive;   //!< blocking passed its guards for this run
-	bool         m_tbAnnounced;
+	bool         m_tbAnnounced; //!< m_tbRequest has been resolved
+	bool         m_tbQuiet;     //!< resolve without printing (--benchmark switching schedules)
 	std::vector<int> m_tbEdges; //!< tile boundaries, [0, e1, .., NX]
 	//! Excitation entries sorted by x, with a prefix table so an x-range maps
 	//! to a contiguous entry range.  m_excVoltXStart[x] is the first entry with
@@ -404,9 +409,6 @@ private:
 	void SetupGPU_LocalABC();
 	void RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) const;
 
-	//! Decide tile edges and depth for trapezoidal temporal blocking, or leave
-	//! m_tbActive false with a printed reason.  Called once, after the grid and
-	//! the extension set are known.
 	//! Build the x-prefix table that maps an x-range to a contiguous run of a
 	//! sparse extension's entries.  `sortedX` is the x index of each entry in
 	//! the already-x-sorted list; `xStart` comes back with numLines[0]+1
@@ -414,7 +416,16 @@ private:
 	void BuildSlabEntryIndex(const std::vector<uint32_t>& sortedX,
 	                         std::vector<uint32_t>& xStart) const;
 
+	//! Decide tile edges and depth for trapezoidal temporal blocking, or leave
+	//! m_tbActive false with a printed reason.  Called when the first batch
+	//! after Init() or SetTemporalBlocking() is recorded.
 	void ConfigureTemporalBlocking();
+	//! PlanTemporalBlocking(), with the tile edges of an active plan.
+	TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req,
+	                                          std::vector<int>* edgesOut) const;
+	//! Bytes one x-plane streams per sweep, the compressed operator's shared
+	//! tables, and the whole grid's state.
+	void TileGeometry(uint64_t& planeBytes, uint64_t& tableBytes, uint64_t& totalBytes) const;
 
 	void CleanupVulkan();
 	void SetupProfiling();

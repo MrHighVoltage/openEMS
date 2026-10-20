@@ -20,7 +20,9 @@
 
 #include <fstream>
 #include <iomanip>
+#include <vector>
 #include "operator.h"
+#include "temporal_blocking.h"
 
 #include "tools/arraylib/array_nijk.h"
 
@@ -55,6 +57,24 @@ public:
 	virtual unsigned int GetNumberOfTimesteps() {return numTS;}
 
 	virtual void NextInterval(float curr_speed) {UNUSED(curr_speed);};
+
+	//! \name Trapezoidal temporal blocking
+	//! Engine_Vulkan and Engine_AVX2_Multithread have it; the others run the
+	//! flat sweep whatever they are asked. Every schedule computes the same
+	//! fields bit for bit, so it may change between any two IterateTS() calls.
+	//@{
+	//! The schedule asked for.
+	virtual TemporalBlockingRequest GetTemporalBlocking() const {return TemporalBlockingRequest::Off();}
+	//! Ask for a schedule from the next IterateTS() on; false if this engine has none.
+	//! \a announce prints what it resolves to, or why it does not engage.
+	virtual bool SetTemporalBlocking(const TemporalBlockingRequest& req, bool announce = true) {UNUSED(req); UNUSED(announce); return false;}
+	//! What \a req would resolve to on this grid, without applying it.
+	virtual TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req) const {UNUSED(req); return TemporalBlockingPlan();}
+	//! Blocked schedules worth measuring on this grid (--benchmark), none deeper than \a maxDepth.
+	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const {UNUSED(maxDepth); return {};}
+	//! True while the engine still tunes itself on the timesteps it runs.
+	virtual bool IsCalibrating() const {return false;}
+	//@}
 
 	//this access functions muss be overloaded by any new engine using a different storage model
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const

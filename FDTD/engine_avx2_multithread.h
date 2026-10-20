@@ -98,8 +98,16 @@ protected:
 	void FinishCalibration();
 
 	// --- trapezoidal temporal blocking (prototype, opt-in) ---
-	//! Decide k and the tile width, or leave blocking disabled.
+	virtual TemporalBlockingRequest GetTemporalBlocking() const {return m_blk_request;}
+	virtual bool SetTemporalBlocking(const TemporalBlockingRequest& req, bool announce = true);
+	virtual TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req) const;
+	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const;
+	virtual bool IsCalibrating() const {return m_opt_speed;}
+	//! Resolve m_blk_request to k, the tile width and the tile edges, or leave blocking disabled.
 	void ConfigureTemporalBlocking();
+	//! PlanTemporalBlocking(), with the tile edges of an active plan.
+	TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req,
+	                                          std::vector<int>* edgesOut) const;
 	//! Static contiguous split of [lo,hi) over \a nThreads, part \a id.
 	static void SplitRange(int lo, int hi, unsigned int nThreads, unsigned int id,
 	                       unsigned int& start, unsigned int& stop);
@@ -165,6 +173,8 @@ protected:
 	bool m_cal_warmup;                       //!< discard the next batch (threads just respawned)
 
 	// --- temporal blocking state (read by every worker; fixed while a batch runs) ---
+	TemporalBlockingRequest m_blk_request; //!< as asked for: option or environment; AUTO is off
+	bool m_blk_quiet;        //!< resolve without printing (--benchmark switching schedules)
 	unsigned int m_blk_k;    //!< timesteps advanced per block; 0 disables blocking
 	unsigned int m_blk_W;    //!< tile width in x-planes
 	//! Tile boundaries: cores are consecutive pairs, wedges the interior entries.

@@ -100,6 +100,7 @@ openEMS::openEMS()
 	m_engine = EngineType_Multithreaded; // default portable engine type
 #endif
 	m_engine_numThreads = 0;
+	m_gpuTBMBOption = 0;
 
 	m_Abort = false;
 	m_Exc = 0;
@@ -326,6 +327,47 @@ openEMS::optionDesc()
 		"(needs: --engine=multithreaded)"
 	);
 
+	// Temporal blocking. Each replaces the environment variable of the same
+	// name (OPENEMS_AVX2_TEMPORAL_BLOCK, ...); see ApplyTemporalBlockingOptions().
+	const auto readSchedule = [](const char* option, const std::string& val) -> std::string
+	{
+		TemporalBlockingRequest req;
+		if (val.empty() || TemporalBlockingRequest::Parse(val, req))
+			return val;
+		cerr << "openEMS - ignoring --" << option << "=" << val
+		     << " (expected auto, off, <k> or <k>:<W>)" << endl;
+		return "";
+	};
+	optdesc.addStringOption("avx2-temporal-block", "",
+		[this, readSchedule](const std::string& val)
+		{
+			m_avx2TBOption = readSchedule("avx2-temporal-block", val);
+		},
+		"Trapezoidal temporal blocking in the avx2-multithreaded engine: off "
+		"(default), <k> or <k>:<W> -- blocks of k timesteps over tiles of W "
+		"x-lines (default W: half the L3 cache)"
+	);
+#ifdef WITH_GPU
+	optdesc.addStringOption("gpu-temporal-block", "",
+		[this, readSchedule](const std::string& val)
+		{
+			m_gpuTBOption = readSchedule("gpu-temporal-block", val);
+		},
+		"Trapezoidal temporal blocking in the gpu engine: auto (default), off, "
+		"<k> or <k>:<W> -- blocks of k timesteps over tiles of W x-lines "
+		"(default W: from the tile target)"
+	);
+
+	optdesc.addIntOption("gpu-temporal-block-mb", 0,
+		[this](int val)
+		{
+			m_gpuTBMBOption = (val > 0) ? (unsigned int)val : 0;
+		},
+		"MB of fields and coefficients one GPU tile should hold (default: 64 on "
+		"a discrete card, 80 % of the CPU's L3 cache on an integrated one)"
+	);
+#endif
+
 #ifdef WITH_GPU
 	optdesc.addBoolSwitch("gpu-no-rebar-fields",
 		[this](bool val)
@@ -387,6 +429,57 @@ void openEMS::SetLibraryArguments(std::vector<std::string> allOptions)
 {
 	collectCommandLineArguments();
 	g_settings.parseLibraryArguments(allOptions);
+}
+
+void openEMS::ApplyTemporalBlockingOptions()
+{
+	// The engines read the environment in Init(); an option replaces its
+	// variable, and a tile target given alone keeps the schedule the
+	// environment or the default asked for.
+	const auto overrides = [](const char* option, const char* env)
+	{
+		if (std::getenv(env))
+			cout << "openEMS - --" << option << " overrides " << env << endl;
+	};
+#ifdef WITH_GPU
+	if (!m_gpuTBOption.empty() || m_gpuTBMBOption)
+	{
+		if (dynamic_cast<Engine_Vulkan*>(FDTD_Eng))
+		{
+			TemporalBlockingRequest req = FDTD_Eng->GetTemporalBlocking();
+			if (!m_gpuTBOption.empty())
+			{
+				overrides("gpu-temporal-block", "OPENEMS_GPU_TEMPORAL_BLOCK");
+				TemporalBlockingRequest::Parse(m_gpuTBOption, req);
+			}
+			if (m_gpuTBMBOption)
+			{
+				overrides("gpu-temporal-block-mb", "OPENEMS_GPU_TEMPORAL_BLOCK_MB");
+				req.targetMB = m_gpuTBMBOption;
+			}
+			FDTD_Eng->SetTemporalBlocking(req);
+		}
+		else
+			cerr << "openEMS - --gpu-temporal-block ignored: the engine is not the gpu engine" << endl;
+	}
+#endif
+#if OPENEMS_ENABLE_AVX2
+	if (!m_avx2TBOption.empty())
+	{
+		if (dynamic_cast<Engine_AVX2_Multithread*>(FDTD_Eng))
+		{
+			TemporalBlockingRequest req = FDTD_Eng->GetTemporalBlocking();
+			overrides("avx2-temporal-block", "OPENEMS_AVX2_TEMPORAL_BLOCK");
+			TemporalBlockingRequest::Parse(m_avx2TBOption, req);
+			FDTD_Eng->SetTemporalBlocking(req);
+		}
+		else
+			cerr << "openEMS - --avx2-temporal-block ignored: the engine is not avx2-multithreaded" << endl;
+	}
+#else
+	if (!m_avx2TBOption.empty())
+		cerr << "openEMS - --avx2-temporal-block ignored: built without the AVX2 engines" << endl;
+#endif
 }
 
 void openEMS::SetNumberOfThreads(int val)
@@ -1485,6 +1578,7 @@ int openEMS::SetupFDTD()
 	if (gpuStartupTrace)
 		cout << "openEMS::SetupFDTD: creating engine..." << endl;
 	FDTD_Eng = FDTD_Op->CreateEngine();
+	ApplyTemporalBlockingOptions();
 	if (gpuStartupTrace)
 	{
 		auto engCreateEnd = std::chrono::steady_clock::now();

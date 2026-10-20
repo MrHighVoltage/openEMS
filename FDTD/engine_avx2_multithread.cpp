@@ -90,6 +90,17 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	m_blk_elide = true;
 	if (const char* env = std::getenv("OPENEMS_AVX2_TBLOCK_ELIDE"))
 		m_blk_elide = (env[0] != '0');
+
+	// OPENEMS_AVX2_TEMPORAL_BLOCK=<k> derives the tile width from the last-level
+	// cache; <k>:<W> sets both by hand. --avx2-temporal-block replaces it
+	// (openEMS::SetupFDTD()).
+	m_blk_quiet = false;
+	if (const char* env = std::getenv("OPENEMS_AVX2_TEMPORAL_BLOCK"))
+	{
+		if (!TemporalBlockingRequest::Parse(env, m_blk_request))
+			std::cerr << "AVX2 temporal blocking: cannot read OPENEMS_AVX2_TEMPORAL_BLOCK=" << env
+			     << " (off, <k> or <k>:<W>); blocking off" << endl;
+	}
 }
 
 Engine_AVX2_Multithread::~Engine_AVX2_Multithread()
@@ -249,14 +260,45 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 
 void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 {
-	m_blk_k = 0;
-	m_blk_W = 0;
-
-	// OPENEMS_AVX2_TEMPORAL_BLOCK=<k> derives the tile width from the last-level
-	// cache; <k>:<W> sets both by hand.
-	const char* env = std::getenv("OPENEMS_AVX2_TEMPORAL_BLOCK");
-	if (!env)
+	m_blk_edges.clear();
+	const TemporalBlockingPlan plan = PlanTemporalBlocking(m_blk_request, &m_blk_edges);
+	m_blk_k = plan.active ? plan.k : 0;
+	m_blk_W = plan.active ? plan.W : 0;
+	if (m_blk_quiet)
 		return;
+
+	if (plan.active)
+		cout << "AVX2 temporal blocking ACTIVE (prototype): k=" << m_blk_k
+		     << ", tile width " << m_blk_W << " x-lines, " << plan.detail << endl;
+	else if (!plan.why.empty())
+		cout << "AVX2 temporal blocking: disabled, " << plan.why << endl;
+}
+
+bool Engine_AVX2_Multithread::SetTemporalBlocking(const TemporalBlockingRequest& req, bool announce)
+{
+	m_blk_request = req;
+	m_blk_quiet = !announce;
+	// The tile is sized from the L3 instances the threads occupy, so while the
+	// thread count is still being calibrated it waits for FinishCalibration().
+	if (!m_opt_speed)
+		ConfigureTemporalBlocking();
+	return true;
+}
+
+TemporalBlockingPlan Engine_AVX2_Multithread::PlanTemporalBlocking(const TemporalBlockingRequest& req) const
+{
+	return PlanTemporalBlocking(req, nullptr);
+}
+
+TemporalBlockingPlan Engine_AVX2_Multithread::PlanTemporalBlocking(const TemporalBlockingRequest& req,
+                                                                   std::vector<int>* edgesOut) const
+{
+	TemporalBlockingPlan plan;
+	if (edgesOut)
+		edgesOut->clear();
+	// Off unless forced: "auto" is the flat sweep while this is a prototype.
+	if (req.mode != TemporalBlockingRequest::FORCED || req.k < 2)
+		return plan;
 
 	// The two guards below refuse grids that blocking cannot help. Both are
 	// performance guards, not correctness ones, and both keep the schedule out
@@ -266,10 +308,7 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	// makes small runs slower, which is the point of the guards.
 	const char* forceEnv = std::getenv("OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE");
 	const bool force = forceEnv && forceEnv[0] == '1';
-	char* endPtr = nullptr;
-	long k = std::strtol(env, &endPtr, 10);
-	if (!endPtr || k < 2 || (*endPtr != '\0' && *endPtr != ':'))
-		return;
+	long k = (long)req.k;
 
 	// One tile of both field arrays should be about half the last-level cache
 	// the run has -- unless that costs block depth on a model with little else
@@ -303,13 +342,8 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	if (W < 2 * k && tableBytes < 0.25 * fieldBytes)
 		W = std::min((long)((double)cacheBytes / planeBytes), 2 * k);
 
-	if (*endPtr == ':')
-	{
-		char* wEnd = nullptr;
-		W = std::strtol(endPtr + 1, &wEnd, 10);
-		if (!wEnd || *wEnd != '\0')
-			return;
-	}
+	if (req.W)
+		W = (long)req.W;
 
 	// W >= 2k is a hard constraint of the geometry, not a tuning choice: a
 	// wedge's dependencies reach k cells into each neighbouring core, so
@@ -319,9 +353,10 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 		k = W / 2;
 	if (k < 2)
 	{
-		cout << "AVX2 temporal blocking: disabled, x-planes too large ("
-		     << (planeBytes / (1024 * 1024)) << " MB) for a useful tile." << endl;
-		return;
+		std::ostringstream why;
+		why << "x-planes too large (" << (planeBytes / (1024 * 1024)) << " MB) for a useful tile.";
+		plan.why = why.str();
+		return plan;
 	}
 
 	// Name every extension that refuses, not just the first: a user who has to
@@ -339,9 +374,8 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	}
 	if (!refused.empty())
 	{
-		cout << "AVX2 temporal blocking: disabled, extension '" << refused
-		     << "' cannot be applied per x-range." << endl;
-		return;
+		plan.why = "extension '" + refused + "' cannot be applied per x-range.";
+		return plan;
 	}
 
 	// W >= 2k is a hard constraint of the geometry, not a tuning choice: a
@@ -350,9 +384,10 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	// Room for at least two cores, so there is a wedge to fill.
 	if ((long)numLines[0] < 2 * W && !force)
 	{
-		cout << "AVX2 temporal blocking: disabled, only " << numLines[0]
-		     << " x-lines for a tile width of " << W << "." << endl;
-		return;
+		std::ostringstream why;
+		why << "only " << numLines[0] << " x-lines for a tile width of " << W << ".";
+		plan.why = why.str();
+		return plan;
 	}
 
 	// Below roughly the run's L3 the flat sweep is already cache-resident and
@@ -363,13 +398,11 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	const double fitsBytes = std::max(48.0 * 1024 * 1024, cacheBytes * 4.0 / 3.0);
 	if (fieldBytes < fitsBytes && !force)
 	{
-		cout << "AVX2 temporal blocking: disabled, grid fits cache ("
-		     << (fieldBytes / (1024 * 1024)) << " MB of field state)." << endl;
-		return;
+		std::ostringstream why;
+		why << "grid fits cache (" << (fieldBytes / (1024 * 1024)) << " MB of field state).";
+		plan.why = why.str();
+		return plan;
 	}
-
-	m_blk_k = (unsigned int)k;
-	m_blk_W = (unsigned int)W;
 
 	// Tile boundaries, with one guarantee bolted on for the benefit of
 	// boundary-anchored extensions.
@@ -390,23 +423,51 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking()
 	// costs a little cache residency on one tile out of NX/W and buys Mur
 	// x-boundaries -- the most common absorbing boundary there is -- a blocked
 	// schedule at all.
-	m_blk_edges.clear();
+	std::vector<int> edges;
 	for (long x = 0; x < (long)numLines[0]; x += W)
-		m_blk_edges.push_back((int)x);
-	m_blk_edges.push_back((int)numLines[0]);
+		edges.push_back((int)x);
+	edges.push_back((int)numLines[0]);
 	const long minTail = k + 3;
-	if (m_blk_edges.size() >= 3 &&
-	    (long)numLines[0] - m_blk_edges.at(m_blk_edges.size() - 2) < minTail)
-		m_blk_edges.erase(m_blk_edges.end() - 2);
+	if (edges.size() >= 3 &&
+	    (long)numLines[0] - edges.at(edges.size() - 2) < minTail)
+		edges.erase(edges.end() - 2);
 
-	cout << "AVX2 temporal blocking ACTIVE (prototype): k=" << m_blk_k
-	     << ", tile width " << m_blk_W << " x-lines, "
-	     << (planeBytes * m_blk_W / (1024 * 1024)) << " MB per tile, "
-	     << (m_blk_edges.size() - 1) << " tiles; L3 " << llc.instances << " x "
-	     << (llc.instanceBytes / (1024 * 1024)) << " MB (" << llc.source << "); coefficient tables "
-	     << (tableBytes / (1024 * 1024)) << " MB; split by "
-	     << (m_blk_rowSplit ? "y-row" : "x-line") << ", barrier elision "
-	     << (m_blk_elide ? "on" : "off") << ", barrier spin " << m_barrierSpinUs << " us" << endl;
+	plan.active = true;
+	plan.k = (unsigned int)k;
+	plan.W = (unsigned int)W;
+	plan.tileMB = planeBytes * W / (1024 * 1024);
+	std::ostringstream detail;
+	detail << plan.tileMB << " MB per tile, "
+	       << (edges.size() - 1) << " tiles; L3 " << llc.instances << " x "
+	       << (llc.instanceBytes / (1024 * 1024)) << " MB (" << llc.source << "); coefficient tables "
+	       << (tableBytes / (1024 * 1024)) << " MB; split by "
+	       << (m_blk_rowSplit ? "y-row" : "x-line") << ", barrier elision "
+	       << (m_blk_elide ? "on" : "off") << ", barrier spin " << m_barrierSpinUs << " us";
+	plan.detail = detail.str();
+	if (edgesOut)
+		*edgesOut = edges;
+	return plan;
+}
+
+std::vector<TemporalBlockingRequest> Engine_AVX2_Multithread::TemporalBlockingCandidates(unsigned int maxDepth) const
+{
+	// Tiles of 25 % to 140 % of the L3 the threads occupy, counted as
+	// PlanTemporalBlocking() counts them (the fields only), each at k = W/2:
+	// the optima measured in PERFORMANCE.md §5.7 lie between 48 and 60 % on a
+	// model with large coefficient tables and near the whole cache on one
+	// without, always with k = W/2.
+	std::vector<TemporalBlockingRequest> out;
+	const double planeBytes = 2.0 * (double)m_vs_x * sizeof(f8vector);
+	const LLC_Span llc = QueryLastLevelCaches(m_numThreads);
+	const double cacheBytes = llc.totalBytes ? (double)llc.totalBytes : 32.0 * 1024 * 1024;
+	for (double share : {0.25, 0.35, 0.5, 0.7, 1.0, 1.4})
+	{
+		const unsigned int W = (unsigned int)std::min<double>(numLines[0], share * cacheBytes / planeBytes);
+		const unsigned int k = std::min({32u, W / 2, maxDepth});
+		if (k >= 2)
+			out.push_back(TemporalBlockingRequest::Forced(k, W));
+	}
+	return out;
 }
 
 void Engine_AVX2_Multithread::SplitRange(int lo, int hi, unsigned int nThreads,
