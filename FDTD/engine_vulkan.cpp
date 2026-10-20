@@ -32,6 +32,7 @@
 #include "Common/processing.h"
 #include "gpu_shader_spirv.h"
 #include "tools/constants.h"
+#include "tools/cache_topology.h"
 
 #include <iostream>
 #include <cstring>
@@ -593,8 +594,8 @@ void Engine_Vulkan::Init()
 	// last-level-cache size, so this is a tunable with a per-device-class
 	// default: the tile wants to be a fraction of the LLC it must stay in, and
 	// a discrete card's is far larger than an integrated one's share of the
-	// CPU LLC.  Measured optima on this host: 64 MB tiles on an RX 6800
-	// (128 MB Infinity Cache), 16 MB on a UHD 770 (36 MB shared L3).
+	// CPU LLC.  Measured optima: 64 MB tiles on an RX 6800 (128 MB Infinity
+	// Cache), 30 MB on a UHD 770 (36 MB shared L3).
 	// 0 here means "resolve from the device class in ConfigureTemporalBlocking".
 	if (const char* env = std::getenv("OPENEMS_GPU_TEMPORAL_BLOCK_MB"))
 	{
@@ -4536,20 +4537,35 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	const uint64_t planeBytes = plane * cellBytes;
 	const uint64_t totalBytes = planeBytes * (uint64_t)NX + tableBytes;
 
-	// The default: discrete cards only.  Integrated GPUs gain from nothing to
-	// 1.4x, depending on whether they share a large CPU L3 and are bandwidth-
-	// rather than compute-bound (PERFORMANCE.md §5.5, §5.8): opt-in there.
+	// The default: discrete and integrated GPUs.  A CPU or virtual device
+	// (llvmpipe, a passthrough) has no cache of its own to block into.
 	VkPhysicalDeviceProperties props{};
 	vkGetPhysicalDeviceProperties(m_physDevice, &props);
-	if (m_tbAuto && props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+	const bool integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+	if (m_tbAuto && !integrated && props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
 		return;
 
-	// Vulkan exposes no last-level-cache size, so the tile target is a
-	// tunable.  Integrated GPUs share the CPU's LLC and get a smaller default.
-	unsigned int targetMB = m_tbTargetMB;
-	if (targetMB == 0)
-		targetMB = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 16 : 64;
-	const uint64_t target = (uint64_t)targetMB << 20;
+	// Vulkan exposes no cache size, so the tile target is a tunable with a
+	// default per device class.  An integrated GPU gets 80 % of one instance of
+	// the CPU's L3, the cache it shares on Intel parts up to Raptor Lake: a
+	// UHD 770 ran 1.37x faster on 25 % less energy per cell with a 30 MB tile
+	// of its 36 MB, an HD 530 at the same speed on 5 % less energy with 7 MB of
+	// its 8 MB, and a tile larger than the L3 gave much of that back
+	// (PERFORMANCE.md §5.5).  Whether a GPU can use that cache at all is not
+	// queryable either and depends on the SoC -- the Vega 7 cannot, and
+	// Intel's GPUs left the CPU's ring with Meteor Lake -- but a tile its
+	// cache cannot hold costs only the wedges: under 1 % on the Vega 7.
+	uint64_t target = (uint64_t)m_tbTargetMB << 20;
+	unsigned int llcMB = 0;
+	if (target == 0 && integrated)
+	{
+		const LLC_Span llc = QueryLastLevelCaches(1);
+		llcMB = (unsigned int)(llc.instanceBytes >> 20);
+		target = llc.instanceBytes ? (uint64_t)(0.8 * (double)llc.instanceBytes) : 16ull << 20;
+	}
+	else if (target == 0)
+		target = 64ull << 20;
+	const unsigned int targetMB = (unsigned int)(target >> 20);
 
 	// A grid between the target and the card's real cache is resident
 	// already, and blocking it costs a few percent (PERFORMANCE.md §5.5).
@@ -4666,7 +4682,10 @@ void Engine_Vulkan::ConfigureTemporalBlocking()
 	          << (m_tbAuto ? " (default)" : "") << " — k=" << k
 	          << " W=" << W << " (" << (m_tbEdges.size() - 1) << " tiles, "
 	          << ((uint64_t)W * planeBytes >> 20) << " MB/tile, "
-	          << (totalBytes >> 20) << " MB of fields and coefficients)" << endl;
+	          << (totalBytes >> 20) << " MB of fields and coefficients";
+	if (llcMB)
+		cout << "; target " << targetMB << " MB = 80 % of the CPU's " << llcMB << " MB L3";
+	cout << ")" << endl;
 }
 
 void Engine_Vulkan::RecordUPMLSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const
