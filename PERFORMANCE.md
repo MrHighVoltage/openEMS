@@ -64,8 +64,12 @@ This is the one-page answer. §2 onward is the detail and the method.
   on an RX 7900 XTX, bit-identical to the flat sweep. A full 60 ps run of it on
   the XTX drops from 3.9 h to **1.5 h**, with port files identical to the flat
   run's. It is on by default for discrete GPUs on grids well beyond their cache
-  (§5.8). On the integrated GPUs it stays opt-in: 1.38× on the UHD 770, which
-  shares the i9-13900K's 36 MB L3, nothing on the HD 530 and the Vega 7.
+  (§5.8). Since 2026-10-20 it is on for integrated GPUs too, with a tile sized
+  from the CPU's L3 (§5.9). On the UHD 770, which shares the i9-13900K's 36 MB
+  L3, that is worth 1.37× and 29 % less energy per cell. The HD 530 keeps its
+  speed and saves 6 %. The Vega 7, which cannot use the L3, runs 1 % slower.
+  `--benchmark` measures the schedules on a given model and prints the options
+  for the fastest.
 - **Thread auto-tune on many-core machines.** Upstream's search leaves
   **15–53%** on the table on the 32-thread host; the fork's default lands within
   3–5% of its own pinned optimum there, and 99–100% on the four-core host (§3.3).
@@ -946,8 +950,8 @@ re-measured.
 ### 5.5 GPU limits: a guessed tile target, and compute-bound devices
 
 The tile target is a **tunable with a per-device-class default** — 64 MB
-discrete, 16 MB integrated — because Vulkan exposes no last-level-cache size to
-query. On the RX 6800 the real cache is 128 MB, so a grid between 64 and 128 MB
+discrete, and 16 MB integrated at the time (80 % of the CPU's L3 since §5.9) —
+because Vulkan exposes no last-level-cache size to query. On the RX 6800 the real cache is 128 MB, so a grid between 64 and 128 MB
 is already cache-resident but still looks too large to the guard. It engages,
 adds the trapezoid's wedge overhead, and saves traffic that was not being spent:
 
@@ -964,16 +968,20 @@ about 5% in the direct single-run A/B above. Either way it is a loss, and it is
 avoidable per host with one environment variable.
 
 This is a defaulting problem, not a schedule problem, and the fix is known: a
-device-ID table or a startup micro-probe instead of a constant. §5.8 found a
+device-ID table or a startup micro-probe instead of a constant. §5.9 took a
+third way: `--benchmark` measures the schedules on the model itself. §5.8 found a
 second defect in the same guess: the target counts only field bytes, so with an
 uncompressed operator a tile is three times larger than the target, and the
 default reaches 1.22× where 3.2× was available. Until then, on a
 card with an unusually large last-level cache, set
-`OPENEMS_GPU_TEMPORAL_BLOCK_MB` to it.
+`OPENEMS_GPU_TEMPORAL_BLOCK_MB` (now also `--gpu-temporal-block-mb`) to it.
 
-On a **compute-bound** device the schedule cannot help at all: the HD 530 is
-flat at 1.00×–1.04× on every row, because removing DRAM traffic from a kernel
-whose limit is 24 execution units removes nothing that was in the way.
+On the HD 530 the schedule does not help speed: it is flat at 1.00×–1.04× on
+every row. This section first put that down to a compute limit, its 24
+execution units. That was wrong. §5.9 measured the DRAM traffic: the HD 530
+runs a few percent of its FLOP rate, and an on-chip ceiling happens to
+coincide with its DRAM limit. Blocking removes a third of the DRAM traffic,
+which saves energy, and the other ceiling keeps the speed where it was.
 
 The Vega 7 is flat too — 482.5 flat against 485.1 blocked on 224³ PEC, and a
 depth sweep that does not move at all:
@@ -1006,7 +1014,8 @@ Both schedules were prototypes behind environment variables —
 k=16 on the CPU and on the RX 6800, k=6 on the integrated devices) — and did
 nothing unless set. The CPU schedule still is. Since 2026-10-19 the GPU one is
 on by default on a discrete card for grids beyond twice its tile target
-(§5.8). Two limits are worth knowing before relying on the numbers
+(§5.8), and since 2026-10-20 on an integrated one (§5.9). Both now also take
+command-line options, `--gpu-temporal-block` and `--avx2-temporal-block`. Two limits are worth knowing before relying on the numbers
 in §5.2 and §5.4:
 
 - **Block depth is capped by the probe interval.** `openems.cpp` calls
@@ -1415,7 +1424,8 @@ to the flat run of two days earlier. That holds with the probe cadence (every
 probe loop, and the 64-timestep batch limit all in play.
 
 **On the integrated GPUs the default stays flat, and should for two of the
-three.** The same TL model, 5000 timesteps, forced schedules
+three.** (Superseded the next day by §5.9, which measured what the speed did
+not show and turned it on.) The same TL model, 5000 timesteps, forced schedules
 (`OPENEMS_GPU_TEMPORAL_BLOCK=k`, tile from `OPENEMS_GPU_TEMPORAL_BLOCK_MB`;
 the integrated default target is 16 MB), MC/s. Rows with all three devices
 are two rounds; the UHD 770-only rows are one:
@@ -1439,13 +1449,15 @@ The three devices repeat §5.4 and §5.5 more sharply:
   than the 1.08–1.17× of §5.4's uniform grids, probably because this operator
   is uncompressed: each cell streams 72 B instead of about 25, so more of the
   time is DRAM traffic that a tile can save.
-- **HD 530**: within 2 % of flat at every depth. It is limited by its 24
-  execution units, not by memory.
+- **HD 530**: within 2 % of flat at every depth. This bullet said it was
+  limited by its 24 execution units, not by memory. §5.9 found two
+  coincident ceilings instead, one of them the DRAM.
 - **Vega 7**: up to 2 % slower than flat. It has no last-level cache to hold a
   tile.
 
 Enabling it by default on integrated GPUs would need to tell a UHD 770 from
-the other two, which Vulkan's device type does not.
+the other two, which Vulkan's device type does not. §5.9 enables it anyway:
+on a device that cannot hold the tile, it costs about 1 %.
 
 One HD 530 flat run failed after 2048 timesteps with `VK_ERROR_DEVICE_LOST`. The
 kernel log shows `Resetting rcs0 for preemption time out`: a 64-timestep batch
@@ -1466,6 +1478,197 @@ are `python/Tests/bench_gpu_sync.py`, whose `tbK[wW]` and `tbmbN` options set
 the schedule (`tb0` is flat), and `python/Tests/gpu_tblock_identity.py`. The
 variant model, the sweep scripts and the dump comparison are in the
 `tests/gpuprof` kit.
+
+### 5.9 Integrated GPUs, and a benchmark mode in place of a cache table (2026-10-20)
+
+§5.8 left blocking off on integrated GPUs: 1.38× on the UHD 770, nothing on
+the HD 530 and the Vega 7, and no way to tell them apart through Vulkan. Two
+more measurements on the same TL model changed that: the DRAM traffic, from
+the memory controllers, and the energy, from RAPL. Both come from `perf`
+system-wide (`bench_gpu_sync.py --counters`), with an idle reading of the
+same counters subtracted.
+
+**DRAM traffic per cell update**, 5000 timesteps, two rounds, MC/s and bytes
+per cell per timestep:
+
+| Schedule (tile) | UHD 770 MC/s | B/cell | HD 530 MC/s | B/cell | Vega 7 MC/s | B/cell |
+|---|---|---|---|---|---|---|
+| flat | 316 | 123 | 251 | 109 | 298 | 141 |
+| k=2, 5 lines (6 MB) | 354 | 73 | 253 | 70 | 291 | 144 |
+| k=4, 11 lines (15 MB) | 403 | 39 | 255 | 75 | 296 | 142 |
+| k=8, 22 lines (30 MB) | 429 | 24 | 251 | 100 | 297 | 141 |
+| k=11, 22 lines (30 MB) | **434** | **20** | 251 | 100 | 298 | 141 |
+| k=16, 45 lines (62 MB) | 412 | 46 | 251 | 106 | 298 | 141 |
+
+The ideal flat sweep moves about 120 B per cell and timestep: per half-step
+it reads and writes the 12 B of the field it updates, and reads the 12 B of
+the other field and 24 B of coefficients. Per device:
+
+- **UHD 770.** Flat it draws 39 GB/s, about 80 % of what the memory delivers,
+  so it is DRAM-bound. Blocking cuts the traffic sixfold, roughly as
+  120/k + 9 B, until the next ceiling at about 430 MC/s. A tile larger than
+  the 36 MB L3 gives half of the saving back.
+- **HD 530.** It is not compute-bound, as §5.5 and §5.8 had it: it runs at
+  a few percent of its FLOP rate. It has two ceilings that happen to
+  coincide. One is the DRAM: flat draws 27.5 GB/s, the same as a run with
+  16-timestep batches. The other is on chip, at about 255 MC/s, probably the
+  GPU's path into the LLC. Blocking cuts the traffic by a third with a tile
+  that fits the 8 MB L3, and the second ceiling keeps the speed where it was.
+  On this Skylake the memory controller counts the GPU's reads apart from the
+  cores' (`gt_requests`), but not its writes, which reach DRAM as LLC
+  write-backs.
+- **Vega 7.** The traffic is the same on every schedule. One x-plane of this
+  model is 1.5 MB, its L2 is 1 MB, and it cannot use the CPU's L3, so an
+  x-slab tile can never stay resident. Only tiling in y and z could help it.
+
+**Energy per cell update**, package plus DRAM where RAPL reports it,
+5000 timesteps, three rounds, against flat:
+
+| | flat | k=2 (6 MB) | k=4 (15 MB) | k=11, 22 lines (30 MB) |
+|---|---|---|---|---|
+| UHD 770 | 66.5 nJ | −10 % | −20 % | **−26 %** |
+| HD 530 | 95.7 nJ | **−6 %** | −5 % | −1 % |
+| Vega 7 | 92.7 nJ | +0.3 % | 0 % | +0.1 % |
+
+These are gross values, busy power over speed. On srv002 one round's idle
+readings ran 2–3 W high, which makes the idle-subtracted values unreliable,
+and one flat run is left out: its package drew 1.5 W less than every other
+run. With it, the HD 530 row reads −4 / −3 / +1 %.
+
+- On the UHD 770 the package draws about 17 W on every schedule, so the
+  saving is the speed.
+- On the HD 530 speed and package power (19.6–19.9 W) do not move. The DRAM
+  modules draw 3.1 W instead of 4.4 W when the tile fits the L3, which is the
+  whole saving. The 30 MB tile does not fit and saves nothing.
+
+All three are bit-identical to the flat sweep on every schedule: the built-in
+cases at 4:12 to 24:48 and the TL model at 2:5 to 16:45, probes included.
+
+**The default since 0107f8e.** An integrated GPU blocks too, with a tile of
+80 % of one instance of the CPU's L3. The size comes from the same query the
+AVX2 engine uses (hwloc, else `sysconf`), and is 16 MB where it cannot be
+read. Neither the size nor the sharing is something Vulkan reports:
+
+- No cache size is exposed, in core 1.4 or in any vendor extension. OpenCL's
+  "global memory cache size" is no substitute: on the RX 6800 it reports
+  16 KiB, the per-unit L0.
+- Whether an integrated GPU can use the CPU's L3 depends on the SoC. Intel
+  parts up to Raptor Lake can; from Meteor Lake on the GPU sits off the CPU's
+  ring. The Vega 7 cannot.
+
+Turning it on regardless is safe because a tile the cache cannot hold costs
+only the wedges. With the default, 5000 timesteps, two rounds:
+
+| | flat MC/s | default | MC/s | B/cell | nJ/cell |
+|---|---|---|---|---|---|
+| UHD 770 | 315 | k=10, 20 lines (27 MB) | **431** (1.37×) | 123 → 23 | 54.8 → 39.1 (−29 %) |
+| HD 530 | 251 | k=2, 4 lines (5 MB) | 252 | 110 → 72 | 81.8 → 76.9 (−6 %) |
+| Vega 7 | 298 | k=4, 9 lines (12 MB) | 295 (−1.1 %) | 141 → 142 | 79.8 → 80.0 (+0.3 %) |
+
+Here nJ/cell is idle-subtracted, package only on the UHD 770 and the Vega 7.
+The default is bit-identical on all three, and small built-in grids stay flat
+because they fall below the threshold.
+
+**Command-line options.** The schedule no longer needs the environment:
+
+- `--gpu-temporal-block=auto|off|<k>|<k>:<W>`
+- `--gpu-temporal-block-mb=<MB>`
+- `--avx2-temporal-block=off|<k>|<k>:<W>`
+
+Each replaces the environment variable of the same name, with a note where
+both are set. From Python they are `Run()` keywords:
+`FDTD.Run(sim_path, gpu_temporal_block='11:22')`.
+
+**`--benchmark`** answers the cache question per model instead of per device
+class. The simulation is set up as usual. Then the engine's schedules run one
+after another on the real model, excitation and probes included. Every
+schedule computes the same fields, so the schedule simply changes between two
+batches. The candidates are:
+
+- the flat sweep;
+- on the GPU, tile targets from 4 to 256 MB at k = W/2;
+- on the AVX2 engine, 25 to 140 % of the L3;
+- the configured schedule.
+
+A probe interval below 32 timesteps caps their depth. A 2 s warm-up on the
+flat sweep, which also covers the AVX2 engine's thread calibration, sets the
+run length: about 3 s of the flat sweep, unless `--benchmark-timesteps` sets
+it. Each candidate runs twice, the second round in reverse order. Nothing is
+written into the simulation directory: field dumps are off, and the probes
+write into a scratch directory that is removed afterwards. The output, on the
+UHD 770:
+
+```
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     315.5     315.0     316.0          -
+  k=2 W=5           7 MB     350.7     350.1     351.4    +11.2 %
+  k=5 W=11         15 MB     404.5     403.8     405.2    +28.2 %
+  k=10 W=20        28 MB     428.1     427.7     428.5    +35.7 %   as configured
+  k=11 W=22        31 MB     430.9     431.5     430.3    +36.6 %
+  k=22 W=45        63 MB     385.0     385.4     384.5    +22.0 %
+  ...
+  Fastest: k=11 W=22, 430.9 MC/s, 1.37x the flat sweep.
+  As configured (k=10 W=20): 428.1 MC/s, 0.6 % below the recommendation.
+  To run this model with the recommendation on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=11:22
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='11:22')
+```
+
+On the TL model it takes 1–1.5 minutes. Its picks:
+
+| Device | flat | Recommended | Default | Default behind by |
+|---|---|---|---|---|
+| UHD 770 | 315 | k=11 W=22, 431 (1.37×) | k=10 W=20 | 0.6–1.5 % |
+| RX 6800 | 3450 | k=32 W=68, 7040 (2.04×) | k=22 W=45 | 0.5 % |
+| Vega 7 | 298 | flat: every schedule within 0.1 % | k=4 W=9 | 1.0 % |
+| HD 530 | 221* | k=4 W=8, 252 | k=2 W=4 | 8.9 %* |
+| AVX2, i9-13900K | 414 | k=18 W=37, 1407 (3.39×) | flat (opt-in) | 70 % |
+
+The two rounds agree within 0.5 % on the UHD 770 and the Vega 7 and within
+2 % on the HD 530. On the RX 6800 they differ by up to 3.9 % and on the AVX2
+engine by up to 7 %: that host is a desktop.
+
+\* **The HD 530 pays for short batches between processing steps.** Its
+benchmark runs are 140 timesteps long, and each ends the way a probe step
+does. A normal flat run of this model with probes every 140 or 280 timesteps
+manages 221 MC/s, against 249 every 1000 and 256 with this model's real
+interval of about 110 000. The benchmark therefore measures that GPU as a
+probe-dense model would run on it: flat 12 % low, shallow blocks less so.
+Its pick is still the fastest in a normal run: k=4 W=8 at 256.5 MC/s,
+against 252.1 for the default and 251.2 for flat. The GPU clock sits at its
+maximum in both cases; why short batches cost this much is open. No other
+device showed it. The benchmark's flat speeds on the UHD 770 (315) and the
+RX 6800 (3450) match their normal runs (315, 3484).
+
+Two rules in the recommendation:
+
+- **The flat sweep, unless a blocked schedule beats it by more than 1 %.** On
+  the Vega 7 the "fastest" was k=32 W=183, 0.1 MC/s ahead of flat, which is
+  noise.
+- **No tie-break toward small tiles.** The idea was to prefer, within 2 % of
+  the fastest, the schedule with the smallest tile, for the DRAM energy a
+  resident tile saves at equal speed. It was tried and dropped. While both
+  tiles fit, the deeper block of the larger one moves less data, and on the
+  UHD 770 the rule chose k=8 W=17, 1.6 % slower than the fastest. The HD 530
+  case it was meant for needs no rule. There the fastest schedule, at k=4,
+  saves nearly as much DRAM traffic as the smallest tile: 75 B per cell
+  against 70 at k=2 and 109 flat.
+
+What the benchmark does not see:
+
+- **Energy.** RAPL is neither portable nor readable without privileges.
+- **Thread count.** The AVX2 engine benchmarks at the thread count it
+  calibrated on the flat sweep: 6 of 32 on the i9-13900K. Blocking removes the
+  DRAM contention that limits that count (§5.7 ran 8 P-cores), so more threads
+  may be faster blocked.
+- **Field dumps.** They are off. A dump interval shorter than the probe
+  interval caps the depth in a real run, the same way probes do.
+- **Other meshes.** The options it prints are in x-lines, for this model.
+
+Raw output: `python/Tests/results/gpu_igpu_tblock_2026-10-20.txt`. The scripts
+(`sweep_igpu_dram.sh`, `split_skl_imc.sh`, `run_igpu_checks.sh`,
+`energy_summary.py`, `verify_igpu_default.sh`, `run_benchmark_mode.sh`) are in
+the `tests/gpuprof` kit.
 
 ---
 

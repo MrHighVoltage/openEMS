@@ -1,0 +1,626 @@
+# Temporal blocking on integrated GPUs, and --benchmark (2026-10-20)
+# Model: tl_skin_sub1 (247x153x133 = 5.03 M cells, uncompressed operator, 72 B/cell; Mur on six faces,
+#        two lumped ports, port probes every ~110k timesteps).
+# Hosts: cytex  = i9-13900K (36 MB L3) with UHD 770 (0000:00:02.0) and RX 6800 (0000:03:00.0); a desktop.
+#        srv002 = i7-6700K (8 MB L3) with HD 530 (0000:00:02.0); shared home server.
+#        srv003 = Ryzen 5 5600G (16 MB L3) with Vega 7 (0000:08:00.0; 1 MB L2, no access to the L3).
+# Builds: sections 1-3 a32c439 (tests/gpuprof/bin-tb3); section 4 0107f8e (bin-tb4);
+#         sections 5-6 407a4f4 (bin-tb6). One simulation at a time per host.
+# Counters: perf -a, kernel.perf_event_paranoid <= 0. DRAM: uncore_imc_free_running (cytex),
+#         uncore_imc data_reads/data_writes (srv002), amd_df dram channels (srv003). Energy: RAPL power/energy-*.
+#         Each run is preceded by an idle reading of the same counters, which is subtracted.
+
+## 1. DRAM traffic per cell update, flat against blocked (tests/gpuprof/sweep_igpu_dram.sh; 5000 TS, 2 rounds)
+#    GB/s and B/cell are the run's, idle subtracted. The "MB field state/tile" labels are MiB, truncated.
+
+### cytex
+cytex: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc_free_running
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell  GT B/c  stages (us/TS)
+plain                 316.6        -       -       -        -    39.2   123.7       -  
+plain/tb2/tbmb8       353.8        -       -       -        -    25.7    72.7       -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             402.3        -       -       -        -    15.7    39.1       -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      429.2        -       -       -        -    10.4    24.3       -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb11w22         434.1        -       -       -        -     8.8    20.3       -  k=11 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     412.1        -       -       -        -    19.2    46.6       -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain                 316.2        -       -       -        -    38.9   122.8       -  
+plain/tb2/tbmb8       353.5        -       -       -        -    25.8    72.9       -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             403.1        -       -       -        -    15.8    39.1       -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      429.6        -       -       -        -     9.9    23.1       -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb11w22         434.0        -       -       -        -     8.9    20.6       -  k=11 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     411.9        -       -       -        -    18.9    46.0       -  k=16 W=45, 6 tiles, 62 MB field state/tile
+=== done
+
+### srv002
+srv002: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell  GT B/c  stages (us/TS)
+plain                     -        -       -       -        -       -       -       -  
+plain/tb2/tbmb8       253.1        -       -       -        -    17.6    69.5    52.6  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             255.3        -       -       -        -    19.2    75.3    59.9  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      251.0        -       -       -        -    25.1   100.1    79.7  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb11w22         250.7        -       -       -        -    25.1   100.1    79.7  k=11 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     251.0        -       -       -        -    26.6   105.9    84.4  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain                 251.2        -       -       -        -    27.5   109.4    87.3  
+plain/tb2/tbmb8       253.2        -       -       -        -    17.7    69.9    52.6  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             255.3        -       -       -        -    19.1    75.0    59.7  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      250.9        -       -       -        -    25.1   100.0    79.6  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb11w22         250.8        -       -       -        -    25.1   100.2    79.8  k=11 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     251.0        -       -       -        -    26.7   106.5    84.5  k=16 W=45, 6 tiles, 62 MB field state/tile
+=== done
+
+### srv003
+srv003: 0000:08:00.0, 5000 timesteps, tl_skin_sub1.xml; DRAM counters amd_df
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell  GT B/c  stages (us/TS)
+plain                 298.1        -       -       -        -    42.1   141.2       -  
+plain/tb2/tbmb8       291.2        -       -       -        -    41.8   143.6       -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             295.7        -       -       -        -    42.0   142.1       -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      297.4        -       -       -        -    42.1   141.4       -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb11w22         297.4        -       -       -        -    42.1   141.4       -  k=11 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     298.1        -       -       -        -    42.1   141.2       -  k=16 W=45, 6 tiles, 62 MB field state/tile
+plain                 298.2        -       -       -        -    42.1   141.2       -  
+plain/tb2/tbmb8       291.3        -       -       -        -    41.8   143.6       -  k=2 W=5, 49 tiles, 6 MB field state/tile
+plain/tb4             295.7        -       -       -        -    42.0   142.1       -  k=4 W=11, 22 tiles, 15 MB field state/tile
+plain/tb8/tbmb32      297.4        -       -       -        -    42.1   141.4       -  k=8 W=22, 11 tiles, 30 MB field state/tile
+plain/tb11w22         297.5        -       -       -        -    42.1   141.4       -  k=11 W=22, 11 tiles, 30 MB field state/tile
+plain/tb16/tbmb64     298.1        -       -       -        -    42.1   141.2       -  k=16 W=45, 6 tiles, 62 MB field state/tile
+=== done
+
+### srv002, uncore_imc split (tests/gpuprof/split_skl_imc.sh): gt_requests counts the GPU's reads only;
+### its writes reach DRAM as LLC write-backs, counted as ia_requests. MiB over the window.
+=== plain/sub16 idle
+803.35,uncore_imc/data_reads/
+73.59,uncore_imc/data_writes/
+0.00,uncore_imc/gt_requests/
+876.87,uncore_imc/ia_requests/
+0.09,uncore_imc/io_requests/
+srv002: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell  GT B/c  stages (us/TS)
+=== plain/sub16 busy
+210998.40,uncore_imc/data_reads/
+51882.28,uncore_imc/data_writes/
+209084.39,uncore_imc/gt_requests/
+53797.58,uncore_imc/ia_requests/
+0.06,uncore_imc/io_requests/
+plain/sub16           221.3        -       -       -        -       -       -       -  
+=== plain/tb2/tbmb8 idle
+1531.78,uncore_imc/data_reads/
+403.20,uncore_imc/data_writes/
+0.00,uncore_imc/gt_requests/
+1928.54,uncore_imc/ia_requests/
+6.43,uncore_imc/io_requests/
+srv002: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell  GT B/c  stages (us/TS)
+=== plain/tb2/tbmb8 busy
+131922.50,uncore_imc/data_reads/
+40296.38,uncore_imc/data_writes/
+126994.90,uncore_imc/gt_requests/
+45203.14,uncore_imc/ia_requests/
+12.43,uncore_imc/io_requests/
+plain/tb2/tbmb8       253.2        -       -       -        -       -       -       -  k=2 W=5, 49 tiles, 6 MB field state/tile
+
+## 2. Bit-identity of the blocked schedules (tests/gpuprof/run_igpu_checks.sh, python/Tests/gpu_tblock_identity.py)
+#    Built-in cases x {flat again, Mur unfused, 4:12, 8:20, 16:40, 24:48, default}; TL x {2:5, 4:11, 8:22, 11:22, 16:45}.
+#    srv003 has no h5py: its dumps were compared on cytex (--compare).
+
+### uhd770
+=== mur_rlc
+  flat again        338.592 MC/s  identical
+  flat Mur unfused  361.573 MC/s  identical
+  tblock 4:12         251.4 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20        279.81 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40       312.88 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      324.857 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           349.587 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== tfsf
+  flat again        336.497 MC/s  identical
+  flat Mur unfused  335.576 MC/s  identical
+  tblock 4:12       194.889 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       258.981 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      278.087 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      296.041 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           348.324 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== pml_mur
+  flat again         213.51 MC/s  identical
+  flat Mur unfused  217.702 MC/s  identical
+  tblock 4:12       181.724 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       191.579 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      206.573 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      211.758 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           218.998 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== pml_mur_unfused
+  flat again        175.564 MC/s  identical
+  flat Mur unfused  182.638 MC/s  identical
+  tblock 4:12       135.092 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       146.628 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      151.823 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      167.809 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           182.017 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== local_abc
+  flat again        411.284 MC/s  identical
+  flat Mur unfused  404.961 MC/s  identical
+  tblock 4:12       281.214 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       330.861 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      358.889 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      375.871 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           435.954 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== local_abc_sa
+  flat again        388.535 MC/s  identical
+  flat Mur unfused  393.896 MC/s  identical
+  tblock 4:12       225.808 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       277.742 MC/s  identical  [k=8 W=20, 4 tiles]
+  tblock 16:40      339.335 MC/s  identical  [k=16 W=40, 2 tiles]
+  tblock 24:48      333.547 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           376.384 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+all identical
+=== tl_skin_sub1
+  flat again         308.42 MC/s  identical
+  flat Mur unfused   300.19 MC/s  identical
+  tblock 2:5         338.82 MC/s  identical  [k=2 W=5, 49 tiles]
+  tblock 4:11        385.09 MC/s  identical  [k=4 W=11, 22 tiles]
+  tblock 8:22        408.57 MC/s  identical  [k=8 W=22, 11 tiles]
+  tblock 11:22       409.00 MC/s  identical  [k=11 W=22, 11 tiles]
+  tblock 16:45       391.79 MC/s  identical  [k=16 W=45, 6 tiles]
+  default            306.53 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+all identical
+
+### hd530
+=== mur_rlc
+  flat again        221.076 MC/s  identical
+  flat Mur unfused  212.313 MC/s  identical
+  tblock 4:12       136.148 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       149.186 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      190.274 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      202.778 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           217.874 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== tfsf
+  flat again        191.919 MC/s  identical
+  flat Mur unfused  192.812 MC/s  identical
+  tblock 4:12       97.5382 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       135.978 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      144.951 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      164.606 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           195.344 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== pml_mur
+  flat again        146.905 MC/s  identical
+  flat Mur unfused  144.915 MC/s  identical
+  tblock 4:12       103.772 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       134.208 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      138.366 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      138.752 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           144.926 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== pml_mur_unfused
+  flat again        112.489 MC/s  identical
+  flat Mur unfused  114.938 MC/s  identical
+  tblock 4:12       70.9135 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       78.2168 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      92.0004 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      101.531 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           113.501 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== local_abc
+  flat again        257.046 MC/s  identical
+  flat Mur unfused    263.9 MC/s  identical
+  tblock 4:12       142.538 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       185.926 MC/s  identical  [k=8 W=20, 5 tiles]
+  tblock 16:40      197.775 MC/s  identical  [k=16 W=40, 3 tiles]
+  tblock 24:48      227.023 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           261.104 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+=== local_abc_sa
+  flat again        222.337 MC/s  identical
+  flat Mur unfused  219.799 MC/s  identical
+  tblock 4:12       105.087 MC/s  identical  [k=4 W=12, 8 tiles]
+  tblock 8:20       147.646 MC/s  identical  [k=8 W=20, 4 tiles]
+  tblock 16:40      183.862 MC/s  identical  [k=16 W=40, 2 tiles]
+  tblock 24:48      187.426 MC/s  identical  [k=24 W=48, 2 tiles]
+  default           222.046 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+all identical
+=== tl_skin_sub1
+  flat again         208.90 MC/s  identical
+  flat Mur unfused   205.98 MC/s  identical
+  tblock 2:5         221.05 MC/s  identical  [k=2 W=5, 49 tiles]
+  tblock 4:11        229.75 MC/s  identical  [k=4 W=11, 22 tiles]
+  tblock 8:22        205.32 MC/s  identical  [k=8 W=22, 11 tiles]
+  tblock 11:22       210.25 MC/s  identical  [k=11 W=22, 11 tiles]
+  tblock 16:45       207.40 MC/s  identical  [k=16 W=45, 6 tiles]
+  default            201.88 MC/s  identical  [not blocked: not a discrete GPU, or no message]
+all identical
+
+### vega7
+=== mur_rlc
+=== tfsf
+=== pml_mur
+=== pml_mur_unfused
+=== local_abc
+=== local_abc_sa
+=== tl_skin_sub1
+
+### vega7, compared on cytex
+  tblock-8-20      identical  [k=8 W=20, 5 tiles]
+
+all identical
+  tblock-8-22      identical  [k=8 W=22, 11 tiles]
+
+all identical
+
+## 3. Energy per cell update (tests/gpuprof/energy_summary.py over energy-*/tl/results.jsonl; 5000 TS, 3 rounds)
+#    nJ/cell = (package + DRAM) power / MC/s, idle subtracted; gross nJ without the subtraction.
+#    cytex and srv003 have no DRAM RAPL domain. srv002: round 3's idle readings ran 2-3 W high, and the first
+#    flat run's busy package power (18.2 W) is 1.5 W below every other run; gross values are the cleaner ones there.
+
+cytex (energy-uhd770/tl/results.jsonl)
+  variant              n    MC/s  B/cell  pkg W  gpu W  ram W nJ/cell (min-max)  vs flat  gross nJ  vs flat
+  plain                3   315.2   122.8   16.1    6.4      -   51.2 (50.5-51.8)    +0.0%      66.5    +0.0%
+  plain/tb2/tbmb8      3   352.1    73.0   16.7    6.8      -   47.4 (46.6-48.5)    -7.3%      60.0    -9.8%
+  plain/tb4            3   402.5    39.2   17.0    7.4      -   42.3 (41.4-43.3)   -17.3%      53.3   -19.8%
+  plain/tb11w22        3   433.6    21.0   17.0    7.8      -   39.2 (38.7-40.2)   -23.4%      49.5   -25.6%
+
+srv002 (energy-hd530/tl/results.jsonl)
+  variant              n    MC/s  B/cell  pkg W  gpu W  ram W nJ/cell (min-max)  vs flat  gross nJ  vs flat
+  plain                3   251.2   109.6   17.4   13.1    3.7   84.3 (81.6-87.8)    +0.0%      93.7    +0.0%
+  plain/tb2/tbmb8      3   253.1    70.0   17.6   13.5    2.4   79.2 (73.9-82.5)    -6.0%      90.0    -4.0%
+  plain/tb4            3   255.3    75.7   17.8   13.8    2.7   80.3 (75.5-83.0)    -4.7%      90.9    -3.0%
+  plain/tb11w22        3   250.8   100.7   17.6   13.3    3.5   84.0 (78.4-87.0)    -0.3%      94.8    +1.2%
+
+srv003 (energy-vega7/tl/results.jsonl)
+  variant              n    MC/s  B/cell  pkg W  gpu W  ram W nJ/cell (min-max)  vs flat  gross nJ  vs flat
+  plain                3   298.1   141.1   23.8      -      -   79.8 (78.6-80.5)    +0.0%      92.7    +0.0%
+  plain/tb2/tbmb8      3   291.3   143.6   23.3      -      -   80.1 (79.8-80.5)    +0.4%      93.0    +0.3%
+  plain/tb4            3   295.8   142.0   23.7      -      -   80.1 (79.9-80.4)    +0.4%      92.7    +0.0%
+  plain/tb11w22        3   297.5   141.4   23.9      -      -   80.3 (80.3-80.3)    +0.6%      92.8    +0.1%
+
+## 4. The integrated default of 0107f8e (tile = 80 % of one L3 instance; tests/gpuprof/verify_igpu_default.sh)
+
+### uhd770
+=== mur_rlc
+  default           356.852 MC/s  identical  [not blocked: grid already fits the 57 MB default threshold (3 MB of fields and coefficients)]
+=== tfsf
+  default           335.158 MC/s  identical  [not blocked: grid already fits the 57 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur
+  default           213.015 MC/s  identical  [not blocked: grid already fits the 57 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur_unfused
+  default           179.737 MC/s  identical  [not blocked: grid already fits the 57 MB default threshold (3 MB of fields and coefficients)]
+=== local_abc
+  default           427.958 MC/s  identical  [not blocked: grid already fits the 57 MB default threshold (3 MB of fields and coefficients)]
+=== local_abc_sa
+  default           384.929 MC/s  identical  [not blocked: grid already fits the 57 MB default threshold (3 MB of fields and coefficients)]
+all identical
+=== tl_skin_sub1
+  default            408.20 MC/s  identical  [k=10 W=20, 12 tiles]
+all identical
+##### speed and energy, flat against the default
+cytex: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc_free_running
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell   GT rd  pkg W  gpu W  ram W nJ/cell  stages (us/TS)
+plain/tb0             315.5        -       -       -        -    38.9   123.3       -   17.3    6.3      -    54.9  
+plain                 430.5        -       -       -        -    10.0    23.2       -   17.1    7.7      -    39.8  k=10 W=20, 12 tiles, 27 MB field state/tile
+plain/tb0             314.1        -       -       -        -    38.7   123.2       -   17.1    6.3      -    54.6  
+plain                 430.6        -       -       -        -     9.4    21.9       -   16.5    7.8      -    38.4  k=10 W=20, 12 tiles, 27 MB field state/tile
+##### done
+
+### hd530
+=== mur_rlc
+  default           221.468 MC/s  identical  [not blocked: grid already fits the 12 MB default threshold (3 MB of fields and coefficients)]
+=== tfsf
+  default           194.983 MC/s  identical  [not blocked: grid already fits the 12 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur
+  default           146.182 MC/s  identical  [not blocked: grid already fits the 12 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur_unfused
+  default           112.888 MC/s  identical  [not blocked: grid already fits the 12 MB default threshold (3 MB of fields and coefficients)]
+=== local_abc
+  default           262.407 MC/s  identical  [not blocked: grid already fits the 12 MB default threshold (3 MB of fields and coefficients)]
+=== local_abc_sa
+  default             220.4 MC/s  identical  [not blocked: grid already fits the 12 MB default threshold (3 MB of fields and coefficients)]
+all identical
+=== tl_skin_sub1
+  default            215.76 MC/s  identical  [k=2 W=4, 61 tiles]
+all identical
+##### speed and energy, flat against the default
+srv002: 0000:00:02.0, 5000 timesteps, tl_skin_sub1.xml; DRAM counters uncore_imc
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell   GT rd  pkg W  gpu W  ram W nJ/cell  stages (us/TS)
+plain/tb0             251.2        -       -       -        -    27.5   109.6    87.5   16.9   13.1    3.7    82.2  
+plain                 252.0        -       -       -        -    18.2    72.4    54.6   16.9   13.3    2.5    77.1  k=2 W=4, 61 tiles, 5 MB field state/tile
+plain/tb0             251.2        -       -       -        -    27.5   109.4    87.4   16.7   13.1    3.7    81.4  
+plain                 252.1        -       -       -        -    18.3    72.4    54.7   16.8   13.4    2.5    76.7  k=2 W=4, 61 tiles, 5 MB field state/tile
+##### done
+
+### vega7
+=== mur_rlc
+  default           284.708 MC/s  ran (not compared: no h5py here)  [not blocked: grid already fits the 25 MB default threshold (3 MB of fields and coefficients)]
+=== tfsf
+  default           244.511 MC/s  ran (not compared: no h5py here)  [not blocked: grid already fits the 25 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur
+  default           214.432 MC/s  ran (not compared: no h5py here)  [not blocked: grid already fits the 25 MB default threshold (3 MB of fields and coefficients)]
+=== pml_mur_unfused
+  default           119.659 MC/s  ran (not compared: no h5py here)  [not blocked: grid already fits the 25 MB default threshold (3 MB of fields and coefficients)]
+=== local_abc
+  default           307.572 MC/s  ran (not compared: no h5py here)  [not blocked: grid already fits the 25 MB default threshold (3 MB of fields and coefficients)]
+=== local_abc_sa
+  default           271.737 MC/s  ran (not compared: no h5py here)  [not blocked: grid already fits the 25 MB default threshold (3 MB of fields and coefficients)]
+=== tl_skin_sub1
+  default            215.09 MC/s  ran (not compared: no h5py here)  [k=4 W=9, 27 tiles]
+##### speed and energy, flat against the default
+srv003: 0000:08:00.0, 5000 timesteps, tl_skin_sub1.xml; DRAM counters amd_df
+variant                MC/s    us/TS  idle % barr/TS  batches    GB/s  B/cell   GT rd  pkg W  gpu W  ram W nJ/cell  stages (us/TS)
+plain/tb0             298.1        -       -       -        -    42.0   140.9       -   23.7      -      -    79.3  
+plain                 294.9        -       -       -        -    42.0   142.3       -   23.6      -      -    80.2  k=4 W=9, 27 tiles, 12 MB field state/tile
+plain/tb0             298.1        -       -       -        -    42.1   141.2       -   23.9      -      -    80.3  
+plain                 294.9        -       -       -        -    42.0   142.3       -   23.5      -      -    79.8  k=4 W=9, 27 tiles, 12 MB field state/tile
+##### done
+
+### vega7 dumps, compared on cytex
+
+all identical
+
+all identical
+
+## 5. --benchmark (tests/gpuprof/run_benchmark_mode.sh; TL model, default run length unless noted)
+
+### UHD 770, 190 TS per run (407a4f4 before its report changes; same measurement)
+Benchmark: warm-up 2.2 s, flat 315.1 MC/s; 14 schedules x 2 rounds of 190 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 190 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     315.5     315.0     316.0          -
+  k=2 W=4           6 MB     342.1     341.5     342.8     +8.5 %
+  k=2 W=5           7 MB     350.7     350.1     351.4    +11.2 %
+  k=4 W=8          11 MB     389.5     389.6     389.4    +23.5 %
+  k=5 W=11         15 MB     404.5     403.8     405.2    +28.2 %
+  k=8 W=17         24 MB     423.9     424.1     423.7    +34.4 %
+  k=10 W=20        28 MB     428.1     427.7     428.5    +35.7 %   as configured
+  k=11 W=22        31 MB     430.9     431.5     430.3    +36.6 %
+  k=17 W=34        48 MB     422.2     421.9     422.6    +33.8 %
+  k=22 W=45        63 MB     385.0     385.4     384.5    +22.0 %
+  k=32 W=68        95 MB     361.8     361.4     362.1    +14.7 %
+  k=32 W=91       127 MB     336.0     336.2     335.8     +6.5 %
+  k=32 W=137      191 MB     318.0     317.8     318.2     +0.8 %
+  k=32 W=183      256 MB     327.4     327.6     327.2     +3.8 %
+
+  Fastest: k=11 W=22, 430.9 MC/s, 1.37x the flat sweep.
+  Recommended: k=8 W=17, within 2 % of it with the smallest tile, which keeps the most of its traffic in the cache
+  (and saves DRAM energy, which this benchmark does not measure).
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=8:17
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='8:17')
+
+### UHD 770, --benchmark-timesteps=100
+Benchmark: warm-up 2.2 s, flat 312.4 MC/s; 14 schedules x 2 rounds of 100 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 100 timesteps per run, 2 rounds; probes kept, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     312.9     312.3     313.5          -
+  k=2 W=4           6 MB     338.3     335.8     340.8     +8.1 %
+  k=2 W=5           7 MB     346.2     345.0     347.4    +10.6 %
+  k=4 W=8          11 MB     388.5     388.2     388.8    +24.2 %
+  k=5 W=11         15 MB     401.8     399.9     403.6    +28.4 %
+  k=8 W=17         24 MB     421.0     420.7     421.4    +34.6 %
+  k=10 W=20        28 MB     421.6     418.4     424.8    +34.7 %   as configured
+  k=11 W=22        31 MB     428.2     428.2     428.2    +36.8 %
+  k=17 W=34        48 MB     418.7     418.3     419.2    +33.8 %
+  k=22 W=45        63 MB     383.5     383.4     383.5    +22.5 %
+  k=32 W=68        95 MB     357.8     358.3     357.3    +14.4 %
+  k=32 W=91       127 MB     332.9     332.4     333.3     +6.4 %
+  k=32 W=137      191 MB     315.2     315.2     315.2     +0.7 %
+  k=32 W=183      256 MB     323.6     323.9     323.3     +3.4 %
+
+  Fastest: k=11 W=22, 428.2 MC/s, 1.37x the flat sweep.
+  As configured (k=10 W=20): 421.6 MC/s, 1.5 % below the recommendation.
+  To run this model with the recommendation on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=11:22
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='11:22')
+
+### RX 6800
+Benchmark: warm-up 2.2 s, flat 3435.6 MC/s; 13 schedules x 2 rounds of 2100 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 2100 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -    3450.3    3453.5    3447.2          -
+  k=2 W=4           6 MB    2889.9    2893.7    2886.1    -16.2 %
+  k=2 W=5           7 MB    3164.0    3162.0    3165.9     -8.3 %
+  k=4 W=8          11 MB    4378.4    4377.5    4379.2    +26.9 %
+  k=5 W=11         15 MB    5221.1    5209.2    5233.1    +51.3 %
+  k=8 W=17         24 MB    6284.0    6392.9    6175.1    +82.1 %
+  k=11 W=22        31 MB    6609.5    6737.1    6481.9    +91.6 %
+  k=17 W=34        48 MB    6950.2    7068.7    6831.7   +101.4 %
+  k=22 W=45        63 MB    7005.3    7078.5    6932.1   +103.0 %   as configured
+  k=32 W=68        95 MB    7040.4    7091.2    6989.6   +104.0 %
+  k=32 W=91       127 MB    6847.6    6891.9    6803.2    +98.5 %
+  k=32 W=137      191 MB    6043.8    6039.4    6048.1    +75.2 %
+  k=32 W=183      256 MB    5002.3    5002.0    5002.5    +45.0 %
+
+  Fastest: k=32 W=68, 7040.4 MC/s, 2.04x the flat sweep.
+  As configured (k=22 W=45): 7005.3 MC/s, 0.5 % below it.
+  The rounds differ by up to 3.9 %: the machine was not quiet, and differences below that are noise.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=32:68
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='32:68')
+
+### RX 6800, OverSampling=20000: probes every 21 TS cap the depth
+Benchmark: warm-up 2.2 s, flat 3340.5 MC/s; 13 schedules x 2 rounds of 600 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 600 timesteps per run, 2 rounds; probes on, field dumps off
+  probes every 21 timesteps cap the block depth at 21
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -    3369.4    3357.4    3381.5          -
+  k=2 W=4           6 MB    2403.4    2388.6    2418.2    -28.7 %
+  k=2 W=5           7 MB    2679.0    2677.9    2680.0    -20.5 %
+  k=4 W=8          11 MB    3752.9    3752.2    3753.6    +11.4 %
+  k=5 W=11         15 MB    4573.7    4557.6    4589.9    +35.7 %
+  k=8 W=17         24 MB    5624.2    5611.0    5637.5    +66.9 %
+  k=11 W=22        31 MB    6170.6    6216.7    6124.5    +83.1 %
+  k=17 W=34        48 MB    6448.4    6500.5    6396.2    +91.4 %
+  k=21 W=45        63 MB    6584.2    6633.4    6535.0    +95.4 %   as configured
+  k=21 W=68        95 MB    6609.1    6639.2    6579.1    +96.1 %
+  k=21 W=91       127 MB    6331.0    6351.5    6310.5    +87.9 %
+  k=21 W=137      191 MB    5524.8    5546.6    5503.0    +64.0 %
+  k=21 W=183      256 MB    4630.9    4636.1    4625.6    +37.4 %
+
+  Fastest: k=21 W=68, 6609.1 MC/s, 1.96x the flat sweep.
+  As configured (k=21 W=45): 6584.2 MC/s, 0.4 % below it.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=21:68
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='21:68')
+
+### RX 6800, 64x64x64_pec
+Benchmark: warm-up 2.1 s, flat 11059.8 MC/s; 2 schedules x 2 rounds of 130000 timesteps
+Benchmark results (--engine=gpu): 0.26 M cells, 130000 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -   10995.7   11067.0   10924.4          -   as configured
+  k=20 W=40         4 MB   10287.1   10285.5   10288.6     -6.4 %
+
+  Fastest: flat, 10995.7 MC/s.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=off
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='off')
+
+### RX 6800, 224x224x224_pml
+Benchmark: warm-up 2.2 s, flat 4580.1 MC/s; 12 schedules x 2 rounds of 1300 timesteps
+Benchmark results (--engine=gpu): 11.24 M cells, 1300 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -    4582.6    4590.9    4574.3          -
+  k=2 W=4           5 MB    4670.5    4668.5    4672.5     +1.9 %
+  k=3 W=6           7 MB    5773.0    5777.1    5769.0    +26.0 %
+  k=4 W=9          11 MB    6811.2    6801.4    6821.1    +48.6 %
+  k=6 W=12         15 MB    7641.8    7655.6    7628.1    +66.8 %
+  k=9 W=19         24 MB    8111.4    8142.0    8080.9    +77.0 %
+  k=12 W=25        31 MB    8319.4    8351.2    8287.6    +81.5 %
+  k=19 W=38        47 MB    8576.2    8566.3    8586.1    +87.1 %
+  k=25 W=51        63 MB    8680.3    8692.2    8668.4    +89.4 %   as configured
+  k=32 W=76        95 MB    8802.3    8853.8    8750.9    +92.1 %
+  k=32 W=102      127 MB    6735.8    6757.4    6714.2    +47.0 %
+  k=32 W=154      192 MB    5833.1    5834.2    5832.0    +27.3 %
+
+  Fastest: k=32 W=76, 8802.3 MC/s, 1.92x the flat sweep.
+  As configured (k=25 W=51): 8680.3 MC/s, 1.4 % below it.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=32:76
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='32:76')
+
+### AVX2 multithreaded, i9-13900K (thread count calibrated on the flat sweep: 6)
+Benchmark: warm-up 2.4 s, flat 364.8 MC/s; 7 schedules x 2 rounds of 220 timesteps
+Benchmark results (--engine=avx2-multithreaded): 5.03 M cells, 220 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     414.4     411.7     417.1          -   as configured
+  k=9 W=18          9 MB    1126.9    1166.9    1087.0   +171.9 %
+  k=13 W=26        12 MB    1312.5    1341.4    1283.7   +216.7 %
+  k=18 W=37        18 MB    1406.5    1389.5    1423.4   +239.4 %
+  k=26 W=52        25 MB    1314.7    1296.4    1333.0   +217.3 %
+  k=32 W=75        36 MB     815.8     819.2     812.4    +96.9 %
+  k=32 W=105       50 MB     737.1     742.2     732.1    +77.9 %
+
+  Fastest: k=18 W=37, 1406.5 MC/s, 3.39x the flat sweep.
+  As configured (flat): 414.4 MC/s, 70.5 % below it.
+  The rounds differ by up to 7.1 %: the machine was not quiet, and differences below that are noise.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=avx2-multithreaded --avx2-temporal-block=18:37
+    FDTD.Run(sim_path, engine='avx2-multithreaded', avx2_temporal_block='18:37')
+
+### Vega 7
+Benchmark: warm-up 2.2 s, flat 297.2 MC/s; 14 schedules x 2 rounds of 180 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 180 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     297.7     297.4     298.0          -
+  k=2 W=4           6 MB     288.6     288.8     288.4     -3.0 %
+  k=2 W=5           7 MB     290.6     290.5     290.7     -2.4 %
+  k=4 W=8          11 MB     293.9     294.1     293.7     -1.3 %
+  k=4 W=9          13 MB     294.6     294.4     294.7     -1.0 %   as configured
+  k=5 W=11         15 MB     295.4     295.5     295.3     -0.8 %
+  k=8 W=17         24 MB     296.7     296.4     296.9     -0.3 %
+  k=11 W=22        31 MB     297.2     297.3     297.0     -0.2 %
+  k=17 W=34        48 MB     297.7     297.5     298.0     +0.0 %
+  k=22 W=45        63 MB     297.6     297.7     297.5     -0.0 %
+  k=32 W=68        95 MB     297.6     297.4     297.8     -0.0 %
+  k=32 W=91       127 MB     297.4     297.6     297.3     -0.1 %
+  k=32 W=137      191 MB     297.3     297.2     297.5     -0.1 %
+  k=32 W=183      256 MB     297.8     298.0     297.6     +0.0 %
+
+  Fastest: flat, 297.7 MC/s.
+  No blocked schedule is more than 1 % faster than the flat sweep: blocking gains nothing on this model and machine.
+  As configured (k=4 W=9): 294.6 MC/s, 1.0 % below it.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=off
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='off')
+
+### HD 530 (twice, then with the excitation running throughout: NumberOfTimesteps=200000)
+Benchmark: warm-up 2.2 s, flat 220.4 MC/s; 13 schedules x 2 rounds of 140 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 140 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     221.0     220.4     221.5          -
+  k=2 W=4           6 MB     229.5     229.2     229.8     +3.9 %   as configured
+  k=2 W=5           7 MB     233.2     233.3     233.1     +5.5 %
+  k=4 W=8          11 MB     251.9     251.8     251.9    +14.0 %
+  k=5 W=11         15 MB     244.4     243.1     245.8    +10.6 %
+  k=8 W=17         24 MB     230.4     230.5     230.3     +4.3 %
+  k=11 W=22        31 MB     224.4     224.3     224.5     +1.5 %
+  k=17 W=34        48 MB     220.1     220.5     219.6     -0.4 %
+  k=22 W=45        63 MB     218.6     218.7     218.4     -1.1 %
+  k=32 W=68        95 MB     218.8     218.7     219.0     -1.0 %
+  k=32 W=91       127 MB     219.2     219.2     219.1     -0.8 %
+  k=32 W=137      191 MB     219.7     219.9     219.6     -0.6 %
+  k=32 W=183      256 MB     219.6     220.0     219.3     -0.6 %
+
+  Fastest: k=4 W=8, 251.9 MC/s, 1.14x the flat sweep.
+  As configured (k=2 W=4): 229.5 MC/s, 8.9 % below it.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=4:8
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='4:8')
+
+Benchmark: warm-up 2.2 s, flat 220.4 MC/s; 13 schedules x 2 rounds of 140 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 140 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     221.0     220.4     221.5          -
+  k=2 W=4           6 MB     229.5     229.2     229.8     +3.9 %   as configured
+  k=2 W=5           7 MB     233.2     233.3     233.1     +5.5 %
+  k=4 W=8          11 MB     251.9     251.8     251.9    +14.0 %
+  k=5 W=11         15 MB     244.4     243.1     245.8    +10.6 %
+  k=8 W=17         24 MB     230.4     230.5     230.3     +4.3 %
+  k=11 W=22        31 MB     224.4     224.3     224.5     +1.5 %
+  k=17 W=34        48 MB     220.1     220.5     219.6     -0.4 %
+  k=22 W=45        63 MB     218.6     218.7     218.4     -1.1 %
+  k=32 W=68        95 MB     218.8     218.7     219.0     -1.0 %
+  k=32 W=91       127 MB     219.2     219.2     219.1     -0.8 %
+  k=32 W=137      191 MB     219.7     219.9     219.6     -0.6 %
+  k=32 W=183      256 MB     219.6     220.0     219.3     -0.6 %
+
+  Fastest: k=4 W=8, 251.9 MC/s, 1.14x the flat sweep.
+  As configured (k=2 W=4): 229.5 MC/s, 8.9 % below it.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=4:8
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='4:8')
+
+Benchmark: warm-up 2.1 s, flat 219.7 MC/s; 13 schedules x 2 rounds of 140 timesteps
+Benchmark results (--engine=gpu): 5.03 M cells, 140 timesteps per run, 2 rounds; probes on, field dumps off
+
+  schedule         tile      MC/s   round 1   round 2    vs flat
+  flat                 -     221.4     221.2     221.6          -
+  k=2 W=4           6 MB     229.7     229.3     230.1     +3.8 %   as configured
+  k=2 W=5           7 MB     233.2     233.4     233.0     +5.3 %
+  k=4 W=8          11 MB     251.8     251.9     251.7    +13.7 %
+  k=5 W=11         15 MB     245.9     245.7     246.2    +11.1 %
+  k=8 W=17         24 MB     230.5     230.6     230.4     +4.1 %
+  k=11 W=22        31 MB     224.3     223.9     224.8     +1.3 %
+  k=17 W=34        48 MB     219.2     218.7     219.7     -1.0 %
+  k=22 W=45        63 MB     219.1     219.0     219.2     -1.0 %
+  k=32 W=68        95 MB     218.3     219.4     217.1     -1.4 %
+  k=32 W=91       127 MB     219.0     219.2     218.9     -1.1 %
+  k=32 W=137      191 MB     220.0     220.2     219.8     -0.6 %
+  k=32 W=183      256 MB     220.1     219.7     220.6     -0.6 %
+
+  Fastest: k=4 W=8, 251.8 MC/s, 1.14x the flat sweep.
+  As configured (k=2 W=4): 229.7 MC/s, 8.8 % below it.
+  To run this model with it on this machine:
+    openEMS <model.xml> --engine=gpu --gpu-temporal-block=4:8
+    FDTD.Run(sim_path, engine='gpu', gpu_temporal_block='4:8')
+
+## 6. HD 530: the cost of a short processing interval (normal runs, no --benchmark)
+#    5000 TS, sparse probes (bench_gpu_sync.py, hdchk): MC/s
+    plain/tb0 251.18
+    plain 252.11
+    plain/tb4w8 256.45
+#    2100 TS flat, probes every N timesteps (OverSampling): Speed line
+    every ~110000 TS: Speed: 256.15 MCells/s 
+    every ~1000 TS: Speed: 249.10 MCells/s 
+    every ~280 TS: Speed: 221.03 MCells/s 
+    every ~140 TS: Speed: 220.88 MCells/s 

@@ -1250,15 +1250,26 @@ covering seven synthetic cases and the TL model; tables in PERFORMANCE.md §5.8.
     keep the separate phases.
 - **G7 — The flat path's Mur.** ✅ The same kernel: +1.3 % on the XTX, a wash on
   the RX 6800.
-- **Device cache table.** Open. The XTX prefers a tile just under its 96 MB
-  cache (+8 % over the 64 MB default), while the RX 6800 is flat from 45 to
-  89 MB. A per-device target would need a table of cache sizes, because
-  Vulkan exposes none.
-- **Integrated GPUs.** Open. Blocking stays opt-in there. On the TL model it
-  gives the UHD 770 1.38× (k=11 on 30 MB tiles, just under the 36 MB L3 it
-  shares with the CPU), the HD 530 at most +2 %, and the Vega 7 up to −2 %
-  (PERFORMANCE.md §5.8). The same table could turn it on for Intel parts that
-  share a large L3, with a target near that L3 rather than the 16 MB default.
+- **Device cache table.** Replaced by measurement (2026-10-20). The XTX
+  prefers a tile just under its 96 MB cache (+8 % over the 64 MB default),
+  while the RX 6800 is flat from 45 to 89 MB. A per-device target would need
+  a table of cache sizes, because Vulkan exposes none. Instead,
+  `--benchmark` measures the schedules on the model itself and prints the
+  options for the fastest. On the TL model it finds k=32 W=68 on the
+  RX 6800, 0.5 % ahead of the default (PERFORMANCE.md §5.9).
+- **Integrated GPUs.** ✅ On by default since 0107f8e, with a tile of 80 % of
+  one instance of the CPU's L3. The speed alone did not justify it, but DRAM
+  traffic and energy did (PERFORMANCE.md §5.9):
+  - UHD 770: 1.37× and −29 % energy per cell.
+  - HD 530: the same speed on −6 % energy, its DRAM traffic down by a third.
+  - Vega 7: 1 % slower; its 1 MB L2 cannot hold a 1.5 MB x-plane.
+- **Still open, from the same work:**
+  - Why the HD 530 loses 12–14 % on a flat run whose probe interval is below
+    about 300 timesteps. Its clock stays at the maximum. The benchmark's
+    3 s runs see this as a probe-dense model would.
+  - The AVX2 engine calibrates its thread count on the flat sweep, also when
+    it then runs blocked, and `--benchmark` inherits that count.
+  - Tiling in y and z, for GPUs whose cache is smaller than one x-plane.
 
 Four races in the flat path were found and fixed on the way (PERFORMANCE.md
 §5.8):
