@@ -38,6 +38,7 @@ BINS = {"ref": None, "new": None}
 KNOBS = ("OPENEMS_AVX2_TEMPORAL_BLOCK", "OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE", "OPENEMS_AVX2_TBLOCK_SPLIT",
          "OPENEMS_AVX2_TBLOCK_ELIDE", "OPENEMS_AVX2_BARRIER_SPIN_US", "OPENEMS_AVX2_SYNC_STATS")
 SETTLE, WINDOW = 5, 20   # DRAM counters: seconds after stepping starts, and how long
+PERF_ENV = dict(os.environ, LC_ALL="C")   # perf -x, prints a decimal comma under e.g. de_DE
 
 
 def variant_env(spec):
@@ -104,7 +105,7 @@ def dram_events():
 	if ev is None:
 		return None
 	try:
-		p = subprocess.run(["perf", "stat", "-a", "-x,", "-e", ev[0], "--", "sleep", "0.1"],
+		p = subprocess.run(["perf", "stat", "-a", "-x,", "-e", ev[0], "--", "sleep", "0.1"], env=PERF_ENV,
 		                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 	except OSError:
 		return None
@@ -112,7 +113,7 @@ def dram_events():
 
 
 def read_dram(ev, seconds):
-	p = subprocess.run(["perf", "stat", "-a", "-x,", "-e", ev[0], "--", "sleep", str(seconds)],
+	p = subprocess.run(["perf", "stat", "-a", "-x,", "-e", ev[0], "--", "sleep", str(seconds)], env=PERF_ENV,
 	                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 	total = 0.0
 	for line in p.stderr.splitlines():
